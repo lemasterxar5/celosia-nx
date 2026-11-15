@@ -108,7 +108,9 @@ ctest --test-dir build/host-tests --output-on-failure
 python -m unittest discover -s tools/switch/hardware -p 'test_*.py'
 ```
 
-The development v47 validation passed **14/14 host CTest targets** and **28 Python tests**. The alpha-policy regression executable evaluated **17,044,151 checks**, including comparison against shader float behavior. These tests cover selected policies, ownership, timing and tools; no project-wide coverage percentage or whole-game correctness is claimed.
+Fresh validation of this public snapshot passed **14/14 host CTest targets**. The Python suite contains **31 tests: 28 pass and three newly added FTP-retry tests do not pass**, because the corresponding retry implementation is unfinished. The failing cases report one assertion failure and three errors, including subtests. Consequently the Python command above currently exits with failure; these tests preserve the pending work rather than implying the collector is complete. The earlier v47 tool validation passed the 28 existing Python tests before these draft retry tests were added.
+
+The alpha-policy regression executable evaluated **17,044,151 checks**, including comparison against shader float behavior. These tests cover selected policies, ownership, timing and tools; no project-wide coverage percentage or whole-game correctness is claimed.
 
 The changed AArch64 renderer/runtime sources were compiled and linked for v47, and the five deko3d shaders were compiled using `uam`. The source-only public package has not been independently reproduced into a playable NRO without the private game inputs.
 

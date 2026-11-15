@@ -1,0 +1,93 @@
+// The game thread's time by subsystem (SOTC_SUBSYS_PROF=1, Debug
+// 'Subsystem timing log'): guest functions wrapped in the function table,
+// the sub-threads' steps (isysWakeupSubThread) by task, and scopes in our
+// own hooks. Inclusive and self time, calls; one [prof] line every 120 game
+// frames, in ms per frame. With it, a one-shot [probe] of the machine at
+// start: memory latency, guest RAM reads, cold calls into the generated code.
+//
+// Off (no SOTC_SUBSYS_PROF at start): nothing is wrapped, a scope is one
+// load and a branch.
+#pragma once
+
+#include <cstdint>
+#include "runtime/ps2_diag.h"
+
+
+class PS2Runtime;
+struct R5900Context;
+
+namespace sotc_prof
+{
+    // Timing on (installed and the tuning toggle on).
+    extern bool g_on;
+    // Set on threads other than the game thread that run hook code (the
+    // model draws' worker, round 24): their scopes are not timed (the
+    // probes' stack is the game thread's; the worker's time is the frame
+    // log's "jobs" column).
+    extern thread_local bool t_offGameThread;
+
+    // Scopes in our hooks (sotc_native.cpp).
+    enum Hook : int
+    {
+        kHookModelDisp, // modelDispHook's host part
+        kHookState,     // modelDispState (the game's modelDisp state, natively)
+        kHookPartTest,  // the parts against the camera
+        kHookPalette,   // readPalette
+        kHookPackets,   // the packet loop (self: draws, lookups)
+        kHookPacketId,  // packetId
+        kHookBuild,     // a packet's mesh built on the game thread
+        kHookSkin,      // a skinned packet posed (palette / CPU pose)
+        kHookQueue,     // a packet's build queued for the async worker (round 14)
+        kHookPlan,      // a draw plan made (buildPlan, round 14)
+        kHookHash,      // packetId's full content hash (round 14)
+        kHookMoves,     // packetId's garbage-move lookups and memo carry (round 14)
+        kHookSync,      // round 79: modelDispHook's syncFrame
+        kHookPs2List,   // round 79: the original modelDisp run by the hook
+        kHookCount
+    };
+
+    uint64_t ticks();
+    // A timed region opened (its serial, 0: none) and closed.
+    uint32_t enter(int probe, uint64_t now);
+    void leave(uint32_t serial, uint64_t now);
+
+    struct Scope
+    {
+        uint32_t serial = 0;
+        explicit Scope(int hook)
+        {
+            if (!ps2_diag::kRelease && g_on && !t_offGameThread) // (round 130: none in the release build)
+                serial = enter(hook, ticks());
+        }
+        ~Scope()
+        {
+            if (serial)
+                leave(serial, ticks());
+        }
+        Scope(const Scope &) = delete;
+        Scope &operator=(const Scope &) = delete;
+    };
+
+    // Wraps the functions (last of the overrides: it wraps what is there).
+    void install(PS2Runtime &runtime);
+    // A game frame ended (sotc_native syncFrame): the report every 120.
+    void frameTick(uint64_t frame);
+    // A wrapped function's inner call from one function to another (the
+    // lean copies' A/B, lean_hot.cpp).
+    using GuestFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
+    void remapWrapped(GuestFn from, GuestFn to);
+    // SOTC_LEAN=2's state now (lean copies or originals): the [prof] lines
+    // end with it ("mixed": it changed inside that window).
+    void noteLean(bool lean);
+    // SOTC_AB's state (sotc_decomp.cpp), for the report like SOTC_LEAN=2's.
+    void noteAb(bool on);
+}
+
+// Round 129: the console's sampling profiler of the game thread
+// (SOTC_PROF129=1; sotc_prof129.cpp, read by r129/prof129.py).
+namespace prof129
+{
+    void install(PS2Runtime &runtime);
+}
+
+#define SOTC_PROF_SCOPE(hook) const ::sotc_prof::Scope sotc_prof_scope_##hook{::sotc_prof::hook}

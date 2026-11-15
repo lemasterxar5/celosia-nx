@@ -1,0 +1,897 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
+set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
+option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
+option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
+
+option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
+option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
+option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
+option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
+option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
+
+option(PS2X_ENABLE_CCACHE "Use ccache as compiler launcher when available (preferred over sccache)" ON)
+if(PS2X_ENABLE_CCACHE)
+    find_program(PS2X_CCACHE_PROGRAM ccache)
+    if(PS2X_CCACHE_PROGRAM)
+        # Content-hashed: unchanged sources (e.g. a header touched but not
+        # changed) come back from the cache instead of being recompiled.
+        set(CMAKE_C_COMPILER_LAUNCHER "${PS2X_CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${PS2X_CCACHE_PROGRAM}")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # Lets ccache cache sources built with the precompiled header.
+            add_compile_options("SHELL:-Xclang -fno-pch-timestamp")
+        endif()
+        set(PS2X_ENABLE_SCCACHE OFF)
+        message(STATUS "Using ccache: ${PS2X_CCACHE_PROGRAM}")
+    endif()
+endif()
+
+if(PS2X_ENABLE_SCCACHE)
+    find_program(PS2X_SCCACHE_PROGRAM sccache)
+
+    if(PS2X_SCCACHE_PROGRAM)
+        if(CMAKE_C_COMPILER)
+            set(CMAKE_C_COMPILER_LAUNCHER "${PS2X_SCCACHE_PROGRAM}")
+        endif()
+
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${PS2X_SCCACHE_PROGRAM}")
+        message(STATUS "Using sccache: ${PS2X_SCCACHE_PROGRAM}")
+    else()
+        message(STATUS "sccache not found; continuing without compiler launcher")
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ReleaseMode.cmake")
+
+set(PS2X_IS_VITA OFF)
+
+if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
+    (CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi"))
+    set(PS2X_IS_VITA ON)
+endif()
+
+set(PS2X_IS_ANDROID OFF)
+
+if(ANDROID)
+    set(PS2X_IS_ANDROID ON)
+endif()
+
+option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
+set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
+set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
+set(PS2X_VITA_VERSION "01.00" CACHE STRING "Vita app version")
+set(PS2X_DEFAULT_BOOT_ELF "" CACHE STRING "Guest ELF path passed directly to main() when argv is unavailable")
+
+if(PS2X_IS_VITA)
+    if(NOT DEFINED ENV{VITASDK})
+        message(FATAL_ERROR "VITASDK is not defined. Configure inside the VitaSDK environment or pass the Vita toolchain file.")
+    endif()
+
+    set(PS2X_VITASDK "$ENV{VITASDK}")
+
+    if(NOT EXISTS "${PS2X_VITASDK}/share/vita.cmake")
+        message(FATAL_ERROR "Could not find vita.cmake under ${PS2X_VITASDK}/share.")
+    endif()
+
+    include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
+else()
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET FALSE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+    if(PS2X_IS_ANDROID)
+        set(PLATFORM "Android" CACHE STRING "" FORCE)
+    endif()
+
+    FetchContent_Declare(
+        raylib
+        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
+        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
+        GIT_PROGRESS TRUE
+    )
+    FetchContent_MakeAvailable(raylib)
+
+    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+        FetchContent_Declare(
+            imgui
+            GIT_REPOSITORY https://github.com/ocornut/imgui.git
+            GIT_TAG "v1.92.7-docking"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(imgui)
+
+        if(NOT imgui_POPULATED)
+            FetchContent_Populate(imgui)
+        endif()
+
+        set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
+
+        add_library(imgui STATIC
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+        )
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+
+        FetchContent_Declare(
+            rlImGui
+            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
+            GIT_TAG "Raylib_5_5"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(rlImGui)
+
+        if(NOT rlimgui_POPULATED)
+            FetchContent_Populate(rlImGui)
+        endif()
+
+        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
+
+        add_library(rlImGui STATIC
+            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
+        )
+        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
+        target_link_libraries(rlImGui PUBLIC raylib imgui)
+    endif()
+endif()
+
+add_library(ps2_host_backend INTERFACE)
+
+set(PS2X_DEFAULT_BOOT_ELF_DEFINE "")
+
+if(PS2X_DEFAULT_BOOT_ELF)
+    set(PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF}")
+    string(REPLACE "\\" "\\\\" PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
+    string(REPLACE "\"" "\\\"" PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
+endif()
+
+option(PS2X_VITA_SDL2_SHIM "Vita: implement the raylib subset on SDL2/GXM (platform/vita/raylib) instead of raylib-vita + PVR GLES" ON)
+
+if(PS2X_IS_VITA AND PS2X_VITA_SDL2_SHIM)
+    # Video through vitaGL (GXM), audio through SDL2: no PowerVR GLES modules
+    # (which Vita3K cannot run).
+    set(PS2X_VITA_PREFIX "${PS2X_VITASDK}/arm-vita-eabi")
+    # A vitaGL build of our own (headers and library), or the SDK's.
+    set(PS2X_VITA_VITAGL_DIR "" CACHE PATH "vitaGL source tree with libvitaGL.a built (empty: the SDK's)")
+    set(PS2X_VITA_VITAGL vitaGL)
+    if(PS2X_VITA_VITAGL_DIR)
+        set(PS2X_VITA_VITAGL "${PS2X_VITA_VITAGL_DIR}/libvitaGL.a")
+    endif()
+    add_library(ps2x_vita_raylib STATIC "${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/raylib/raylib_vita.cpp")
+    if(PS2X_VITA_VITAGL_DIR)
+        target_include_directories(ps2x_vita_raylib BEFORE PUBLIC "${PS2X_VITA_VITAGL_DIR}/source")
+    endif()
+    target_include_directories(ps2x_vita_raylib PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/raylib"
+        "${PS2X_VITA_PREFIX}/include")
+    target_link_libraries(ps2x_vita_raylib PUBLIC
+        SDL2
+        # Video: vitaGL on GXM, shaders compiled at run time (libshacccg).
+        ${PS2X_VITA_VITAGL} vitashark SceShaccCgExt mathneon SceShaccCg_stub taihen_stub
+        SceDisplay_stub SceCtrl_stub SceTouch_stub SceGxm_stub SceAudio_stub SceAudioIn_stub
+        SceSysmodule_stub SceHid_stub SceMotion_stub SceAppMgr_stub SceAppUtil_stub
+        SceCommonDialog_stub SceIme_stub ScePower_stub SceLibKernel_stub SceProcessmgr_stub
+        SceKernelDmacMgr_stub SceIofilemgr_stub SceRtc_stub
+        # Whole archive: libstdc++ checks for pthread through weak symbols;
+        # without them std::call_once / std::thread throw "Unknown error".
+        -Wl,--whole-archive pthread -Wl,--no-whole-archive
+        m c)
+    target_compile_definitions(ps2_host_backend INTERFACE PLATFORM_VITA PS2X_VITA_SDL2_SHIM=1)
+    target_link_libraries(ps2_host_backend INTERFACE ps2x_vita_raylib)
+elseif(PS2X_IS_VITA)
+    set(PS2X_VITA_PREFIX "${PS2X_VITASDK}/arm-vita-eabi")
+    set(PS2X_VITA_EXTRA_INCLUDE_DIRS "" CACHE STRING "Extra include directories for Vita host dependencies")
+    set(PS2X_VITA_LIBRARY_DIR "${PS2X_VITA_PREFIX}/lib")
+    set(PS2X_VITA_REQUIRED_LIBRARY_NAMES
+        raylib
+        SDL2
+        OpenSLES
+        taihen_stub
+        SceAppMgr_stub
+        SceCtrl_stub
+        SceGxm_stub
+        SceCommonDialog_stub
+        SceLibKernel_stub
+        SceAudio_stub
+        SceTouch_stub
+        SceHid_stub
+        SceMotion_stub
+        SceSysmodule_stub
+        SceIofilemgr_stub
+        SceNetCtl_stub
+        SceNet_stub
+        SceDisplay_stub
+        SceAppUtil_stub
+        SceAudioIn_stub
+        ScePower_stub
+        SceProcessmgr_stub
+        SceIme_stub
+        libIMGEGL_stub_weak
+        libgpu_es4_ext_stub_weak
+        libGLESv2_stub_weak
+        libGL_stub_weak
+        libGLESv1_CM_stub_weak
+    )
+
+    set(PS2X_VITA_INCLUDE_DIRS
+        "${PS2X_VITA_PREFIX}/include"
+    )
+
+    foreach(PS2X_VITA_OPTIONAL_INCLUDE_DIR IN ITEMS
+        "${PS2X_VITA_PREFIX}/include/raylib"
+        "${PS2X_VITA_PREFIX}/include/SDL2")
+        if(EXISTS "${PS2X_VITA_OPTIONAL_INCLUDE_DIR}")
+            list(APPEND PS2X_VITA_INCLUDE_DIRS "${PS2X_VITA_OPTIONAL_INCLUDE_DIR}")
+        endif()
+    endforeach()
+
+    if(PS2X_VITA_EXTRA_INCLUDE_DIRS)
+        list(APPEND PS2X_VITA_INCLUDE_DIRS ${PS2X_VITA_EXTRA_INCLUDE_DIRS})
+    endif()
+
+    if(NOT EXISTS "${PS2X_VITA_PREFIX}/include/SDL2/SDL.h")
+        message(FATAL_ERROR
+            "Missing SDL2 headers under ${PS2X_VITA_PREFIX}/include/SDL2. "
+            "Quenom/raylib-5.5-vita requires SDL2 with PVR support installed into VitaSDK.")
+    endif()
+
+    if(NOT EXISTS "${PS2X_VITA_LIBRARY_DIR}")
+        message(FATAL_ERROR "Missing Vita library directory: ${PS2X_VITA_LIBRARY_DIR}")
+    endif()
+
+    function(ps2x_find_vita_library out_var library_name)
+        string(MAKE_C_IDENTIFIER "${library_name}" library_id)
+        set(cache_var "PS2X_VITA_LIB_${library_id}")
+
+        find_library(${cache_var}
+            NAMES "${library_name}" "${library_name}.a" "lib${library_name}.a"
+            PATHS "${PS2X_VITA_LIBRARY_DIR}"
+            NO_DEFAULT_PATH
+        )
+
+        if(NOT ${cache_var})
+            message(FATAL_ERROR
+                "Could not find Vita library '${library_name}' under ${PS2X_VITA_LIBRARY_DIR}. "
+                "Install Quenom/raylib-5.5-vita and its SDL2/PVR dependencies into VitaSDK first.")
+        endif()
+
+        set(${out_var} "${${cache_var}}" PARENT_SCOPE)
+    endfunction()
+
+    set(PS2X_VITA_RESOLVED_LIBRARIES "")
+
+    foreach(PS2X_VITA_LIBRARY_NAME IN LISTS PS2X_VITA_REQUIRED_LIBRARY_NAMES)
+        ps2x_find_vita_library(PS2X_VITA_LIBRARY_PATH "${PS2X_VITA_LIBRARY_NAME}")
+        list(APPEND PS2X_VITA_RESOLVED_LIBRARIES "${PS2X_VITA_LIBRARY_PATH}")
+    endforeach()
+
+    target_compile_definitions(ps2_host_backend INTERFACE PLATFORM_VITA)
+    target_include_directories(ps2_host_backend INTERFACE ${PS2X_VITA_INCLUDE_DIRS})
+    target_link_libraries(ps2_host_backend INTERFACE
+        ${PS2X_VITA_RESOLVED_LIBRARIES}
+        m
+        c
+        pthread
+    )
+else()
+    target_link_libraries(ps2_host_backend INTERFACE raylib)
+
+    if(PS2X_IS_ANDROID)
+        target_link_libraries(ps2_host_backend INTERFACE log android)
+    endif()
+endif()
+
+if(PS2X_IS_ANDROID)
+    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
+else()
+    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+endif()
+
+option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+
+if(NOT PS2X_ENABLE_FFMPEG)
+    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+    add_library(ffmpeg INTERFACE)
+elseif(WIN32)
+    include(ExternalProject)
+
+    set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+    set(FFMPEG_PREBUILT_URL
+        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+
+    set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
+    set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
+    set(FFMPEG_INCLUDE_DIR "${FFMPEG_SOURCE_DIR}/include")
+    set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/bin")
+    set(FFMPEG_BIN_DIR "${FFMPEG_SOURCE_DIR}/bin")
+
+    ExternalProject_Add(ffmpeg_external
+        URL "${FFMPEG_PREBUILT_URL}"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        PREFIX "${FFMPEG_PREFIX_DIR}"
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ""
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS
+        "${FFMPEG_LIB_DIR}/avcodec.lib"
+        "${FFMPEG_LIB_DIR}/avformat.lib"
+        "${FFMPEG_LIB_DIR}/avutil.lib"
+        "${FFMPEG_LIB_DIR}/swresample.lib"
+        "${FFMPEG_LIB_DIR}/swscale.lib"
+    )
+
+    # Link against the import libraries shipped with the Windows DLLs.
+    add_library(ffmpeg_avcodec STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avcodec PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avcodec.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avcodec ffmpeg_external)
+
+    add_library(ffmpeg_avformat STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avformat PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avformat.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avformat ffmpeg_external)
+
+    add_library(ffmpeg_avutil STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avutil PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avutil.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avutil ffmpeg_external)
+
+    add_library(ffmpeg_swresample STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_swresample PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/swresample.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_swresample ffmpeg_external)
+
+    add_library(ffmpeg_swscale STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_swscale PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/swscale.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_swscale ffmpeg_external)
+
+    add_library(ffmpeg INTERFACE)
+    target_link_libraries(ffmpeg INTERFACE
+        ffmpeg_avcodec
+        ffmpeg_avformat
+        ffmpeg_avutil
+        ffmpeg_swresample
+        ffmpeg_swscale
+        bcrypt
+        secur32
+        ws2_32
+        user32
+        advapi32
+        ole32
+        shell32
+    )
+
+    set(PS2X_FFMPEG_BIN_DIR "${FFMPEG_BIN_DIR}" CACHE INTERNAL "Directory containing FFmpeg runtime DLLs")
+    set(PS2X_COPY_FFMPEG_DLLS_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyFfmpegDlls.cmake"
+        CACHE INTERNAL
+        "Script used to stage FFmpeg runtime DLLs beside executables")
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
+        libavcodec
+        libavformat
+        libavutil
+        libswresample
+        libswscale
+    )
+
+    add_library(ffmpeg INTERFACE)
+    target_link_libraries(ffmpeg INTERFACE PkgConfig::FFMPEG)
+endif()
+
+function(ps2x_stage_ffmpeg_runtime_dlls target_name)
+    if(NOT WIN32)
+        return()
+    endif()
+
+    if(NOT PS2X_FFMPEG_BIN_DIR OR NOT PS2X_COPY_FFMPEG_DLLS_SCRIPT)
+        return()
+    endif()
+
+    if(TARGET ffmpeg_external)
+        add_dependencies(${target_name} ffmpeg_external)
+    endif()
+
+    add_custom_command(
+        TARGET ${target_name} POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+        "-Dsource_dir=${PS2X_FFMPEG_BIN_DIR}"
+        "-Ddest_dir=$<TARGET_FILE_DIR:${target_name}>"
+        -P "${PS2X_COPY_FFMPEG_DLLS_SCRIPT}"
+        VERBATIM
+    )
+endfunction()
+
+add_library(ps2_runtime STATIC
+    src/lib/game_overrides.cpp
+    src/lib/gs/ps2_gif_arbiter.cpp
+    src/lib/ps2_audio.cpp
+    src/lib/ps2_audio_vag.cpp
+    src/lib/gs/ps2_gs_memory.cpp
+    src/lib/gs/gs_frontend.cpp
+    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_async_backend.cpp
+    src/lib/gs/gs_hw_backend.cpp
+    src/lib/ps2_iop_host.cpp
+    src/lib/ps2_memory.cpp
+    src/lib/ps2_pad.cpp
+    src/lib/host_menu.cpp
+    src/lib/ps2_rom_device.cpp
+    src/lib/ps2_vfs.cpp
+    src/lib/ps2_runtime.cpp
+    src/lib/ps2_macro_selftest.cpp
+    src/lib/ps2_vif1_interpreter.cpp
+    src/lib/vu/ps2_vu1_core.cpp
+    src/lib/vu/ps2_vu1_upper.cpp
+    src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_rec.cpp
+    src/lib/games_database.cpp
+)
+
+# Native renderer: the front picks Metal (macOS) or OpenGL (macOS with
+# SOTC_NATIVE_GL=1, the Vita through vitaGL).
+target_sources(ps2_runtime PRIVATE src/lib/native/native_renderer.cpp src/lib/native/native_renderer_gl.cpp src/lib/native/native_recorder.cpp)
+# The scene recorder's blocks are zlib-compressed (the Vita SDK has libz).
+if(WIN32)
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(ps2_runtime PUBLIC ZLIB::ZLIB)
+else()
+    target_link_libraries(ps2_runtime PUBLIC z)
+endif()
+
+# GPU GS rasterizer (Metal) on macOS, the default there (PS2X_GS_GPU=0 = CPU).
+if(NOT APPLE)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_metal_raster_stub.cpp)
+endif()
+if(APPLE)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/metal/gs_metal_raster.mm src/lib/native/native_renderer_metal.mm)
+    set_source_files_properties(src/lib/gs/metal/gs_metal_raster.mm src/lib/native/native_renderer_metal.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
+    target_link_libraries(ps2_runtime PUBLIC "-framework Metal" "-framework Foundation" "-framework OpenGL")
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_METAL=1)
+endif()
+
+if(PS2X_ENABLE_RUNTIME_LOGS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2_RUNTIME_LOGS=1
+    )
+endif()
+
+if(PS2X_ENABLE_AGRESSIVE_LOGS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        AGRESSIVE_LOGS=1
+        PS2_FUNCTION_LOG_TRACKER=1
+    )
+endif()
+
+if(PS2X_ENABLE_IOP_RPC_TRACE)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=0
+    )
+endif()
+
+if(PS2X_STRICT_RETURN_DIAGNOSTICS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_STRICT_RETURN_DIAGNOSTICS=1
+    )
+endif()
+
+target_compile_definitions(ps2_runtime PRIVATE
+    PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
+)
+
+file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
+)
+
+target_sources(ps2_runtime PRIVATE
+    ${KERNEL_SRC_FILES}
+)
+
+# Directories holding the recompiled game code (and any hand-written game
+# overrides). Defaults to src/runner; projects can keep generated code out of
+# the source tree by pointing this at their own directories.
+set(PS2X_RUNNER_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE STRING "Directories with ps2EntryRunner sources")
+set(RUNNER_SRC_FILES)
+foreach(runner_dir IN LISTS PS2X_RUNNER_DIRS)
+    file(GLOB runner_dir_files CONFIGURE_DEPENDS "${runner_dir}/*.cpp")
+    list(APPEND RUNNER_SRC_FILES ${runner_dir_files})
+endforeach()
+
+set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+if(EXISTS "${RUNNER_MAIN_CPP}")
+    list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
+elseif(EXISTS "${ROOT_MAIN_CPP}")
+    list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
+endif()
+
+if(PS2X_IS_ANDROID)
+    add_library(ps2EntryRunner SHARED
+        ${RUNNER_SRC_FILES}
+    )
+
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--undefined=ANativeActivity_onCreate")
+else()
+    add_executable(ps2EntryRunner
+        ${RUNNER_SRC_FILES}
+    )
+endif()
+
+if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+    set_target_properties(ps2EntryRunner PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+    )
+endif()
+
+# Lean copies of hot recompiled functions (game/overrides/lean_*.cpp): they
+# rename the functions they hold (lean/renames.inc), so each is a
+# translation unit of its own.
+foreach(PS2X_SOURCE IN LISTS RUNNER_SRC_FILES)
+    if(PS2X_SOURCE MATCHES "/overrides/lean_[^/]*\\.cpp$")
+        set_source_files_properties(${PS2X_SOURCE} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    endif()
+    # The second set (lean_part_tN.cpp) defines PS2X_EE_TRUST_FINITE before
+    # ps2_runtime_macros.h: not with the precompiled header, which has it 0.
+    if(PS2X_SOURCE MATCHES "/overrides/lean_part_t[0-9]+\\.cpp$")
+        set_source_files_properties(${PS2X_SOURCE} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    endif()
+endforeach()
+
+if(PS2X_ENABLE_RUNNER_PCH)
+    set(PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
+    )
+
+    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
+            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
+        endif()
+    endforeach()
+
+    list(APPEND PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
+    )
+
+    target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
+if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
+    target_compile_definitions(ps2EntryRunner PRIVATE
+        PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(ps2EntryRunner PRIVATE /FS)
+endif()
+
+target_include_directories(ps2_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+)
+
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_link_libraries(ps2EntryRunner
+    PRIVATE
+    ps2_runtime
+)
+target_include_directories(ps2EntryRunner PRIVATE ${PS2X_RUNNER_DIRS})
+
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE
+        src/lib/ps2_debug_panel.cpp
+    )
+    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+endif()
+
+ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
+
+if(PS2X_IS_VITA)
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+
+    if(PS2X_VITA_CREATE_PACKAGE)
+        set(PS2X_VITA_VPK_FILES "")
+
+        foreach(PS2X_VITA_MODULE IN ITEMS
+            libgpu_es4_ext.suprx
+            libIMGEGL.suprx
+            libGLESv2.suprx
+            libpvrPSP2_WSEGL.suprx
+            libGL.suprx)
+            set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
+
+            if(EXISTS "${PS2X_VITA_MODULE_PATH}")
+                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
+            else()
+                message(WARNING
+                    "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
+            endif()
+        endforeach()
+
+        # The shader cache's seed (round 19, raylib_vita.cpp's seedShaderCache):
+        # a vitaGL shader cache ({v,f}/XX/<hash>.gxp, from a Vita3K run's
+        # ux0:data/shader_cache/<title id>/v2) packed as app0:shader_cache.
+        set(PS2X_VITA_SHADER_SEED "${CMAKE_BINARY_DIR}/../vita-shader-seed" CACHE PATH "vitaGL shader cache to pack into the VPK (missing: none)")
+        if(EXISTS "${PS2X_VITA_SHADER_SEED}")
+            file(GLOB_RECURSE PS2X_VITA_SEED_FILES RELATIVE "${PS2X_VITA_SHADER_SEED}" "${PS2X_VITA_SHADER_SEED}/*.gxp")
+            foreach(PS2X_VITA_SEED_FILE IN LISTS PS2X_VITA_SEED_FILES)
+                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_SHADER_SEED}/${PS2X_VITA_SEED_FILE}" "shader_cache/${PS2X_VITA_SEED_FILE}")
+            endforeach()
+            list(LENGTH PS2X_VITA_SEED_FILES PS2X_VITA_SEED_COUNT)
+            message(STATUS "VPK: ${PS2X_VITA_SEED_COUNT} seeded shaders from ${PS2X_VITA_SHADER_SEED}")
+        endif()
+
+        vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
+        vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
+            VERSION ${PS2X_VITA_VERSION}
+            NAME ${PS2X_VITA_APP_NAME}
+            ${PS2X_VITA_VPK_FILES}
+        )
+    endif()
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    EnableFastReleaseMode(ps2_runtime)
+    EnableFastReleaseMode(ps2EntryRunner)
+
+    if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
+        if(MSVC)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
+            )
+        elseif(MINGW)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
+            )
+        endif()
+    endif()
+endif()
+
+# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+if(MSVC)
+    target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+endif()
+
+# Generated/native VU1 code trusts the FPU mode instead of normalising every
+# float in software (see vu1rec::norm).
+option(PS2X_VU1_TRUST_FPU "VU1 native/generated code: no software float normalisation" ON)
+if(PS2X_VU1_TRUST_FPU)
+    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_VU1_TRUST_FPU=1)
+endif()
+
+# Vita: Work around for GCC 10's LTO plugin
+if(PS2X_IS_VITA)
+    # Cortex-A9: Thumb-2 and NEON. The runtime is speed-optimized; the
+    # recompiled game (tens of MB of code) by PS2X_VITA_GAME_OPT.
+    set(PS2X_VITA_GAME_OPT "-O2" CACHE STRING "Optimization level of the recompiled game code on the Vita (-O2 or -Os)")
+    foreach(PS2X_VITA_TARGET IN ITEMS ps2_runtime ps2EntryRunner ps2_iop)
+        if(TARGET ${PS2X_VITA_TARGET})
+            target_compile_options(${PS2X_VITA_TARGET} PRIVATE -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb)
+        endif()
+    endforeach()
+    # The runtime and the game overrides at -O3 (throttled Vita3K, 2026-10-21:
+    # the render thread 57.5 -> 52.8 ms at the shrine altar, the attract demo
+    # 30.1 -> 29.5 ms; LTO on the two gave nothing).
+    target_compile_options(ps2_runtime PRIVATE -O3)
+    target_compile_options(ps2EntryRunner PRIVATE ${PS2X_VITA_GAME_OPT})
+    # Except the hot few: recompiled VU1 microcode and native replacements
+    # (game overrides) run every vertex.
+    # Round 121: profile-guided optimisation (GCC PGO) of the natives (the game overrides, ~75% of the game thread),
+    # the runtime and the recompiled game. PS2X_VITA_PGO=gen: instrumented build (PS2X_VITA_PGO_GAME=ON: the
+    # recompiled game too); its .gcda files are written to ux0:data/celosia/pgo at SOTC_GCOV_DUMP_FRAME=<n>
+    # (sotc_native.cpp gcovDump). PS2X_VITA_PGO=<dir or .tar.xz>: compiled with those profiles (tools/pgo_fix.py's
+    # output; the default is game/pgo/vita-pgo.tar.xz when it exists). The .gcda names are the objects' paths below
+    # the build directory (-fprofile-prefix-path); the overrides' carry their tree's path as @ROOT@, replaced here.
+    # Functions changed since the training lose their profile (GCC's per-function checksums: -Wno-coverage-mismatch)
+    # and are compiled as without PGO (-fprofile-partial-training). OFF / empty: no PGO.
+    get_filename_component(PS2X_PGO_TREE "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
+    set(PS2X_PGO_DEFAULT "")
+    if(EXISTS "${PS2X_PGO_TREE}/game/pgo/vita-pgo.tar.xz")
+        set(PS2X_PGO_DEFAULT "${PS2X_PGO_TREE}/game/pgo/vita-pgo.tar.xz")
+    endif()
+    set(PS2X_VITA_PGO "${PS2X_PGO_DEFAULT}" CACHE STRING "Vita: PGO: gen, a profile directory / .tar.xz, or OFF")
+    option(PS2X_VITA_PGO_GAME "Vita: PGO of the recompiled game too (gen: instrumented; with a profile: applied)" OFF)
+    set(PS2X_VITA_PGO_ELF_ROOM "65536" CACHE STRING "Vita: sotc_vita_elf_room's size in the instrumented build")
+    set(PS2X_VITA_PGO_FLAGS "")
+    set(PS2X_VITA_PGO_GAME_FLAGS "")
+    if(PS2X_VITA_PGO STREQUAL "gen")
+        set(PS2X_VITA_PGO_FLAGS -fprofile-generate=ux0:data/celosia/pgo -fprofile-prefix-path=${CMAKE_BINARY_DIR}
+            -fprofile-update=single -fno-profile-values -fno-profile-reorder-functions -fprofile-info-section=gcov_info)
+        target_link_options(ps2EntryRunner PRIVATE -fprofile-generate -Wl,--undefined=__gcov_info_to_gcda)
+        if(PS2X_VITA_PGO_GAME)
+            set(PS2X_VITA_PGO_GAME_FLAGS ${PS2X_VITA_PGO_FLAGS})
+        endif()
+    elseif(PS2X_VITA_PGO AND EXISTS "${PS2X_VITA_PGO}")
+        set(PS2X_PGO_SRC "${PS2X_VITA_PGO}")
+        if(PS2X_VITA_PGO MATCHES "\\.tar\\.xz$")
+            file(SHA1 "${PS2X_VITA_PGO}" PS2X_PGO_SUM)
+            string(SUBSTRING "${PS2X_PGO_SUM}" 0 12 PS2X_PGO_SUM)
+            set(PS2X_PGO_SRC "${CMAKE_BINARY_DIR}/pgo-src-${PS2X_PGO_SUM}")
+            if(NOT EXISTS "${PS2X_PGO_SRC}")
+                file(ARCHIVE_EXTRACT INPUT "${PS2X_VITA_PGO}" DESTINATION "${PS2X_PGO_SRC}")
+            endif()
+        endif()
+        string(REGEX REPLACE "^/" "" PS2X_PGO_ROOT "${PS2X_PGO_TREE}")
+        string(REPLACE "/" "#" PS2X_PGO_ROOT "${PS2X_PGO_ROOT}")
+        # The build directory's copy is named by the profiles' contents: a new profile changes the flags, so
+        # ninja rebuilds what it covers.
+        file(GLOB PS2X_PGO_FILES RELATIVE "${PS2X_PGO_SRC}" "${PS2X_PGO_SRC}/*.gcda")
+        set(PS2X_PGO_SUM "")
+        foreach(PS2X_PGO_FILE IN LISTS PS2X_PGO_FILES)
+            file(SHA1 "${PS2X_PGO_SRC}/${PS2X_PGO_FILE}" PS2X_PGO_ONE)
+            string(APPEND PS2X_PGO_SUM "${PS2X_PGO_ONE}")
+        endforeach()
+        string(SHA1 PS2X_PGO_SUM "${PS2X_PGO_SUM}")
+        string(SUBSTRING "${PS2X_PGO_SUM}" 0 12 PS2X_PGO_SUM)
+        set(PS2X_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-use-${PS2X_PGO_SUM}")
+        if(NOT EXISTS "${PS2X_PGO_DIR}")
+            file(MAKE_DIRECTORY "${PS2X_PGO_DIR}")
+            foreach(PS2X_PGO_FILE IN LISTS PS2X_PGO_FILES)
+                string(REPLACE "@ROOT@" "${PS2X_PGO_ROOT}" PS2X_PGO_NAME "${PS2X_PGO_FILE}")
+                configure_file("${PS2X_PGO_SRC}/${PS2X_PGO_FILE}" "${PS2X_PGO_DIR}/${PS2X_PGO_NAME}" COPYONLY)
+            endforeach()
+        endif()
+        set(PS2X_VITA_PGO_FLAGS -fprofile-use=${PS2X_PGO_DIR} -fprofile-prefix-path=${CMAKE_BINARY_DIR}
+            -fprofile-partial-training -fprofile-correction -fno-profile-values -fno-profile-reorder-functions -fno-vpt
+            -Wno-missing-profile -Wno-coverage-mismatch)
+        # The recompiled game's unity batches (PS2X_VITA_PGO_GAME; the profile has them): off by default, round 121
+        # measured 0..-1% of the game thread in Vita3K for +2.5 MB of text (the natives' and runtime's: -3..-5%).
+        if(PS2X_VITA_PGO_GAME AND PS2X_PGO_FILES MATCHES "Unity#unity_")
+            set(PS2X_VITA_PGO_GAME_FLAGS ${PS2X_VITA_PGO_FLAGS})
+        endif()
+    endif()
+    if(PS2X_VITA_PGO_FLAGS)
+        if(PS2X_VITA_PGO_GAME_FLAGS)
+            message(STATUS "Vita: PGO ${PS2X_VITA_PGO} (overrides, runtime, recompiled game)")
+        else()
+            message(STATUS "Vita: PGO ${PS2X_VITA_PGO} (overrides, runtime)")
+        endif()
+        target_compile_options(ps2_runtime PRIVATE ${PS2X_VITA_PGO_FLAGS})
+        if(PS2X_VITA_PGO_GAME_FLAGS)
+            target_compile_options(ps2EntryRunner PRIVATE ${PS2X_VITA_PGO_GAME_FLAGS})
+        endif()
+    endif()
+    set(PS2X_VITA_OVERRIDE_OPTS -O3 ${PS2X_VITA_PGO_FLAGS})
+    # Round 130: PS2X_VITA_RELEASE (below, with the --wrap lines): the runtime, the sound side and the game
+    # overrides with SOTC_RELEASE=1 (not the recompiled game: it reads no switch).
+    option(PS2X_VITA_RELEASE "Vita: release build (diagnostics compiled out)" OFF)
+    if(PS2X_VITA_RELEASE)
+        message(STATUS "Vita: release build (SOTC_RELEASE=1)")
+        list(APPEND PS2X_VITA_OVERRIDE_OPTS -DSOTC_RELEASE=1)
+        foreach(PS2X_VITA_TARGET IN ITEMS ps2_runtime ps2_iop)
+            if(TARGET ${PS2X_VITA_TARGET})
+                target_compile_definitions(${PS2X_VITA_TARGET} PRIVATE SOTC_RELEASE=1)
+            endif()
+        endforeach()
+    endif()
+    get_target_property(PS2X_RUNNER_SOURCES ps2EntryRunner SOURCES)
+    foreach(PS2X_SOURCE IN LISTS PS2X_RUNNER_SOURCES)
+        if(PS2X_SOURCE MATCHES "/overrides/lean_part[^/]*\\.cpp$")
+            # Recompiled code like the rest of it.
+            set_source_files_properties(${PS2X_SOURCE} PROPERTIES COMPILE_OPTIONS "${PS2X_VITA_GAME_OPT}")
+        elseif(PS2X_SOURCE MATCHES "/overrides/sotc_native\\.cpp$" AND PS2X_VITA_PGO STREQUAL "gen")
+            # The instrumented build's text ends elsewhere: its own room for vita-elf-create (sotc_native.cpp).
+            set_source_files_properties(${PS2X_SOURCE} PROPERTIES COMPILE_OPTIONS
+                "${PS2X_VITA_OVERRIDE_OPTS};-DSOTC_VITA_ELF_ROOM=${PS2X_VITA_PGO_ELF_ROOM}")
+        elseif(PS2X_SOURCE MATCHES "/overrides/[^/]*\\.cpp$")
+            set_source_files_properties(${PS2X_SOURCE} PROPERTIES COMPILE_OPTIONS "${PS2X_VITA_OVERRIDE_OPTS}")
+        elseif(PS2X_SOURCE MATCHES "vu1rec_[^/]*\\.cpp$")
+            # Not instrumented (PS2X_VITA_PGO_GAME): one huge generated microcode function then fails to assemble
+            # (Thumb conditional branches out of range).
+            if(PS2X_VITA_PGO STREQUAL "gen")
+                set_source_files_properties(${PS2X_SOURCE} PROPERTIES COMPILE_OPTIONS "-O2;-fno-profile-arcs")
+            else()
+                set_source_files_properties(${PS2X_SOURCE} PROPERTIES COMPILE_OPTIONS "-O2")
+            endif()
+        endif()
+    endforeach()
+    # Round 66: the hot code together at the start of .text. Every function
+    # in a section of its own, and the linker places the ones Vita3K
+    # profiles sampled (vita_hot_order.ld in a runner directory, written by
+    # tools/vita_hot_order.py; hottest first) before the rest: ~11 MB of the
+    # ~36 MB of code, 90% of the samples in its first ~2 MB, instead of
+    # spread over all of it (fewer pages / TLB entries / L2 sets for the
+    # console's Cortex-A9; Vita3K's JIT does not see the layout).
+    option(PS2X_VITA_FUNCTION_SECTIONS "Vita: -ffunction-sections and the hot-code order file" ON)
+    set(PS2X_VITA_HOT_ORDER "" CACHE FILEPATH "Vita: ld section-ordering file (empty: vita_hot_order.ld of a runner directory)")
+    if(PS2X_VITA_FUNCTION_SECTIONS)
+        foreach(PS2X_VITA_TARGET IN ITEMS ps2_runtime ps2EntryRunner ps2_iop)
+            if(TARGET ${PS2X_VITA_TARGET})
+                target_compile_options(${PS2X_VITA_TARGET} PRIVATE -ffunction-sections)
+            endif()
+        endforeach()
+        set(PS2X_VITA_HOT_ORDER_FILE "${PS2X_VITA_HOT_ORDER}")
+        if(NOT PS2X_VITA_HOT_ORDER_FILE)
+            foreach(PS2X_RUNNER_DIR IN LISTS PS2X_RUNNER_DIRS)
+                if(EXISTS "${PS2X_RUNNER_DIR}/vita_hot_order.ld")
+                    set(PS2X_VITA_HOT_ORDER_FILE "${PS2X_RUNNER_DIR}/vita_hot_order.ld")
+                endif()
+            endforeach()
+        endif()
+        if(PS2X_VITA_HOT_ORDER_FILE AND EXISTS "${PS2X_VITA_HOT_ORDER_FILE}")
+            message(STATUS "Vita: hot-code order from ${PS2X_VITA_HOT_ORDER_FILE}")
+            target_link_options(ps2EntryRunner PRIVATE "-Wl,--section-ordering-file=${PS2X_VITA_HOT_ORDER_FILE}")
+            set_property(TARGET ps2EntryRunner APPEND PROPERTY LINK_DEPENDS "${PS2X_VITA_HOT_ORDER_FILE}")
+        endif()
+    endif()
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    # Round mem99: malloc & co. through ps2_vita_runtime.cpp (SOTC_HEAP_PROF).
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--wrap=malloc,--wrap=free,--wrap=realloc,--wrap=calloc,--wrap=memalign")
+    # Round 130: PS2X_VITA_RELEASE=ON: the build the player plays. SOTC_RELEASE=1 (runtime/ps2_diag.h): the
+    # diagnostics' switches (checks, verifies, per-subsystem logs and stats, the difftest, the A/B rotation, the
+    # profilers) read as off at compile time and their paths dropped; no per-call timers. The frame summary
+    # (SOTC_FRAME_LOG=1) still works. OFF (default): the dev build, every switch from env.txt as before.
+    # (the option and its definitions: above, with the overrides' options)
+    # Round 130 (measuring only): PS2X_VITA_DIAGCOUNT=ON counts the diagnostics' library calls by caller
+    # (src/lib/ps2_vita_diagcount.cpp, "[diag130]" lines every 10 s). Never for a shipped VPK.
+    option(PS2X_VITA_DIAGCOUNT "Vita: count clock reads / getenv / formatting calls by caller (measuring build)" OFF)
+    if(PS2X_VITA_DIAGCOUNT)
+        target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_diagcount.cpp)
+        set_source_files_properties(src/lib/ps2_vita_diagcount.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE COMPILE_OPTIONS "-fno-lto")
+        target_link_options(ps2EntryRunner PRIVATE
+            "-Wl,--wrap=sceKernelGetProcessTimeWide,--wrap=sceKernelGetProcessTimeLow,--wrap=getenv,--wrap=sceKernelGetThreadInfo,--wrap=vsnprintf,--wrap=snprintf,--wrap=fprintf,--wrap=sceKernelSignalSema,--wrap=sceKernelLibcGettimeofday")
+    endif()
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_vita_runtime.cpp PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        COMPILE_OPTIONS "-fno-lto"
+    )
+endif()
+
+if(PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+endif()
+
+install(TARGETS ps2_runtime ps2EntryRunner
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+if(WIN32 AND PS2X_ENABLE_FFMPEG)
+    install(DIRECTORY "${FFMPEG_BIN_DIR}/"
+        DESTINATION bin
+        FILES_MATCHING
+        PATTERN "*.dll"
+    )
+endif()
+
+install(DIRECTORY include/
+    DESTINATION include
+)

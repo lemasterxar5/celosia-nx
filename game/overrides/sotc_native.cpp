@@ -1,0 +1,12136 @@
+#include <tuple>
+// Shadow of the Colossus: models drawn by the native renderer
+// (runtime/native_renderer.h) straight from the game's own model data, read
+// at modelDisp (docs/native_renderer_map.md). SOTC_NATIVE=1 shows that
+// picture instead of the emulated one; the emulated drawing still runs.
+//
+// What is read: the model header (packets at +0x60/+0x64), the instance's
+// LOD (bits 40-42 of the 64-bit word at instance + 0x250), the part
+// visibility the clip left (LOD table at header + 0x30, part x 0x30 + 0x2c),
+// and per packet its world batches (VIF: GIF tag, V3-32 positions, V2-16 ST,
+// V4-8 colours, each batch ending in MSCNT; triangle strips). The matrix is
+// camera (camera context + 0x5a0) x model (modelDisp's second argument).
+// Textures: the surface's index (+0x2c) into the model's table (+0x40,
+// 0x20 each; +0x10 the texture object, whose +0x20 is the "NTO2" header:
+// +0x14 pixels, +0x18 CLUT, +0x1c format | log2 width << 16 | log2 height
+// << 20; byte +0x1f bit 0: level 0 uploaded as PSMCT32, W/2 x H/2 (8-bit)
+// or W/2 x H/4 (4-bit), so the pixels are in GS block order).
+// Skinned parts (characters) are posed on the CPU every frame from the bone
+// palette in their instance chain (readPalette).
+// Lit batches (normals) are lit per vertex as the VU1's lit microcode does,
+// from the lights in the instance's own packet.
+// Not yet: the second texture and mip levels.
+
+#include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
+#include "runtime/native_tuning.h"
+#include "runtime/native_recorder.h"
+#include "runtime/host_menu.h"
+#include "runtime/native_renderer.h"
+#include "runtime/ps2_diag.h"
+#include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/ps2_gs_psmct32.h"
+#include "runtime/gs/ps2_gs_psmt4.h"
+#include "runtime/gs/ps2_gs_psmt8.h"
+#include "runtime/ps2_stats.h"
+#include "runtime/ps2_fast_paths.h"
+#include "ps2x/iop/audio_stats.h"
+#include "runtime/ps2_thread_load.h"
+#include "runtime/ee_scheduler.h"
+#include "sotc_prof.h"
+#include "sotc_decomp.h"
+#include "sotc_worker.h"
+namespace char104 // round 104 (decomp_char104.cpp)
+{
+    void install(PS2Runtime &runtime);
+    void frameTick(uint64_t frame);
+    void setAb(bool on);
+    void setAb108(bool nat, bool snap, bool anime); // round 108
+    void setAb109(bool anime, bool open, bool obj); // round 109
+    void setAb111(bool hold, bool delta);            // round 111
+    void setAb114(bool gain, bool net);              // round 114
+}
+#include "lines67.h"
+#include "lean_hot.h"
+#include "ThreadNaming.h"
+
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <map>
+#include <memory>
+#include <new>
+#include <optional>
+#include <cmath>
+#if defined(__arm__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#include <cstdio>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <chrono>
+#include <iostream>
+#include <thread>
+#include <set>
+#include <string>
+#include <sys/stat.h>
+#if !defined(__vita__) && !defined(__SWITCH__)
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+extern "C" unsigned int _pthread_stack_default_user; // ps2_vita_runtime.cpp
+extern "C" void ps2x_vita_pace_ab(int on);                // raylib_vita.cpp (round 110)
+extern "C" void ps2x_vita_pace132_ab(int on);             // raylib_vita.cpp (round 132)
+#endif
+#include <vector>
+
+namespace sotc_native
+{
+    bool mdsTraceOn(); // round 61's SOTC_MDS_TRACE (mdstrace, below)
+    void mdsTraceModel();
+    void mdsTraceFrame();
+    constexpr uint32_t kModelDisp = 0x01097118u, kGetCameraContext = 0x0108F518u;
+    PS2Runtime::RecompiledFunction g_modelDisp = nullptr, g_getCameraContext = nullptr;
+    uint32_t g_cameraContext = 0;
+    uint64_t g_frame = 0;
+    uint32_t g_frameDraws = 0;
+    uint32_t g_modelDraws = 0; // 3D draws this frame
+
+    // The frame timing log (Debug 'Frame timing log', SOTC_FRAME_LOG): the
+    // native hooks' own time (after the recompiled call they wrap).
+    struct HookTimer
+    {
+        uint64_t start = ps2_diag::kTimers && native_renderer::tuning().frameTiming() ? native_renderer::nowUs() : 0u;
+        ~HookTimer()
+        {
+            if (start)
+                native_renderer::frameCounters().hookUs += native_renderer::nowUs() - start;
+        }
+    };
+
+    // Round 32: the game thread's work at a frame's change (syncFrame) by
+    // part, the last change's (frameLog prints it: "sync ..."): the join,
+    // endFrame (the renderer's hand-over), the frame log itself, the sound
+    // log, the idle thread's turn, the rest (the next frame's start).
+    enum SyncPart { kSyncJoin, kSyncEnd, kSyncLog, kSyncAudio, kSyncIdle, kSyncRest, kSyncParts };
+    uint64_t g_syncUs[kSyncParts] = {};
+
+    // The model jobs' worker (round 23, below at modelDispHook).
+    namespace hookjobs
+    {
+        extern bool g_on;
+        extern uint64_t g_lastSiteUs[];
+        extern const char *const kSiteNames[];
+        enum Site { k_zfog, k_frame, k_glend, k_gsreg_feedback, k_gsreg_refraction, k_gsreg_2d, k_meshdisp, k_shadowdisp, k_ptclenv, k_ptclvtx, k_screenblur, k_move, k_kick, kSites };
+        void join(Site site);
+        void frameEnd();
+        void frameStart();
+    }
+    inline void hookJoin(hookjobs::Site site)
+    {
+        if (hookjobs::g_on)
+            hookjobs::join(site);
+    }
+    // Round 61: modelDispState's lane (below, before modelDispHook).
+    namespace mdslane
+    {
+        extern bool g_frameOn, g_switch;
+        extern std::atomic<int> g_help;
+        extern uint64_t g_helpUs, g_helpJobs, g_helpJoins;
+        extern std::atomic<uint64_t> g_workerHelpFrame;
+        void join(int site);
+        void frameStart(bool hookWorkerOn);
+    }
+
+    // Round 76: the frame log's lines on a thread of their own (below, before frameLog).
+    namespace log76
+    {
+        extern bool g_switch;
+    }
+
+    const uint8_t *g_ram = nullptr;
+    // Round 34, -DSOTC_READ_TRACK (check builds, r34/rt): the guest words the
+    // thread reads while t_readTrack (4-byte granules, g_readBits), for
+    // SOTC_KICK_DEFER_CHECK. Nothing in other builds.
+#if defined(SOTC_READ_TRACK)
+    thread_local bool t_readTrack = false;
+    uint8_t *g_readBits = nullptr; // 32 MB / 4 bits
+    thread_local uint8_t t_readSite = 0;
+    uint8_t *g_readTag = nullptr; // a word's last reader (SOTC_READ_SITE)
+    inline void noteRead(uint32_t addr, uint32_t bytes)
+    {
+        if (!t_readTrack || !bytes || !g_readBits)
+            return;
+        for (uint32_t a = addr & ~3u, end = addr + bytes; a < end; a += 4u)
+        {
+            const uint32_t w = (a & 0x1FFFFFFu) >> 2;
+            g_readBits[w >> 3] |= static_cast<uint8_t>(1u << (w & 7u));
+            g_readTag[w] = t_readSite;
+        }
+    }
+    struct ReadSite
+    {
+        uint8_t prev;
+        explicit ReadSite(uint8_t site) : prev(t_readSite) { t_readSite = site; }
+        ~ReadSite() { t_readSite = prev; }
+    };
+#define SOTC_READ_SITE_CAT2(a, b) a##b
+#define SOTC_READ_SITE_CAT(a, b) SOTC_READ_SITE_CAT2(a, b)
+#define SOTC_READ_SITE(n) ::sotc_native::ReadSite SOTC_READ_SITE_CAT(readSite_, __LINE__)(n)
+    const char *const kReadSiteNames[] = {"other", "modelDispDraw", "verify", "surfaceRow/Scroll", "surface", "packetId", "texture", "palette", "skinRecord",
+                                          "mesh/shadow/ptcl/2D", "kick pass", "build copy", "lod", "draw's scroll row", "plan walk"};
+#else
+    inline void noteRead(uint32_t, uint32_t) {}
+#define SOTC_READ_SITE(n)
+#endif
+    // The display walk's fast paths (2026-10-22 evening), on unless
+    // SOTC_NATIVE_R2=0 (no longer alternated by SOTC_AB); set once a frame
+    // (syncFrame). Each part has a switch of its own too.
+    bool g_r2 = true;
+    // SOTC_MOVE_MEMO=0: a packet / texture moved by a garbage move is hashed again (round 13).
+    bool g_moveMemo = !std::getenv("SOTC_MOVE_MEMO") || std::atoi(std::getenv("SOTC_MOVE_MEMO")) != 0;
+    bool g_quickTextures = true; // decodedTexture: no sample for a texture drawn the frame before (SOTC_TEX_QUICK=0: off)
+    bool g_surfaceMemo = true;   // modelDispHook: a surface's state worked out once a frame (SOTC_SURFACE_MEMO=0: off)
+    bool g_prefetch = true;      // modelDispState / modelDispHook: guest lines asked for ahead (SOTC_HOOK_PREFETCH=0: off)
+    // Round 32: modelDispHook's game-thread part leaner (SOTC_HOOK_LEAN=0:
+    // round 31's): the part tree walked once (modelDispState's walk gives the
+    // job its parts), the palette read straight into the job, the matrices
+    // and lights copied as blocks, the prefetch queue pumped while the draw
+    // runs (it was only at the next draw's start with the plans and the
+    // worker on) and the next draw's matrix, palette and plan asked for.
+    // SOTC_HOOK_LEAN_CHECK=1: both ways each draw, the jobs compared
+    // ([hook-lean] every 600 frames). Read at the first draw (the Vita's
+    // env.txt comes after static init).
+#if defined(SOTC_HOOK_ASM_LEAN)
+    constexpr bool g_hookLean = true;
+#else
+    bool g_hookLean = true;
+#endif
+    struct LeanStats
+    {
+        uint64_t partChecks = 0, partDiffer = 0, paletteChecks = 0, paletteDiffer = 0;
+        // SOTC_HOOK_LEAN_STATS=1 (or the check): the game thread's part of
+        // the draws, counted the same either way: draws, nodes of the hook's
+        // second walk, palette bytes moved on the host (the VU picture's
+        // clear and copies / the job's own), queued lines asked for / dropped.
+        bool on = false;
+        uint64_t draws = 0, walkNodes = 0, paletteHostBytes = 0, queuePumped = 0, queueDropped = 0;
+    } g_leanStats;
+    // -DSOTC_HOOK_ASM_LEAN (r32/nasm.sh, instruction counts only): the lean
+    // path alone, no checks or counters compiled in.
+#if defined(SOTC_HOOK_ASM_LEAN)
+    constexpr bool leanStatsOn() { return false; }
+#else
+    inline bool leanStatsOn() { return g_leanStats.on; }
+#endif
+    bool g_planOn = true;        // modelDispHook: draw plans kept across frames (SOTC_PLAN=0: off)
+    uint32_t g_planVerify = 0;   // SOTC_PLAN_VERIFY=<n>: plan against the packet walk every n-th frame
+    // SOTC_R2_CHECK=1 (debugging): the new paths checked against the old ones
+    // at every use (the quick texture against its full sample, each surface's
+    // kept state against the reads it replaces); counts every 600 frames.
+    struct R2Check
+    {
+        bool on = ps2_diag::env("SOTC_R2_CHECK") != nullptr;
+        uint64_t texQuick = 0, texStale = 0, surfaces = 0, surfaceMismatches = 0, packetQuick = 0, packetStale = 0;
+        void note(const char *what, bool bad)
+        {
+            if (!bad)
+                return;
+            ++surfaceMismatches;
+            static int told = 0;
+            if (told++ < 40)
+                std::fprintf(stderr, "[r2-check] mismatch: %s\n", what);
+        }
+    };
+    // Made at the first use (after the environment is read), then a plain
+    // pointer: a function-local static costs a guard check with a barrier
+    // (dmb) at every call on the Vita, and this is asked twice a draw.
+    R2Check *g_r2Check = nullptr;
+    inline R2Check &r2Check()
+    {
+        if (!g_r2Check)
+            g_r2Check = new R2Check;
+        return *g_r2Check;
+    }
+    inline void prefetchGuest(uint32_t addr)
+    {
+        lines67::pref(addr);
+        __builtin_prefetch(g_ram + (addr & 0x1FFFFE0u));
+    }
+    // Round 32: `bytes` (a multiple of 4) of guest memory from addr as real()
+    // / word() read them one by one (each word's address masked): one copy
+    // when the block does not wrap at the 32 MB end.
+    inline void guestBlock(uint32_t addr, uint32_t bytes, void *out)
+    {
+        const uint32_t at = addr & 0x1FFFFFCu;
+        noteRead(addr, bytes);
+        if (at + bytes <= 0x2000000u)
+            std::memcpy(out, g_ram + at, bytes);
+        else
+            for (uint32_t i = 0; i < bytes; i += 4u)
+                std::memcpy(static_cast<uint8_t *>(out) + i, g_ram + ((addr + i) & 0x1FFFFFCu), 4);
+    }
+    uint32_t word(uint32_t addr)
+    {
+        noteRead(addr, 4u);
+        lines67::touch(addr);
+        uint32_t v;
+        std::memcpy(&v, g_ram + (addr & 0x1FFFFFCu), 4);
+        return v;
+    }
+    float real(uint32_t addr)
+    {
+        noteRead(addr, 4u);
+        lines67::touch(addr);
+        float v;
+        std::memcpy(&v, g_ram + (addr & 0x1FFFFFCu), 4);
+        return v;
+    }
+
+    // SOTC_HOOK_STATS=1 (debugging): what modelDispHook walked, every 120 frames.
+    struct HookStats
+    {
+        bool on = ps2_diag::env("SOTC_HOOK_STATS") != nullptr;
+        uint64_t instances = 0, packets = 0, lodPackets = 0, draws = 0, textures = 0, decoded = 0, idSame = 0, idPrev = 0, idQuick = 0, idSampled = 0, idMoved = 0,
+                 idHashed = 0, nodes = 0, surfaces = 0, surfaceHits = 0;
+        std::set<uint32_t> headers, surfaceSet, textureSet;
+    };
+    HookStats *g_hookStats = nullptr; // as r2Check: no guard per call
+    inline HookStats &hookStats()
+    {
+        if (!g_hookStats)
+            g_hookStats = new HookStats;
+        return *g_hookStats;
+    }
+
+    // A vertex as the batch gives it: model space, or bind pose with up to
+    // three bones (palette matrices) and weights.
+    struct BatchVertex
+    {
+        float x, y, z;
+        float u, v;
+        float u2, v2;     // the second texture's (two-texture surfaces)
+        float nx, ny, nz; // lit batches
+        uint8_t r, g, b, a;
+        uint8_t bones;
+        uint8_t bone[3];
+        float weight[3];
+        uint32_t skin[4]; // the skin qword as it came (shadow models read it their own way)
+    };
+    using Strip = std::vector<BatchVertex>;
+
+    // The packet's batches, one triangle strip each (they end in MSCNT).
+    // STCYCL n+1 interleaves n fields per vertex; each UNPACK's address is
+    // its field: 0 GIF tag, 1 position (V3-32), then by format
+    //   V2-16 ST, V4-8 colour (unlit)
+    //   V4-16 two ST pairs (two textures), V4-8 colour
+    //   V3-32 normal, V2-16 ST, V4-8 colour (lit)
+    //   V4-16 normal, V2-16 ST, V4-8 colour, V4-32 skin (skinned)
+    // Skin: w = bone count, x/y/z = bone index + weight (the fraction; one
+    // bone: full weight); the bone is palette matrix n (VU1 qwords 4n..4n+3).
+    template <typename Mem>
+    void readBatchesFrom(const Mem &m, uint32_t addr, uint32_t size, std::vector<Strip> &out)
+    {
+        const uint32_t end = addr + size;
+        uint32_t p = addr;
+        uint32_t positions = 0, normals = 0, colours = 0, uvs = 0, pairs = 0, skin = 0, count = 0;
+        while (p < end)
+        {
+            const uint32_t code = m.word(p);
+            p += 4;
+            const uint32_t cmd = (code >> 24) & 0x7Fu, num = (code >> 16) & 0xFFu, field = code & 0x3FFu;
+            uint32_t words = 0;
+            if ((cmd & 0x60u) == 0x60u)
+            {
+                const uint32_t vn = (cmd >> 2) & 3u, vl = cmd & 3u, n = num ? num : 256u;
+                words = (n * (vn + 1u) * (32u >> vl) + 31u) / 32u;
+                switch (cmd & 0x6Fu)
+                {
+                case 0x68u: // V3-32: position at field 1 (a normal elsewhere)
+                    if (field == 1u)
+                    {
+                        positions = p;
+                        count = n;
+                    }
+                    else
+                        normals = p;
+                    break;
+                case 0x6Eu:
+                    colours = p;
+                    break;
+                case 0x65u: // ST, 12-bit fraction (VIF ROW taken as 0)
+                    uvs = p;
+                    break;
+                case 0x6Du: // two ST pairs, or a normal
+                    pairs = p;
+                    break;
+                case 0x6Cu:
+                    if (field != 0u)
+                        skin = p;
+                    break;
+                }
+            }
+            else if (cmd == 0x20u)
+                words = 1;
+            else if (cmd == 0x30u || cmd == 0x31u)
+                words = 4;
+            else if (cmd == 0x4Au)
+                words = (num ? num : 256u) * 2u;
+            else if (cmd == 0x50u || cmd == 0x51u)
+                words = ((code & 0xFFFFu) ? (code & 0xFFFFu) : 65536u) * 4u;
+            else if (cmd == 0x14u || cmd == 0x15u || cmd == 0x17u) // the batch goes to VU1
+            {
+                if (positions)
+                {
+                    Strip strip(count);
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        BatchVertex &v = strip[i];
+                        v = {m.real(positions + i * 12u), m.real(positions + i * 12u + 4u), m.real(positions + i * 12u + 8u), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 128, 128, 128, 128, 0, {0, 0, 0}, {0.0f, 0.0f, 0.0f}};
+                        // V4-16 is the normal when the ST comes apart (V2-16), else two ST pairs.
+                        const uint32_t st = uvs ? m.word(uvs + i * 4u) : (pairs ? m.word(pairs + i * 8u) : 0u);
+                        if (pairs && !uvs) // the second texture's pair
+                        {
+                            const uint32_t st2 = m.word(pairs + i * 8u + 4u);
+                            v.u2 = static_cast<int16_t>(st2 & 0xFFFFu) / 4096.0f;
+                            v.v2 = static_cast<int16_t>(st2 >> 16) / 4096.0f;
+                        }
+                        if (normals)
+                        {
+                            v.nx = m.real(normals + i * 12u);
+                            v.ny = m.real(normals + i * 12u + 4u);
+                            v.nz = m.real(normals + i * 12u + 8u);
+                        }
+                        else if (pairs && uvs)
+                        {
+                            const uint32_t xy = m.word(pairs + i * 8u), z = m.word(pairs + i * 8u + 4u);
+                            v.nx = static_cast<int16_t>(xy & 0xFFFFu) / 4096.0f;
+                            v.ny = static_cast<int16_t>(xy >> 16) / 4096.0f;
+                            v.nz = static_cast<int16_t>(z & 0xFFFFu) / 4096.0f;
+                        }
+                        v.u = static_cast<int16_t>(st & 0xFFFFu) / 4096.0f;
+                        v.v = static_cast<int16_t>(st >> 16) / 4096.0f;
+                        if (colours)
+                        {
+                            const uint32_t c = m.word(colours + i * 4u);
+                            v.r = static_cast<uint8_t>(c);
+                            v.g = static_cast<uint8_t>(c >> 8);
+                            v.b = static_cast<uint8_t>(c >> 16);
+                            v.a = static_cast<uint8_t>(c >> 24);
+                        }
+                        if (skin)
+                        {
+                            const uint32_t q = skin + i * 16u;
+                            for (uint32_t k = 0; k < 4u; ++k)
+                                v.skin[k] = m.word(q + k * 4u);
+                            v.bones = static_cast<uint8_t>(std::min(m.word(q + 12u), 3u));
+                            for (uint32_t k = 0; k < v.bones; ++k)
+                            {
+                                const float packed = m.real(q + k * 4u);
+                                const float bone = std::floor(packed);
+                                v.bone[k] = static_cast<uint8_t>(std::clamp(bone, 0.0f, 255.0f));
+                                v.weight[k] = v.bones == 1 ? 1.0f : packed - bone;
+                            }
+                        }
+                    }
+                    out.push_back(std::move(strip));
+                }
+                positions = normals = colours = uvs = pairs = skin = count = 0;
+            }
+            p += words * 4u;
+        }
+    }
+
+    // Guest memory as readBatches reads it: the game's, or a copy of a
+    // packet's bytes (the async worker; past the copy reads 0).
+    struct GuestMem
+    {
+        uint32_t word(uint32_t a) const { return sotc_native::word(a); }
+        float real(uint32_t a) const { return sotc_native::real(a); }
+    };
+    struct CopyMem
+    {
+        uint32_t base;
+        const std::vector<uint8_t> *bytes;
+        uint32_t word(uint32_t a) const
+        {
+            const uint32_t off = (a & ~3u) - base;
+            uint32_t v = 0;
+            if (off <= bytes->size() && bytes->size() - off >= 4u)
+                std::memcpy(&v, bytes->data() + off, 4);
+            return v;
+        }
+        float real(uint32_t a) const
+        {
+            const uint32_t v = word(a);
+            float f;
+            std::memcpy(&f, &v, 4);
+            return f;
+        }
+    };
+    void readBatches(uint32_t addr, uint32_t size, std::vector<Strip> &out) { readBatchesFrom(GuestMem{}, addr, size, out); }
+
+    bool lit(const std::vector<Strip> &strips)
+    {
+        for (const Strip &strip : strips)
+            if (!strip.empty() && (strip[0].nx != 0.0f || strip[0].ny != 0.0f || strip[0].nz != 0.0f))
+                return true;
+        return false;
+    }
+
+    // Strips as a triangle list; `place` maps a batch vertex (position,
+    // normal) to the mesh's space. Unlit strips get face normals.
+    template <typename Place>
+    void triangulate(const std::vector<Strip> &strips, Place place, std::vector<native_renderer::Vertex> &out, bool secondTexture = false)
+    {
+        std::vector<native_renderer::Vertex> placed;
+        for (const Strip &strip : strips)
+        {
+            placed.resize(strip.size());
+            for (size_t i = 0; i < strip.size(); ++i)
+            {
+                const BatchVertex &v = strip[i];
+                native_renderer::Vertex &o = placed[i];
+                place(v, o);
+                o.u = secondTexture ? v.u2 : v.u;
+                o.v = secondTexture ? v.v2 : v.v;
+                o.r = v.r;
+                o.g = v.g;
+                o.b = v.b;
+                o.a = v.a;
+            }
+            for (size_t i = 2; i < placed.size(); ++i)
+            {
+                native_renderer::Vertex t[3] = {placed[i - 2], placed[i - 1], placed[i]};
+                const float ux = t[1].x - t[0].x, uy = t[1].y - t[0].y, uz = t[1].z - t[0].z;
+                const float vx = t[2].x - t[0].x, vy = t[2].y - t[0].y, vz = t[2].z - t[0].z;
+                float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+                const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (!(len > 0.0f))
+                    continue; // degenerate (strip joins)
+                for (native_renderer::Vertex &v : t)
+                {
+                    if (v.nx == 0.0f && v.ny == 0.0f && v.nz == 0.0f)
+                    {
+                        v.nx = nx / len;
+                        v.ny = ny / len;
+                        v.nz = nz / len;
+                    }
+                    out.push_back(v);
+                }
+            }
+        }
+    }
+
+    bool skinned(const std::vector<Strip> &strips)
+    {
+        for (const Strip &strip : strips)
+            if (!strip.empty() && strip[0].bones)
+                return true;
+        return false;
+    }
+
+    // An NTO2 texture (level 0) as RGBA8, on the GPU once under its header address.
+    // The game streams data in and reuses memory when the area changes: what
+    // is cached under an address is also keyed by a sample of its contents.
+    // sample() of the bytes at `addr` as if they were at `seed` (a moved packet).
+    uint64_t sampleAt(uint32_t addr, uint32_t seed, uint32_t bytes, uint32_t samples)
+    {
+        uint64_t h = 0xcbf29ce484222325ull ^ seed;
+        const uint32_t step = std::max<uint32_t>((bytes / samples) & ~3u, 4u);
+        for (uint32_t off = 0; off + 4u <= bytes; off += step)
+            h = (h ^ word(addr + off)) * 0x100000001b3ull;
+        return h;
+    }
+    uint64_t sample(uint32_t addr, uint32_t bytes, uint32_t samples)
+    {
+        uint64_t h = 0xcbf29ce484222325ull ^ addr;
+        const uint32_t step = std::max<uint32_t>((bytes / samples) & ~3u, 4u);
+        for (uint32_t off = 0; off + 4u <= bytes; off += step)
+            h = (h ^ word(addr + off)) * 0x100000001b3ull;
+        return h;
+    }
+
+    // A hash of every byte of guest memory from addr (word aligned) on, 8 at a
+    // time (content ids: packetId, decodedTexture).
+    // SOTC_HASH_STATS=1 (debugging, round 13): bytes hashed per frame, by packets / textures.
+    uint64_t g_hashBytes[2] = {0, 0};
+    uint64_t g_hashCalls[2] = {0, 0};
+    // Round 14: four 32-bit lanes (xxHash32's round: multiply, rotate,
+    // multiply), 16 bytes a step, the lanes independent: the Cortex-A9 has
+    // no 64-bit multiply and the old chain (one 64-bit multiply and a shift
+    // per 8 bytes, each on the last) ran ~3 cycles a byte in calibrated
+    // Vita3K (25 ms of an area change's cut frame for ~2 MB of new packets).
+    // The 128 bits of state end in a 64-bit finaliser. Ids are only compared
+    // within a run. SOTC_FAST_HASH=0: the old hash.
+    const bool g_fastHash = !std::getenv("SOTC_FAST_HASH") || std::atoi(std::getenv("SOTC_FAST_HASH")) != 0;
+    inline uint32_t rotl32(uint32_t v, int r) { return (v << r) | (v >> (32 - r)); }
+    uint64_t contentHashLanes(const uint8_t *p, uint32_t bytes, uint64_t h)
+    {
+        constexpr uint32_t P1 = 0x9E3779B1u, P2 = 0x85EBCA77u, P3 = 0xC2B2AE3Du, P4 = 0x27D4EB2Fu;
+        const uint32_t lo = static_cast<uint32_t>(h), hi = static_cast<uint32_t>(h >> 32);
+        uint32_t a = lo + P1 + P2, b = lo + P2, c = hi, d = hi - P1;
+        uint32_t i = 0;
+        for (; i + 16u <= bytes; i += 16u)
+        {
+            uint32_t w[4];
+            std::memcpy(w, p + i, 16);
+            a = rotl32(a + w[0] * P2, 13) * P1;
+            b = rotl32(b + w[1] * P2, 13) * P1;
+            c = rotl32(c + w[2] * P2, 13) * P1;
+            d = rotl32(d + w[3] * P2, 13) * P1;
+        }
+        uint32_t t = rotl32(a, 1) + rotl32(b, 7) + rotl32(c, 12) + rotl32(d, 18);
+        uint32_t u = rotl32(a, 3) ^ rotl32(b, 11) ^ rotl32(c, 19) ^ rotl32(d, 27);
+        t += bytes;
+        for (; i + 4u <= bytes; i += 4u)
+        {
+            uint32_t w;
+            std::memcpy(&w, p + i, 4);
+            t = rotl32(t + w * P3, 17) * P4;
+            u = rotl32(u ^ (w * P1), 15) * P2;
+        }
+        for (; i < bytes; ++i)
+        {
+            t = rotl32(t + p[i] * 0x165667B1u, 11) * P1;
+            u = rotl32(u ^ (p[i] * P3), 13) * P4;
+        }
+        uint64_t x = (static_cast<uint64_t>(u) << 32) | t;
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ull;
+        x ^= x >> 33;
+        return x;
+    }
+    uint64_t contentHash(uint32_t addr, uint32_t bytes, uint64_t h)
+    {
+        addr &= 0x1FFFFFCu;
+        noteRead(addr, bytes);
+        if (g_fastHash)
+        {
+            if (addr + bytes <= 0x2000000u)
+                return contentHashLanes(g_ram + addr, bytes, h);
+            std::vector<uint8_t> copy(bytes);
+            for (uint32_t i = 0; i < bytes; ++i)
+                copy[i] = g_ram[(addr + i) & 0x1FFFFFFu];
+            return contentHashLanes(copy.data(), bytes, h);
+        }
+        const auto mix = [&h](uint64_t v)
+        {
+            h = (h ^ v) * 0x100000001b3ull;
+            h ^= h >> 29;
+        };
+        if (addr + bytes <= 0x2000000u)
+        {
+            const uint8_t *p = g_ram + addr;
+            uint32_t i = 0;
+            for (; i + 8u <= bytes; i += 8u)
+            {
+                uint64_t v;
+                std::memcpy(&v, p + i, 8);
+                mix(v);
+            }
+            for (; i < bytes; ++i)
+                mix(p[i]);
+        }
+        else
+            for (uint32_t i = 0; i < bytes; ++i)
+                mix(g_ram[(addr + i) & 0x1FFFFFFu]);
+        return h;
+    }
+
+    // Memos by address, four ways a set (a scene draws a few thousand
+    // packets: one way a slot made neighbours evict each other every frame,
+    // and each time the full hash ran again); the way used longest ago goes.
+    template <typename Entry, uint32_t Sets>
+    struct WayMemo
+    {
+        Entry ways[Sets][4];
+        Entry &find(uint32_t address, uint32_t hash, bool &found)
+        {
+            Entry *set = ways[hash & (Sets - 1u)];
+            Entry *oldest = &set[0];
+            for (int i = 0; i < 4; ++i)
+            {
+                if (set[i].address == address)
+                {
+                    found = true;
+                    return set[i];
+                }
+                if (set[i].frame + 1u < oldest->frame + 1u) // ~0 (never used) first
+                    oldest = &set[i];
+            }
+            found = false;
+            return *oldest;
+        }
+    };
+    uint64_t decodedTexture(uint32_t header);
+    // texture() asked again for a header in the same frame: the key it gave
+    // (the contents sampled once a frame; was every draw).
+    struct TextureMemo
+    {
+        uint32_t header = 0;
+        uint64_t frame = ~0ull, key = 0;
+    };
+    TextureMemo g_textureMemo[256];
+    uint64_t texture(uint32_t header)
+    {
+        SOTC_READ_SITE(6);
+        if (!native_renderer::tuning().fastHooks)
+            return decodedTexture(header);
+        TextureMemo &memo = g_textureMemo[(header ^ (header >> 9)) & 255u];
+        if (HookStats &hs = hookStats(); hs.on)
+            ++hs.textures, hs.textureSet.insert(header);
+        if (memo.header == header && memo.frame == g_frame)
+            return memo.key;
+        if (HookStats &hs = hookStats(); hs.on)
+            ++hs.decoded;
+        const uint64_t key = decodedTexture(header);
+        memo = {header, g_frame, key};
+        return key;
+    }
+
+    // A texture as it is in guest memory, copied out (decodable on another
+    // thread): its format, the palette (CSM1 order undone), and the bytes of
+    // every level from the pixels' address on (and what a level's swizzled
+    // read reaches past them).
+    struct TexSource
+    {
+        uint32_t header = 0, psm = 0, width = 0, height = 0, levels = 1;
+        uint8_t swizzleBits = 0;
+        uint32_t palette[256] = {};
+        std::vector<uint8_t> pixels;
+    };
+
+    // GS memory as an 8-bit / 4-bit texture reads it after a PSMCT32 upload
+    // (the NTO2 swizzled levels), by page: a page is 8 KB in every format;
+    // within one, an 8-bit pixel's byte (128 x 64), a 4-bit pixel's nibble
+    // (128 x 128), and which 32-bit pixel (64 x 32) holds a byte. Made once
+    // from the GS's own address functions.
+    struct SwizzleTables
+    {
+        uint16_t t8[64 * 128], t4[128 * 128], inv32[2048];
+    };
+    const SwizzleTables &swizzleTables()
+    {
+        static const SwizzleTables *tables = []
+        {
+            auto *t = new SwizzleTables();
+            for (uint32_t y = 0; y < 64u; ++y)
+                for (uint32_t x = 0; x < 128u; ++x)
+                    t->t8[y * 128u + x] = static_cast<uint16_t>(GSPSMT8::addrPSMT8(0, 2, x, y));
+            for (uint32_t y = 0; y < 128u; ++y)
+                for (uint32_t x = 0; x < 128u; ++x)
+                    t->t4[y * 128u + x] = static_cast<uint16_t>(GSPSMT4::addrPSMT4(0, 2, x, y));
+            for (uint32_t y = 0; y < 32u; ++y)
+                for (uint32_t x = 0; x < 64u; ++x)
+                    t->inv32[GSPSMCT32::addrPSMCT32(0, 1, x, y) >> 2] = static_cast<uint16_t>(x | (y << 6));
+            return t;
+        }();
+        return *tables;
+    }
+
+    uint32_t log2u(uint32_t v)
+    {
+        uint32_t n = 0;
+        while ((1u << (n + 1u)) <= v)
+            ++n;
+        return n;
+    }
+
+    // The source of a texture (formats checked by the caller); false: no room.
+    bool texSource(uint32_t header, TexSource &src)
+    {
+        SOTC_READ_SITE(6);
+        const uint32_t format = word(header + 0x1Cu);
+        src.header = header;
+        src.psm = format & 0x3Fu;
+        src.width = 1u << ((format >> 16) & 0xFu);
+        src.height = 1u << ((format >> 20) & 0xFu);
+        // Mip levels (format bits 12-15, texTransResolve): each half the last,
+        // stored one after the other; byte +0x1f has a swizzle bit per level.
+        static const bool noMips = std::getenv("SOTC_NATIVE_NOMIPS") != nullptr;
+        src.levels = noMips ? 1u : std::clamp((format >> 12) & 0xFu, 1u, 7u);
+        noteRead(header + 0x1Fu, 1u);
+        src.swizzleBits = g_ram[(header + 0x1Fu) & 0x1FFFFFFu];
+        if (src.psm != 0x00u)
+        {
+            const uint32_t clut = header + word(header + 0x18u);
+            const uint32_t entries = src.psm == 0x14u ? 16u : 256u;
+            for (uint32_t i = 0; i < entries; ++i)
+            {
+                // CSM1: of every 32 entries, 8-15 and 16-23 are swapped.
+                const uint32_t from = entries == 256u ? ((i & ~0x18u) | ((i & 8u) << 1) | ((i & 16u) >> 1)) : i;
+                src.palette[i] = word(clut + from * 4u);
+            }
+        }
+        size_t at = 0, reach = 0;
+        for (uint32_t level = 0, w = src.width, h = src.height; level < src.levels && w >= 1u && h >= 1u; ++level, w /= 2u, h /= 2u)
+        {
+            const size_t bytes = src.psm == 0x00u ? static_cast<size_t>(w) * h * 4u : (src.psm == 0x13u ? static_cast<size_t>(w) * h : static_cast<size_t>(w) * h / 2u);
+            size_t read = bytes;
+            if (src.psm != 0x00u && ((src.swizzleBits >> level) & 1u))
+                read = static_cast<size_t>(std::max(w / 2u, 1u)) * std::max(src.psm == 0x13u ? h / 2u : h / 4u, 1u) * 4u;
+            reach = std::max(reach, at + read);
+            at += bytes;
+        }
+        try
+        {
+            src.pixels.resize(reach);
+        }
+        catch (const std::bad_alloc &)
+        {
+            return false;
+        }
+        const uint32_t pixels = (header + word(header + 0x14u)) & 0x1FFFFFFu;
+        noteRead(pixels, static_cast<uint32_t>(reach));
+        if (pixels + reach <= 0x2000000u)
+            std::memcpy(src.pixels.data(), g_ram + pixels, reach);
+        else
+            for (size_t i = 0; i < reach; ++i)
+                src.pixels[i] = g_ram[(pixels + i) & 0x1FFFFFFu];
+        return true;
+    }
+
+    // RGBA8 of every level, one after the other; `decoded` the levels made.
+    // Pure: runs on the async worker too.
+    bool decodeTexture(const TexSource &src, std::vector<uint8_t> &rgba, uint32_t &decoded)
+    {
+        const uint32_t psm = src.psm, entries = psm == 0x14u ? 16u : 256u;
+        const uint32_t *palette = src.palette;
+        size_t total = 0;
+        for (uint32_t level = 0, lw = src.width, lh = src.height; level < src.levels && lw >= 1u && lh >= 1u; ++level, lw /= 2u, lh /= 2u)
+            total += static_cast<size_t>(lw) * lh * 4u;
+        try
+        {
+            rgba.resize(total);
+        }
+        catch (const std::bad_alloc &)
+        {
+            return false;
+        }
+        const SwizzleTables &tables = swizzleTables();
+        const uint8_t *raw = src.pixels.data();
+        const size_t rawSize = src.pixels.size();
+        size_t at = 0, base = 0;
+        decoded = 0;
+        for (uint32_t level = 0, w = src.width, h = src.height; level < src.levels && w >= 1u && h >= 1u; ++level, w /= 2u, h /= 2u)
+        {
+            uint8_t *out = &rgba[base];
+            base += static_cast<size_t>(w) * h * 4u;
+            const uint8_t *in = raw + at;
+            const size_t avail = rawSize - at;
+            const bool swizzled = ((src.swizzleBits >> level) & 1u) != 0u;
+            if (psm == 0x00u)
+                std::memcpy(out, in, std::min(avail, static_cast<size_t>(w) * h * 4u)); // PSMCT32: the pixels themselves (alpha 0x80 = opaque)
+            else if (!swizzled)
+            {
+                uint32_t *o = reinterpret_cast<uint32_t *>(out);
+                if (psm == 0x14u)
+                    for (uint32_t y = 0; y < h; ++y)
+                        for (uint32_t x = 0; x < w; ++x)
+                        {
+                            const uint8_t b = in[(y * w + x) / 2u];
+                            *o++ = palette[(x & 1u) ? (b >> 4) : (b & 15u)];
+                        }
+                else
+                    for (uint32_t i = 0; i < w * h; ++i)
+                        o[i] = palette[in[i]];
+            }
+            else
+            {
+                // Uploaded as PSMCT32 (cw x ch, bw32 pages a row) and read back
+                // as 8 / 4-bit (tbw / 2 pages a row): each pixel's GS byte, then
+                // the 32-bit pixel that wrote it. The PS2's scratch area of
+                // max(w, 64) x max(h, 64) + 16 KB: bytes past it read 0, as do
+                // the bytes no 32-bit pixel wrote.
+                const uint32_t cw = std::max(w / 2u, 1u), ch = std::max(psm == 0x13u ? h / 2u : h / 4u, 1u);
+                const uint32_t bw32 = std::max<uint32_t>(cw / 64u, 1u), bwShift = log2u(bw32);
+                const uint32_t tbw = std::max<uint32_t>(w / 64u, 2u), ppr = tbw >> 1;
+                const uint32_t scratch = std::max(w, 64u) * std::max(h, 64u) + 0x4000u;
+                const auto byteAt = [&](uint32_t a) -> uint32_t
+                {
+                    if (a >= scratch)
+                        return 0u;
+                    const uint32_t page = a >> 13, q = tables.inv32[(a & 8191u) >> 2];
+                    const uint32_t cx = ((page & (bw32 - 1u)) << 6) + (q & 63u), cy = ((page >> bwShift) << 5) + (q >> 6);
+                    if (cx >= cw || cy >= ch)
+                        return 0u;
+                    const size_t from = (static_cast<size_t>(cy) * cw + cx) * 4u + (a & 3u);
+                    return from < avail ? in[from] : 0u;
+                };
+                uint32_t *o = reinterpret_cast<uint32_t *>(out);
+                if (psm == 0x14u)
+                    for (uint32_t y = 0; y < h; ++y)
+                    {
+                        const uint32_t rowPage = (y >> 7) * ppr;
+                        const uint16_t *row = &tables.t4[(y & 127u) * 128u];
+                        for (uint32_t x = 0; x < w; ++x)
+                        {
+                            const uint32_t n = ((rowPage + (x >> 7)) << 14) + row[x & 127u];
+                            const uint32_t b = byteAt(n >> 1);
+                            *o++ = palette[(n & 1u) ? (b >> 4) : (b & 15u)];
+                        }
+                    }
+                else
+                    for (uint32_t y = 0; y < h; ++y)
+                    {
+                        const uint32_t rowPage = (y >> 6) * ppr;
+                        const uint16_t *row = &tables.t8[(y & 63u) * 128u];
+                        for (uint32_t x = 0; x < w; ++x)
+                            *o++ = palette[byteAt(((rowPage + (x >> 7)) << 13) + row[x & 127u]) & (entries - 1u)];
+                    }
+            }
+            ++decoded;
+            at += psm == 0x00u ? static_cast<size_t>(w) * h * 4u : (psm == 0x13u ? static_cast<size_t>(w) * h : static_cast<size_t>(w) * h / 2u);
+        }
+        return true;
+    }
+
+    bool decodeTextureReference(uint32_t header, std::vector<uint8_t> &rgba, uint32_t &decodedOut);
+
+    uint64_t decodedTexture(uint32_t header)
+    {
+        SOTC_READ_SITE(6);
+        if (!header || word(header) != 0x324F544Eu) // "NTO2"
+            return 0;
+        const uint32_t format = word(header + 0x1Cu), psm = format & 0x3Fu;
+        const uint32_t width = 1u << ((format >> 16) & 0xFu), height = 1u << ((format >> 20) & 0xFu);
+        const uint32_t pixelBytes = psm == 0x14u ? width * height / 2u : width * height;
+        const auto sampleNow = [&]
+        {
+            return sample(header + word(header + 0x14u), pixelBytes, 64u) ^ sample(header + word(header + 0x18u), psm == 0x14u ? 64u : 1024u, 16u) * 31u ^
+                   format;
+        };
+        uint64_t key = 0;
+        bool changedInPlace = false;
+        if (native_renderer::tuning().fastHooks)
+        {
+            // Fast hooks: a hash of the texture's bytes (every level, the
+            // palette, the format and swizzle bits), kept by header while the
+            // sample above stays the same (see packetId: the game moves
+            // textures in memory after an area loads).
+            struct ContentMemo
+            {
+                uint32_t address = 0, format = 0;
+                uint64_t frame = ~0ull, sampled = 0, key = 0, sampledAt = 0;
+                bool rewritten = false; // seen changed in place: sampled at every call
+                uint32_t moveSerial = 0; // sotc_decomp::g_guestMoveSerial at the last sample
+            };
+            static WayMemo<ContentMemo, 512> memos;
+            bool found = false;
+            ContentMemo &memo = memos.find(header, (header >> 4) ^ (header >> 13), found);
+            // The sample is 64 words spread over the pixels and 16 over the
+            // palette: ~80 cache misses (the Vita: ~20 us) for each texture
+            // every frame. As packetId: a texture drawn the frame before,
+            // never seen rewritten in place, is taken as it was; the full
+            // sample comes round one frame in 16 (by address).
+            if (found && g_quickTextures && !memo.rewritten && memo.moveSerial == sotc_decomp::g_guestMoveSerial && memo.format == format && memo.frame + 1u >= g_frame && g_frame - memo.sampledAt < 16u &&
+                ((g_frame + (header >> 5)) & 15u) != 0u)
+            {
+                key = memo.key;
+                memo.frame = g_frame;
+                if (R2Check &c = r2Check(); c.on)
+                {
+                    ++c.texQuick;
+                    if (sampleNow() != memo.sampled)
+                    {
+                        if (c.texStale++ < 20)
+                            std::fprintf(stderr, "[r2-check] texture %08x changed, kept its key (frame %llu)\n", header, (unsigned long long)g_frame);
+                    }
+                }
+            }
+            else if (const uint64_t sampled = sampleNow(); found && memo.sampled == sampled)
+            {
+                key = memo.key;
+                memo.frame = g_frame;
+                memo.sampledAt = g_frame;
+                memo.format = format;
+                memo.moveSerial = sotc_decomp::g_guestMoveSerial;
+            }
+            else
+            {
+                // Drawn in the last two frames and changed: rewritten where it is
+                // (animated), decoded at once, not on the worker.
+                // (not after a garbage move: then another texture was moved there)
+                changedInPlace = found && memo.moveSerial == sotc_decomp::g_guestMoveSerial && memo.frame != ~0ull && memo.frame + 2u >= g_frame;
+                // Moved here by a garbage move (round 13, as packetId): the
+                // memo at the old header, sampled before the move, with the
+                // same samples here (read as if still there), gives its key.
+                if (g_moveMemo && !changedInPlace)
+                {
+                    uint64_t movedKey = 0;
+                    sotc_decomp::walkGuestMoves(header, [&](uint32_t old, uint32_t serial)
+                    {
+                        bool had = false;
+                        ContentMemo &o = memos.find(old, (old >> 4) ^ (old >> 13), had);
+                        if (!had || &o == &memo || o.rewritten || o.format != format || !(o.moveSerial < serial))
+                            return false;
+                        const uint64_t at = sampleAt(header + word(header + 0x14u), old + word(header + 0x14u), pixelBytes, 64u) ^
+                                            sampleAt(header + word(header + 0x18u), old + word(header + 0x18u), psm == 0x14u ? 64u : 1024u, 16u) * 31u ^ format;
+                        if (at != o.sampled)
+                            return false;
+                        movedKey = o.key;
+                        return true;
+                    });
+                    static const bool moveCheck = ps2_diag::env("SOTC_MOVE_MEMO_CHECK") != nullptr;
+                    if (movedKey && moveCheck)
+                    {
+                        uint32_t bytes = 0;
+                        for (uint32_t level = 0, w = width, h = height, levels = std::clamp((format >> 12) & 0xFu, 1u, 7u); level < levels && w >= 1u && h >= 1u;
+                             ++level, w /= 2u, h /= 2u)
+                            bytes += psm == 0x00u ? w * h * 4u : (psm == 0x13u ? w * h : w * h / 2u);
+                        uint64_t h = contentHash(header + word(header + 0x14u), bytes, 0x84222325cbf29ce4ull ^ format);
+                        h = contentHash(header + word(header + 0x18u), psm == 0x00u ? 0u : (psm == 0x14u ? 64u : 1024u), h ^ (noteRead(header + 0x1Fu, 1u), g_ram[(header + 0x1Fu) & 0x1FFFFFFu]));
+                        const uint64_t fresh = (h & 0x03FFFFFFFFFFFFFFull) | (1ull << 58);
+                        static uint64_t checks = 0, bad = 0;
+                        ++checks;
+                        bad += fresh != movedKey;
+                        if ((checks & 255u) == 0u || (fresh != movedKey && bad < 10u))
+                            std::fprintf(stderr, "[move-memo] textures: %llu moved keys checked, %llu differ\n", (unsigned long long)checks, (unsigned long long)bad);
+                    }
+                    if (movedKey)
+                    {
+                        key = movedKey;
+                        memo = {header, format, g_frame, sampled, key, g_frame, false, sotc_decomp::g_guestMoveSerial};
+                        goto haveKey;
+                    }
+                }
+                uint32_t bytes = 0;
+                for (uint32_t level = 0, w = width, h = height, levels = std::clamp((format >> 12) & 0xFu, 1u, 7u); level < levels && w >= 1u && h >= 1u;
+                     ++level, w /= 2u, h /= 2u)
+                    bytes += psm == 0x00u ? w * h * 4u : (psm == 0x13u ? w * h : w * h / 2u);
+                g_hashBytes[1] += bytes;
+                ++g_hashCalls[1];
+                uint64_t h = contentHash(header + word(header + 0x14u), bytes, 0x84222325cbf29ce4ull ^ format);
+                h = contentHash(header + word(header + 0x18u), psm == 0x00u ? 0u : (psm == 0x14u ? 64u : 1024u), h ^ (noteRead(header + 0x1Fu, 1u), g_ram[(header + 0x1Fu) & 0x1FFFFFFu]));
+                key = (h & 0x03FFFFFFFFFFFFFFull) | (1ull << 58);
+                memo = {header, format, g_frame, sampled, key, g_frame, found && (memo.rewritten || changedInPlace), sotc_decomp::g_guestMoveSerial};
+            }
+        }
+        else
+            key = sampleNow();
+    haveKey:
+        if (native_renderer::hasTexture(key))
+            return key;
+        if ((psm != 0x00u && psm != 0x13u && psm != 0x14u) || width > 1024u || height > 1024u)
+        {
+            static const bool log = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+            static std::set<uint32_t> seen;
+            if (log && seen.insert(header).second)
+                std::fprintf(stderr, "[native-tex] header %08x psm %02x %ux%u format %08x swizzled %u\n", header, psm, width, height, format,
+                             g_ram[(header + 0x1Fu) & 0x1FFFFFFu] & 1u);
+            return 0;
+        }
+        const uint64_t decodeStart = ps2_diag::kTimers && native_renderer::tuning().frameTiming() ? native_renderer::nowUs() : 0u;
+        auto src = std::make_shared<TexSource>();
+        if (!texSource(header, *src))
+            return 0; // no room: asked for again at the next draw
+        // SOTC_TEX_DECODE_CHECK=1 (debugging): every texture also decoded by
+        // the earlier per-pixel code, and the two compared.
+        static const bool decodeCheck = ps2_diag::env("SOTC_TEX_DECODE_CHECK") != nullptr;
+        if (decodeCheck)
+        {
+            std::vector<uint8_t> fast, slow;
+            uint32_t fastLevels = 0, slowLevels = 0;
+            const bool a = decodeTexture(*src, fast, fastLevels), b = decodeTextureReference(header, slow, slowLevels);
+            static uint64_t checked = 0, mismatched = 0;
+            ++checked;
+            if (a != b || fastLevels != slowLevels || fast != slow)
+            {
+                ++mismatched;
+                std::fprintf(stderr, "[tex-check] MISMATCH header %08x psm %02x %ux%u levels %u/%u swizzle %02x\n", header, psm, width, height, fastLevels, slowLevels,
+                             src->swizzleBits);
+            }
+            if (checked % 200u == 0u)
+                std::fprintf(stderr, "[tex-check] %llu textures, %llu mismatches\n", (unsigned long long)checked, (unsigned long long)mismatched);
+        }
+        // SOTC_TEXDUMP_DIR=<dir> (debugging): level 0 of every decoded texture, raw RGBA.
+        static const char *dumpDir = std::getenv("SOTC_TEXDUMP_DIR");
+        if (native_recorder::active())
+        {
+            // The scene recorder keeps each texture's PS2 source with it (the
+            // CLUT's words hashed: 16 or 256 entries of 32 bits).
+            const uint32_t clutBytes = psm == 0x00u ? 0u : (psm == 0x14u ? 64u : 1024u);
+            const uint64_t clut = clutBytes ? contentHash(header + word(header + 0x18u), clutBytes, 0xC1u) : 0u;
+            native_recorder::textureSource(key, header, psm, width, height, format, clut);
+        }
+        const auto finish = [key, width, height, header, psm](const std::vector<uint8_t> &rgba, uint32_t decoded)
+        {
+            if (dumpDir)
+            {
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/nat_%08x_psm%02x_%ux%u.rgba", dumpDir, header, psm, width, height);
+                if (FILE *f = std::fopen(path, "wb"))
+                {
+                    std::fwrite(rgba.data(), 1, static_cast<size_t>(width) * height * 4u, f);
+                    std::fclose(f);
+                }
+            }
+            native_renderer::uploadTexture(key, width, height, rgba.data(), decoded);
+        };
+        // On the worker: decoded there, uploaded at the next frame's start.
+        auto out = std::make_shared<std::pair<std::vector<uint8_t>, uint32_t>>();
+        auto ok = std::make_shared<bool>(false);
+        if (!changedInPlace && native_renderer::buildAsync({key}, [src, out, ok] { *ok = decodeTexture(*src, out->first, out->second); },
+                                        [out, ok, finish]
+                                        {
+                                            if (*ok)
+                                                finish(out->first, out->second);
+                                        }))
+        {
+            if (decodeStart)
+                native_renderer::frameCounters().decodeUs += native_renderer::nowUs() - decodeStart;
+            return key;
+        }
+        static std::vector<uint8_t> rgba;
+        uint32_t decoded = 0;
+        if (!decodeTexture(*src, rgba, decoded))
+            return 0;
+        if (decodeStart)
+            native_renderer::frameCounters().decodeUs += native_renderer::nowUs() - decodeStart;
+        finish(rgba, decoded);
+        return key;
+    }
+
+    // The earlier decoder (per pixel through the GS address functions,
+    // straight from guest memory): SOTC_TEX_DECODE_CHECK's reference.
+    bool decodeTextureReference(uint32_t header, std::vector<uint8_t> &rgba, uint32_t &decodedOut)
+    {
+        const uint32_t format = word(header + 0x1Cu), psm = format & 0x3Fu;
+        const uint32_t width = 1u << ((format >> 16) & 0xFu), height = 1u << ((format >> 20) & 0xFu);
+        const uint32_t clut = header + word(header + 0x18u);
+        const uint32_t entries = psm == 0x14u ? 16u : 256u;
+        uint32_t palette[256];
+        if (psm != 0x00u)
+            for (uint32_t i = 0; i < entries; ++i)
+            {
+                // CSM1: of every 32 entries, 8-15 and 16-23 are swapped.
+                const uint32_t from = entries == 256u ? ((i & ~0x18u) | ((i & 8u) << 1) | ((i & 16u) >> 1)) : i;
+                palette[i] = word(clut + from * 4u);
+            }
+        // Mip levels (format bits 12-15, texTransResolve): each half the last,
+        // stored one after the other; byte +0x1f has a swizzle bit per level.
+        static const bool noMips = std::getenv("SOTC_NATIVE_NOMIPS") != nullptr;
+        const uint32_t levels = noMips ? 1u : std::clamp((format >> 12) & 0xFu, 1u, 7u);
+        noteRead(header + 0x1Fu, 1u);
+        const uint8_t swizzleBits = g_ram[(header + 0x1Fu) & 0x1FFFFFFu];
+        rgba.clear();
+        std::vector<uint8_t> scratch;
+        // Room for every level at once (growing level by level copied the
+        // levels before each time); no room in the heap: no texture this time
+        // (asked for again at the next draw), rather than an abort.
+        {
+            size_t total = 0;
+            for (uint32_t level = 0, lw = width, lh = height; level < levels && lw >= 1u && lh >= 1u; ++level, lw /= 2u, lh /= 2u)
+                total += static_cast<size_t>(lw) * lh * 4u;
+            try
+            {
+                rgba.reserve(total);
+                if (psm != 0x00u)
+                    scratch.reserve(static_cast<size_t>(std::max(width, 64u)) * std::max(height, 64u) + 0x4000u);
+            }
+            catch (const std::bad_alloc &)
+            {
+                return false;
+            }
+        }
+        uint32_t pixels = header + word(header + 0x14u), w = width, h = height, decoded = 0;
+        for (uint32_t level = 0; level < levels && w >= 1u && h >= 1u; ++level)
+        {
+            const size_t base = rgba.size();
+            rgba.resize(base + static_cast<size_t>(w) * h * 4u);
+            uint8_t *out = &rgba[base];
+            const bool swizzled = ((swizzleBits >> level) & 1u) != 0u;
+            if (psm == 0x00u)
+            {
+                // PSMCT32: the pixels themselves (alpha 0x80 = opaque).
+                noteRead(pixels, w * h * 4u);
+                for (uint32_t i = 0; i < w * h; ++i)
+                    std::memcpy(out + i * 4u, g_ram + ((pixels + i * 4u) & 0x1FFFFFFu), 4);
+            }
+            else
+            {
+                if (swizzled)
+                {
+                    // Uploaded as PSMCT32 and read back as 8/4-bit: replay that.
+                    const uint32_t cw = std::max(w / 2u, 1u), ch = std::max(psm == 0x13u ? h / 2u : h / 4u, 1u);
+                    scratch.assign(static_cast<size_t>(std::max(w, 64u)) * std::max(h, 64u) + 0x4000u, 0);
+                    const uint32_t bw32 = std::max<uint32_t>(cw / 64u, 1u);
+                    for (uint32_t i = 0; i < cw * ch; ++i)
+                    {
+                        const uint32_t a = GSPSMCT32::addrPSMCT32(0, bw32, i % cw, i / cw);
+                        if (a + 4u <= scratch.size())
+                        {
+                            noteRead(pixels + i * 4u, 4u);
+                            std::memcpy(&scratch[a], g_ram + ((pixels + i * 4u) & 0x1FFFFFFu), 4);
+                        }
+                    }
+                }
+                const uint32_t tbw = std::max<uint32_t>(w / 64u, 2u);
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = 0; x < w; ++x)
+                    {
+                        uint32_t index;
+                        if (swizzled && psm == 0x14u)
+                        {
+                            const uint32_t n = GSPSMT4::addrPSMT4(0, tbw, x, y);
+                            const uint8_t b = (n >> 1) < scratch.size() ? scratch[n >> 1] : 0;
+                            index = (n & 1u) ? (b >> 4) : (b & 15u);
+                        }
+                        else if (swizzled)
+                        {
+                            const uint32_t a = GSPSMT8::addrPSMT8(0, tbw, x, y);
+                            index = a < scratch.size() ? scratch[a] : 0u;
+                        }
+                        else if (psm == 0x14u)
+                        {
+                            noteRead(pixels + (y * w + x) / 2u, 1u);
+                            const uint8_t b = g_ram[(pixels + (y * w + x) / 2u) & 0x1FFFFFFu];
+                            index = (x & 1u) ? (b >> 4) : (b & 15u);
+                        }
+                        else
+                        {
+                            noteRead(pixels + y * w + x, 1u);
+                            index = g_ram[(pixels + y * w + x) & 0x1FFFFFFu];
+                        }
+                        std::memcpy(out + (static_cast<size_t>(y) * w + x) * 4u, &palette[index & (entries - 1u)], 4);
+                    }
+            }
+            ++decoded;
+            pixels += psm == 0x00u ? w * h * 4u : (psm == 0x13u ? w * h : w * h / 2u);
+            w /= 2u;
+            h /= 2u;
+        }
+        decodedOut = decoded;
+        return true;
+    }
+
+    // A model packet's id. Fast hooks: a hash of all its bytes, not of where
+    // they are. After an area loads the game moves its model data and
+    // textures around in memory (its heap compaction), several times in the
+    // first second: ids by address rebuilt the whole scene each time (~2 400
+    // packets and ~100 textures, five times in ~20 frames, every one of them
+    // the same bytes as before). A memo by address keeps a packet's id while a
+    // sample of its contents (32 words) stays the same, so the full hash runs
+    // only when the packet is new there; the same packet drawn again in a
+    // frame (instances) takes the id it had. Without fast hooks: the address
+    // and size, and the sample (another area loaded in its place makes new ids).
+    // What a draw of a packet drawn the frame before reads is in its first
+    // 32 bytes (one cache line on the Vita).
+    struct alignas(64) PacketMemo
+    {
+        uint32_t address = 0, size = 0;
+        uint64_t frame = ~0ull, id = 0;
+        uint32_t sampledAt = 0;  // the frame of the last full sample (its low 32 bits)
+        bool rewritten = false;  // seen changed in place
+        uint16_t moveSerial = 0; // sotc_decomp::g_guestMoveSerial at the last sample (a garbage move since: sampled again)
+        uint64_t sample = 0, quick = 0; // 32 words; four words
+        uint32_t movedFrom = 0; // carried here from that address by the garbage moves (rekeyPacketMemo), not sampled here yet
+    };
+    // The memo's sets: four ways, the addresses apart from the entries (a set's
+    // four tags in 16 bytes: one cache line looked at, not the four entries'
+    // 3-4), so the next packet's lookup can be prefetched.
+    template <uint32_t Sets>
+    struct PacketMemoTable
+    {
+        struct alignas(16) Tags
+        {
+            uint32_t address[4] = {};
+        };
+        Tags tags[Sets];
+        PacketMemo entries[Sets][4];
+        static uint32_t set(uint32_t address) { return ((address >> 4) ^ (address >> 15)) & (Sets - 1u); }
+        PacketMemo &find(uint32_t address, bool &found)
+        {
+            const uint32_t at = set(address);
+            Tags &t = tags[at];
+            for (int i = 0; i < 4; ++i)
+                if (t.address[i] == address && entries[at][i].address == address)
+                {
+                    found = true;
+                    return entries[at][i];
+                }
+            found = false;
+            int oldest = 0; // the way used longest ago (~0: never used, first)
+            for (int i = 1; i < 4; ++i)
+                if (entries[at][i].frame + 1u < entries[at][oldest].frame + 1u)
+                    oldest = i;
+            t.address[oldest] = address; // the caller fills the entry
+            return entries[at][oldest];
+        }
+        // The entry for this address if there is one (nothing taken on a miss).
+        PacketMemo *peek(uint32_t address)
+        {
+            const uint32_t at = set(address);
+            for (int i = 0; i < 4; ++i)
+                if (tags[at].address[i] == address && entries[at][i].address == address)
+                    return &entries[at][i];
+            return nullptr;
+        }
+        // The tag line, and the entry's first line when the tag is there already.
+        void prefetch(uint32_t address, bool entry) const
+        {
+            const uint32_t at = set(address);
+            const Tags &t = tags[at];
+            __builtin_prefetch(&t);
+            if (entry)
+                for (int i = 0; i < 4; ++i)
+                    if (t.address[i] == address)
+                        __builtin_prefetch(&entries[at][i]);
+        }
+    };
+    // Four words of a packet, spread over it (the quick check).
+    inline uint64_t quickSample(uint32_t data, uint32_t size)
+    {
+        const uint32_t step = (size / 5u) & ~3u;
+        uint64_t h = 0xcbf29ce484222325ull ^ data;
+        for (uint32_t i = 1; i <= 4; ++i)
+            h = (h ^ word(data + (size >= 8u ? std::min(step * i, size - 4u) : 0u))) * 0x100000001b3ull;
+        return h;
+    }
+    PacketMemoTable<2048> g_packetMemo;
+    // The garbage moves carried into the packet memo (round 14). An area
+    // change moves ~250 blocks a frame for 10-20 frames, and walkGuestMoves
+    // (at a lookup, a few moves back) found few of the moved packets: a
+    // packet moved into the address another moved packet had left took that
+    // one's memo first (the draw order is not the heap's), so 700-1 400
+    // packets (1-1.6 MB) were hashed again in each of those frames on the
+    // Mac route, 25-30 ms of hook.packetId a frame in calibrated Vita3K.
+    // Now at the first packetId after new moves every memo whose address a
+    // move's source holds goes to its destination (moves in their order),
+    // marked movedFrom: its next lookup takes its id when the 32 sampled
+    // words at the new place are the memo's (sampleAt as if at the old
+    // address), as walkGuestMoves does. SOTC_MOVE_REKEY=0: off.
+    bool g_moveRekey = !std::getenv("SOTC_MOVE_REKEY") || std::atoi(std::getenv("SOTC_MOVE_REKEY")) != 0;
+    uint32_t g_rekeyedAt = 0; // sotc_decomp::g_guestMoveCount carried in so far
+    uint64_t g_rekeyed = 0, g_rekeyHits = 0;
+    void rekeyPacketMemo()
+    {
+        SOTC_READ_SITE(5);
+        namespace sd = sotc_decomp;
+        const uint32_t count = sd::g_guestMoveCount;
+        if (count == g_rekeyedAt)
+            return;
+        const uint32_t first = g_rekeyedAt;
+        g_rekeyedAt = count;
+        if (count - first > sd::kGuestMoves)
+            return; // the ring lost some: the lookups' sample checks catch the rest
+        struct M
+        {
+            uint32_t src, len, dst, order;
+        };
+        static std::vector<M> moves;
+        moves.clear();
+        for (uint32_t n = first; n != count; ++n)
+        {
+            const sd::GuestMove &m = sd::g_guestMoves[n & (sd::kGuestMoves - 1u)];
+            if (m.len)
+                moves.push_back({m.src, m.len, m.dst, n - first});
+        }
+        if (moves.empty())
+            return;
+        std::sort(moves.begin(), moves.end(), [](const M &a, const M &b) { return a.src != b.src ? a.src < b.src : a.order < b.order; });
+        uint32_t maxLen = 0;
+        for (const M &m : moves)
+            maxLen = std::max(maxLen, m.len);
+        // The move after `after` (in order) whose source holds addr, the first such; false: none.
+        const auto into = [&](uint32_t addr, uint32_t after, const M *&got)
+        {
+            auto it = std::upper_bound(moves.begin(), moves.end(), addr, [](uint32_t a, const M &m) { return a < m.src; });
+            got = nullptr;
+            for (int left = 16; left > 0 && it != moves.begin(); --left)
+            {
+                --it;
+                if (addr - it->src >= maxLen)
+                    break;
+                if (addr - it->src < it->len && it->order + 1u > after && (!got || it->order < got->order))
+                    got = &*it;
+            }
+            return got != nullptr;
+        };
+        struct Carried
+        {
+            PacketMemo memo;
+            uint32_t to;
+        };
+        static std::vector<Carried> carried;
+        carried.clear();
+        auto &t = g_packetMemo;
+        for (uint32_t set = 0; set < 2048u; ++set)
+            for (int w = 0; w < 4; ++w)
+            {
+                PacketMemo &e = t.entries[set][w];
+                if (t.tags[set].address[w] != e.address || e.address == 0u || e.frame == ~0ull)
+                    continue;
+                uint32_t at = e.address, after = 0;
+                const M *m = nullptr;
+                bool moved = false;
+                for (int step = 0; step < 8 && into(at & 0x1FFFFFFu, after, m); ++step)
+                {
+                    at = m->dst + ((at & 0x1FFFFFFu) - m->src);
+                    after = m->order + 1u;
+                    moved = true;
+                }
+                if (!moved)
+                    continue;
+                Carried c{e, at | (e.address & ~0x1FFFFFFu)};
+                if (!c.memo.movedFrom)
+                    c.memo.movedFrom = e.address; // the address its sample was taken at
+                carried.push_back(c);
+                t.tags[set].address[w] = 0u;
+                e.address = 0u;
+            }
+        for (Carried &c : carried)
+        {
+            bool found = false;
+            PacketMemo &e = t.find(c.to, found);
+            e = c.memo;
+            e.address = c.to;
+        }
+        g_rekeyed += carried.size();
+    }
+    // The last packetId whose bytes changed where they are (same address and
+    // size, another sample): packets the game rewrites in place (every frame,
+    // some of them) are built at once, not on the async worker, which would
+    // leave them out of every frame.
+    bool g_packetChangedInPlace = false;
+    // The last packetId's packet seen rewritten in place at some time (its
+    // memo's flag): a draw plan asks for that packet's id every frame.
+    bool g_packetRewritten = false;
+    uint64_t packetId(uint32_t data, uint32_t size, bool fast)
+    {
+        SOTC_READ_SITE(5);
+        g_packetChangedInPlace = false;
+        g_packetRewritten = false;
+        if (!fast)
+            return ((static_cast<uint64_t>(size) << 32) | data) ^ (sample(data, size, 32u) & 0x7FFF000000000000ull);
+        if (g_moveRekey && g_moveMemo && sotc_decomp::g_guestMoveCount != g_rekeyedAt)
+        {
+            SOTC_PROF_SCOPE(kHookMoves);
+            rekeyPacketMemo();
+        }
+        bool found = false;
+        PacketMemo &memo = g_packetMemo.find(data, found);
+        found = found && memo.size == size;
+        HookStats &hs = hookStats();
+        g_packetRewritten = found && memo.rewritten;
+        const uint16_t moveSerial = static_cast<uint16_t>(sotc_decomp::g_guestMoveSerial);
+        const bool moved = found && memo.moveSerial != moveSerial;
+        if (found && memo.frame == g_frame && !moved)
+        {
+            hs.idSame += hs.on;
+            return memo.id;
+        }
+        // This round (g_r2): the 32-word sample (32 cache misses) only one
+        // frame in 48-63; on the other frames in 16 four words (a packet
+        // rewritten in place is still caught within 16 frames).
+        const bool stagger = ((g_frame + (data >> 5)) & 15u) == 0u;
+        const uint32_t age = static_cast<uint32_t>(g_frame) - memo.sampledAt;
+        if (g_r2 && found && !moved && !memo.rewritten && native_renderer::tuning().packetQuickCheck && !(stagger && age >= 48u))
+        {
+            if ((memo.frame + 1u == g_frame && !stagger) || quickSample(data, size) == memo.quick)
+            {
+                (memo.frame + 1u == g_frame ? hs.idPrev : hs.idQuick) += hs.on;
+                memo.frame = g_frame;
+                if (R2Check &c = r2Check(); c.on)
+                {
+                    ++c.packetQuick;
+                    if (sample(data, size, 32u) != memo.sample && c.packetStale++ < 20)
+                        std::fprintf(stderr, "[r2-check] packet %08x changed, kept its id (frame %llu)\n", data, (unsigned long long)g_frame);
+                }
+                return memo.id;
+            }
+        }
+        // Never rewritten in place: four words, the full sample one frame in
+        // 16 (by address, so not all on the same frame).
+        else if (!g_r2 && found && !moved && !memo.rewritten && native_renderer::tuning().packetQuickCheck && age < 16u && !stagger)
+        {
+            // Drawn the frame before too: taken as it was (the full sample
+            // comes round within 16 frames). Back after a while: four words.
+            if (memo.frame + 1u == g_frame || quickSample(data, size) == memo.quick)
+            {
+                (memo.frame + 1u == g_frame ? hs.idPrev : hs.idQuick) += hs.on;
+                memo.frame = g_frame;
+                if (R2Check &c = r2Check(); c.on)
+                {
+                    ++c.packetQuick;
+                    if (sample(data, size, 32u) != memo.sample && c.packetStale++ < 20)
+                        std::fprintf(stderr, "[r2-check] packet %08x changed, kept its id (frame %llu)\n", data, (unsigned long long)g_frame);
+                }
+                return memo.id;
+            }
+        }
+        const uint64_t sampled = sample(data, size, 32u);
+        hs.idSampled += hs.on;
+        // Carried here by rekeyPacketMemo: its sample was taken at movedFrom.
+        const bool carriedHere = found && memo.movedFrom && !memo.rewritten && sampleAt(data, memo.movedFrom, size, 32u) == memo.sample;
+        if (carriedHere)
+        {
+            ++g_rekeyHits;
+            static const bool moveCheck = ps2_diag::env("SOTC_MOVE_MEMO_CHECK") != nullptr;
+            if (moveCheck)
+            {
+                static uint64_t checks = 0, bad = 0;
+                const uint64_t fresh = (contentHash(data, size, 0x9E3779B97F4A7C15ull ^ size) & 0x07FFFFFFFFFFFFFFull) | (1ull << 59);
+                ++checks;
+                bad += fresh != memo.id;
+                if ((checks & 4095u) == 0u || (fresh != memo.id && bad < 10u))
+                    std::fprintf(stderr, "[move-rekey] packets: %llu carried ids checked, %llu differ\n", (unsigned long long)checks, (unsigned long long)bad);
+            }
+        }
+        if (found)
+            memo.movedFrom = 0u;
+        if (found && (memo.sample == sampled || carriedHere))
+        {
+            memo.sample = sampled;
+            memo.frame = g_frame;
+            memo.sampledAt = static_cast<uint32_t>(g_frame);
+            memo.moveSerial = moveSerial;
+            memo.quick = quickSample(data, size);
+            return memo.id;
+        }
+        // Moved here by a garbage move (round 13): the memo at its old address,
+        // sampled before that move and never seen rewritten, with the same 32
+        // words here, gives its id (the move copied the bytes as they were).
+        // With the memos carried by rekeyPacketMemo the walk back over the
+        // moves finds little more (moves the ring lost, chunked copies) and
+        // costs ~8 us a new packet (an area change's cut frame: ~1 600 new
+        // packets, 13 ms in calibrated Vita3K): only with SOTC_MOVE_WALK=1.
+        static const bool walkToo = std::getenv("SOTC_MOVE_WALK") != nullptr;
+        if (g_moveMemo && (!found || moved) && (!g_moveRekey || walkToo))
+        {
+            SOTC_PROF_SCOPE(kHookMoves);
+            PacketMemo *from = nullptr;
+            sotc_decomp::walkGuestMoves(data, [&](uint32_t old, uint32_t serial)
+            {
+                PacketMemo *o = g_packetMemo.peek(old);
+                if (!o || o == &memo || o->size != size || o->rewritten || static_cast<uint16_t>(serial - o->moveSerial) == 0u ||
+                    static_cast<uint16_t>(serial - o->moveSerial) > 0x8000u)
+                    return false;
+                if (sampleAt(data, old, size, 32u) != o->sample)
+                    return false;
+                from = o;
+                return true;
+            });
+            if (from)
+            {
+                hs.idMoved += hs.on;
+                const uint64_t id = from->id;
+                // SOTC_MOVE_MEMO_CHECK=1 (checking): the id hashed anew too, and compared.
+                static const bool moveCheck = ps2_diag::env("SOTC_MOVE_MEMO_CHECK") != nullptr;
+                if (moveCheck)
+                {
+                    static uint64_t checks = 0, bad = 0;
+                    const uint64_t fresh = (contentHash(data, size, 0x9E3779B97F4A7C15ull ^ size) & 0x07FFFFFFFFFFFFFFull) | (1ull << 59);
+                    ++checks;
+                    bad += fresh != id;
+                    if ((checks & 4095u) == 0u || (fresh != id && bad < 10u))
+                        std::fprintf(stderr, "[move-memo] packets: %llu moved ids checked, %llu differ\n", (unsigned long long)checks, (unsigned long long)bad);
+                }
+                memo.address = data;
+                memo.size = size;
+                memo.frame = g_frame;
+                memo.id = id;
+                memo.sampledAt = static_cast<uint32_t>(g_frame);
+                memo.rewritten = false;
+                memo.moveSerial = moveSerial;
+                memo.sample = sampled;
+                memo.quick = quickSample(data, size);
+                g_packetChangedInPlace = false;
+                g_packetRewritten = false;
+                return id;
+            }
+        }
+        // Drawn in the last two frames and changed: rewritten in place
+        // (animated). Long unused: another packet loaded there (async is fine).
+        // Not after a garbage move: then another packet was moved there.
+        g_packetChangedInPlace = !moved && found && memo.frame != ~0ull && memo.frame + 2u >= g_frame;
+        hs.idHashed += hs.on;
+        // Bit 59 set, 60-63 clear: apart from the per-frame meshes' ids
+        // (bits 60, 62, 63 and a count) and the second pass's (bit 61 flipped).
+        g_hashBytes[0] += size;
+        ++g_hashCalls[0];
+        uint64_t id;
+        {
+            SOTC_PROF_SCOPE(kHookHash);
+            id = (contentHash(data, size, 0x9E3779B97F4A7C15ull ^ size) & 0x07FFFFFFFFFFFFFFull) | (1ull << 59);
+        }
+        const bool rewritten = found && (memo.rewritten || g_packetChangedInPlace);
+        memo.address = data;
+        memo.size = size;
+        memo.frame = g_frame;
+        memo.id = id;
+        memo.sampledAt = static_cast<uint32_t>(g_frame);
+        memo.rewritten = rewritten;
+        memo.moveSerial = moveSerial;
+        g_packetRewritten = rewritten;
+        memo.sample = sampled;
+        memo.quick = quickSample(data, size);
+        return id;
+    }
+
+    // The surface's texture: +0x2c, or +0x3c for the second (texture mode 2).
+    uint64_t surfaceTexture(uint32_t header, uint32_t surface, uint32_t field = 0x2Cu)
+    {
+        SOTC_READ_SITE(4);
+        const uint32_t s = word(header + 0x50u) + surface * 0x120u;
+        const uint32_t index = word(s + field);
+        if (index >= word(header + 0x44u))
+            return 0;
+        const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+        return object ? texture(word(object + 0x20u)) : 0;
+    }
+
+    // modelGetDlLayer (0x1096a80): the display list layer of a surface; the
+    // layers go to the GS in increasing order, so it is the draw order.
+    uint32_t surfaceLayer(uint32_t header, uint32_t s, bool fading)
+    {
+        SOTC_READ_SITE(4);
+        uint64_t flags;
+        noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&flags, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+        const uint32_t owner = word(header + 8u);
+        const bool second = owner && word(owner + 0x38u) == 1u;
+        const auto bit = [flags](int n) { return ((flags >> n) & 1u) != 0; };
+        if (flags & 0x1020000u)
+            return 8;
+        if (bit(23))
+            return 10;
+        if (bit(25))
+            return 16;
+        if (bit(9))
+            return 17;
+        if (bit(10))
+            return (bit(8) || fading) ? 13 : 12;
+        if (bit(14))
+            return 1;
+        if (bit(15))
+            return 18;
+        if (bit(8) || fading)
+            return second ? 6 : 3;
+        return second ? 5 : 2;
+    }
+
+    // modelDisp's skips: bit 29 never drawn; bit 17 (boss effect) and bit 24
+    // (shadow effect) only while getNowBossEffect (0x1186290) has bit 0 / 1;
+    // bit 26 not while the underwater fog (getFogUnderWater, 0x1186328) is on.
+    bool surfaceDrawn(uint32_t s)
+    {
+        uint64_t flags;
+        noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&flags, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+        const uint32_t boss = word(0x1186290u);
+        if ((flags >> 29) & 1u)
+            return false;
+        if ((flags >> 17) & 1u)
+            return (boss & 1u) != 0;
+        if (((flags >> 24) & 1u) && !(boss & 2u))
+            return false;
+        return !(((flags >> 26) & 1u) && word(0x1186328u) != 0u);
+    }
+
+    // Texture scrolling: texTransResolve puts a VIF STROW in each texture's
+    // transfer packet, the row the 16-bit values at *(NTO2 header +0xc) and
+    // +4, which the game moves every frame. The ST unpacks use STMOD 1, so
+    // the row adds to S and T (12-bit fraction).
+    struct ScrollRow
+    {
+        uint32_t at = 0, w0 = 0, w1 = 0; // the pair's address, its two words
+    };
+    // Round 34: the model draw running (modelDispDraw) takes the scroll rows
+    // and the mip K scale its hook copied (SOTC_KICK_DEFER: the job may run
+    // after the game moved them for the next frame); a row its hook did not
+    // copy is read here as before (counted: g_scrollMissed).
+    const std::vector<ScrollRow> *g_drawScrolls = nullptr;
+    float g_drawLodScale = 0.0f;
+    bool g_drawLodScaleSet = false;
+    uint64_t g_scrollMissed = 0, g_scrollTaken = 0;
+    uint64_t g_kickJoined = 0; // SOTC_KICK_DEFER: kicks that joined all the same (a draw without a plan)
+    inline float drawLodScale() { return g_drawLodScaleSet ? g_drawLodScale : real(0x0118C180u); }
+    inline void scrollRead(uint32_t scroll, uint32_t &w0, uint32_t &w1)
+    {
+        if (const std::vector<ScrollRow> *rows = g_drawScrolls)
+        {
+            for (const ScrollRow &r : *rows)
+                if (r.at == scroll)
+                {
+                    w0 = r.w0, w1 = r.w1;
+                    ++g_scrollTaken;
+                    return;
+                }
+            ++g_scrollMissed;
+        }
+        noteRead(scroll, 8u);
+        std::memcpy(&w0, g_ram + (scroll & 0x1FFFFFCu), 4);
+        std::memcpy(&w1, g_ram + ((scroll + 4u) & 0x1FFFFFCu), 4);
+    }
+    bool surfaceRow(uint32_t header, uint32_t surface, float offset[2], uint32_t field = 0x2Cu)
+    {
+        SOTC_READ_SITE(3);
+        const uint32_t s = word(header + 0x50u) + surface * 0x120u;
+        const uint32_t index = word(s + field);
+        if (index >= word(header + 0x44u))
+            return false;
+        const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+        const uint32_t nto2 = object ? word(object + 0x20u) : 0u;
+        const uint32_t scroll = nto2 ? word(nto2 + 0xCu) : 0u;
+        if (!scroll)
+            return false;
+        uint32_t pair, second;
+        scrollRead(scroll, pair, second);
+        const int32_t r0 = static_cast<int32_t>(pair & 0xFFFFu), r1 = static_cast<int32_t>(second & 0xFFFFu);
+        offset[0] = static_cast<float>(r0) / 4096.0f;
+        offset[1] = static_cast<float>(r1) / 4096.0f;
+        return r0 != 0 || r1 != 0;
+    }
+
+    // Mip selection as texTransResolve sets TEX1 from the NTO2 header: MXL =
+    // levels - 1, MMIN +0x78 (2-5: mipmapped), L +0x94, K = +0x90 x
+    // *0x118c180 (1/16 steps); the GS level is log2(1/Q) x 2^L + K, Q = 1/w.
+    void surfaceLod(uint32_t header, uint32_t surface, native_renderer::DrawState &state, uint32_t field = 0x2Cu)
+    {
+        SOTC_READ_SITE(12);
+        const uint32_t s = word(header + 0x50u) + surface * 0x120u;
+        const uint32_t index = word(s + field);
+        if (index >= word(header + 0x44u))
+            return;
+        const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+        const uint32_t nto2 = object ? word(object + 0x20u) : 0u;
+        if (!nto2 || word(nto2) != 0x324F544Eu)
+            return;
+        const uint32_t levels = std::clamp((word(nto2 + 0x1Cu) >> 12) & 0xFu, 1u, 7u);
+        if (levels < 2u || word(nto2 + 0x78u) < 2u)
+            return;
+        state.maxLod = static_cast<float>(levels - 1u);
+        state.lodScale = static_cast<float>(1u << (word(nto2 + 0x94u) & 3u));
+        const int32_t k = static_cast<int32_t>(static_cast<float>(static_cast<int32_t>(word(nto2 + 0x90u))) * drawLodScale());
+        state.lodK = static_cast<float>((k << 20) >> 20) / 16.0f; // 12-bit signed, 7.4
+    }
+
+    // ALPHA_1 (0x42, first pass) or ALPHA_2 (0x43, the second texture's
+    // pass) in the surface's A+D packet (+0x60): 0x44 blends, 0x48 adds,
+    // 0x42 subtracts (Cd - Cs x As).
+    // CLAMP_1 (0x08, first pass) or CLAMP_2 (0x09, the second texture's) in
+    // the surface's A+D packet: WMS / WMT 1 (clamp) or 2 (region clamp)
+    // keep the coordinate inside the texture; repeating there pulls the far
+    // edge into the border under bilinear filtering (light seams).
+    uint8_t surfaceClamp(uint32_t s, uint32_t reg = 0x08u)
+    {
+        SOTC_READ_SITE(4);
+        for (uint32_t q = s + 0x60u; q < s + 0xC0u; q += 16u)
+            if (word(q + 8u) == reg)
+            {
+                const uint32_t v = word(q), wms = v & 3u, wmt = (v >> 2) & 3u;
+                return static_cast<uint8_t>(((wms == 1u || wms == 2u) ? 1u : 0u) | ((wmt == 1u || wmt == 2u) ? 2u : 0u));
+            }
+        return 0;
+    }
+
+    // SOTC_LOG_SURFACE_REGS, read once into a plain flag (no guard / barrier per call).
+    bool g_logSurfaceRegs()
+    {
+        static int8_t state = -1; // game thread only
+        if (state < 0)
+            state = std::getenv("SOTC_LOG_SURFACE_REGS") != nullptr;
+        return state != 0;
+    }
+    native_renderer::Blend surfaceBlend(uint32_t s, uint32_t reg = 0x42u)
+    {
+        SOTC_READ_SITE(4);
+        // SOTC_LOG_SURFACE_REGS=1: the distinct GS registers of the surfaces' A+D packets.
+        if (reg == 0x42u && g_logSurfaceRegs())
+        {
+            static std::set<std::pair<uint32_t, uint64_t>> seen;
+            for (uint32_t q = s + 0x60u; q < s + 0xC0u; q += 16u)
+            {
+                const uint32_t r = word(q + 8u);
+                const uint64_t v = (static_cast<uint64_t>(word(q + 4u)) << 32) | word(q);
+                if (r < 0x80u && seen.insert({r, v}).second && seen.size() < 400)
+                    std::fprintf(stderr, "[surface] reg %02x = %016llx\n", r, static_cast<unsigned long long>(v));
+            }
+        }
+        for (uint32_t q = s + 0x60u; q < s + 0xC0u; q += 16u)
+            if (word(q + 8u) == reg)
+                switch (word(q) & 0xFFu)
+                {
+                case 0x48u: return native_renderer::Blend::Additive;
+                case 0x42u: return native_renderer::Blend::Subtract;
+                default: return native_renderer::Blend::Normal;
+                }
+        return native_renderer::Blend::Normal;
+    }
+
+    // A surface's draw state as modelDispHook works it out, kept for the
+    // frame (a scene draws ~3 000 packets a frame over ~450 surfaces): the
+    // surface record (5 cache lines), the texture table, the texture object
+    // and its NTO2 header are read once a frame per surface, not per draw.
+    // Read per draw still: the flags' tests against the game's globals
+    // (surfaceDrawn), the scroll row's values, the LOD's K scale.
+    struct SurfaceInfo
+    {
+        uint32_t s = 0, header = 0;
+        uint64_t frame = ~0ull;
+        uint64_t flags = 0;   // +0x18 (64 bits)
+        uint32_t texMode = 0; // +0x1c
+        bool full = false;    // the rest below made (at the first draw that gets that far)
+        uint8_t layer[2] = {}; // surfaceLayer, not fading / fading
+        uint8_t clamp = 0, clamp2 = 0;
+        native_renderer::Blend blend = native_renderer::Blend::Normal, blend2 = native_renderer::Blend::Normal;
+        uint32_t scroll = 0; // the first texture's scroll row (two 16-bit values), 0: none
+        uint64_t texture = 0, texture2 = 0;
+        struct Lod
+        {
+            bool on = false;
+            float maxLod = 0.0f, lodScale = 1.0f;
+            int32_t k = 0; // NTO2 +0x90, times *0x118c180 per draw
+        } lod[2];
+    };
+    SurfaceInfo g_surfaceInfo[1024];
+    // modelDispState's own while the model jobs run on the worker (round 23).
+    SurfaceInfo g_surfaceInfoSync[1024];
+    // surfaceLod's reads, kept (the K product made per draw: applyLod).
+    SurfaceInfo::Lod surfaceLodInfo(uint32_t header, uint32_t s, uint32_t field)
+    {
+        SOTC_READ_SITE(12);
+        SurfaceInfo::Lod l;
+        const uint32_t index = word(s + field);
+        if (index >= word(header + 0x44u))
+            return l;
+        const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+        const uint32_t nto2 = object ? word(object + 0x20u) : 0u;
+        if (!nto2 || word(nto2) != 0x324F544Eu)
+            return l;
+        const uint32_t levels = std::clamp((word(nto2 + 0x1Cu) >> 12) & 0xFu, 1u, 7u);
+        if (levels < 2u || word(nto2 + 0x78u) < 2u)
+            return l;
+        l.on = true;
+        l.maxLod = static_cast<float>(levels - 1u);
+        l.lodScale = static_cast<float>(1u << (word(nto2 + 0x94u) & 3u));
+        l.k = static_cast<int32_t>(word(nto2 + 0x90u));
+        return l;
+    }
+    void applyLod(const SurfaceInfo::Lod &l, native_renderer::DrawState &state)
+    {
+        SOTC_READ_SITE(12);
+        if (!l.on)
+            return;
+        state.maxLod = l.maxLod;
+        state.lodScale = l.lodScale;
+        const int32_t k = static_cast<int32_t>(static_cast<float>(l.k) * drawLodScale());
+        state.lodK = static_cast<float>((k << 20) >> 20) / 16.0f; // 12-bit signed, 7.4
+    }
+    // surfaceRow's reads: the row pair's address.
+    uint32_t surfaceScroll(uint32_t header, uint32_t s)
+    {
+        SOTC_READ_SITE(3);
+        const uint32_t index = word(s + 0x2Cu);
+        if (index >= word(header + 0x44u))
+            return 0;
+        const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+        const uint32_t nto2 = object ? word(object + 0x20u) : 0u;
+        return nto2 ? word(nto2 + 0xCu) : 0u;
+    }
+    inline uint32_t surfaceSlot(uint32_t s) { return ((s >> 5) * 0x9E3779B1u) >> 22; }
+    // The flags and texture mode (what every packet asks first).
+    SurfaceInfo &surfaceInfo(uint32_t header, uint32_t s, SurfaceInfo *memo = g_surfaceInfo)
+    {
+        SOTC_READ_SITE(4);
+        SurfaceInfo &i = memo[surfaceSlot(s)];
+        if (i.s == s && i.header == header && i.frame == g_frame)
+            return i;
+        i.s = s;
+        i.header = header;
+        i.frame = g_frame;
+        noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&i.flags, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+        i.texMode = word(s + 0x1Cu);
+        i.full = false;
+        i.layer[0] = static_cast<uint8_t>(surfaceLayer(header, s, false));
+        i.layer[1] = static_cast<uint8_t>(surfaceLayer(header, s, true));
+        return i;
+    }
+    // surfaceDrawn from the kept flags.
+    bool surfaceDrawnFlags(uint64_t flags)
+    {
+        const uint32_t boss = word(0x1186290u);
+        if ((flags >> 29) & 1u)
+            return false;
+        if ((flags >> 17) & 1u)
+            return (boss & 1u) != 0;
+        if (((flags >> 24) & 1u) && !(boss & 2u))
+            return false;
+        return !(((flags >> 26) & 1u) && word(0x1186328u) != 0u);
+    }
+    // The rest, at the first draw of the surface this frame.
+    const SurfaceInfo &surfaceInfoFull(SurfaceInfo &i, uint32_t surface)
+    {
+        SOTC_READ_SITE(4);
+        if (i.full)
+            return i;
+        i.full = true;
+        i.texture = surfaceTexture(i.header, surface, 0x2Cu);
+        i.blend = surfaceBlend(i.s, 0x42u);
+        i.clamp = surfaceClamp(i.s, 0x08u);
+        i.lod[0] = surfaceLodInfo(i.header, i.s, 0x2Cu);
+        i.scroll = surfaceScroll(i.header, i.s);
+        if (i.texMode == 2u)
+        {
+            i.texture2 = surfaceTexture(i.header, surface, 0x3Cu);
+            i.blend2 = surfaceBlend(i.s, 0x43u);
+            i.clamp2 = surfaceClamp(i.s, 0x09u);
+            i.lod[1] = surfaceLodInfo(i.header, i.s, 0x3Cu);
+        }
+        else
+        {
+            i.texture2 = 0;
+            i.lod[1] = {};
+        }
+        return i;
+    }
+
+    // Skinned parts: their instance chain (instance + 0xc: a NEXT tag past
+    // the instance's own 15 qwords) ends in a RET packet that unpacks the
+    // bone palette to VU1 qword 0 (modelSetMatrixTransTag), each matrix
+    // bone x view (camera space, the projection comes after). Rigid parts
+    // upload one matrix there (5 qwords). False when there is no palette.
+    // VU1 data memory as the palette leaves it (1024 qwords, zero where it
+    // wrote nothing). Only the qwords the last palette wrote are cleared
+    // again (was the whole 16 KB per skinned instance).
+    struct VuPalette
+    {
+        std::vector<float> vu = std::vector<float>(1024u * 4u, 0.0f);
+        uint32_t lo = 0, hi = 0; // qwords written by the last palette
+        const float *data() const { return vu.data(); }
+        const float &operator[](size_t i) const { return vu[i]; }
+    };
+    // SOTC_STALE_CHECK=1 (debugging, round 12, the parts desync): the guest
+    // memory each model draw read (its matrix, its bone palette) is hashed
+    // when the hook reads it and again when the frame's display list goes to
+    // the VIF1 (ps2_stats::kickHook, what the PS2's DMA reads) and at the
+    // next frame's first hook: a region that changed in between was drawn
+    // with other data than the console's.
+    struct StaleRegion
+    {
+        uint32_t at, bytes, instance;
+        uint8_t kind; // 0 matrix, 1 palette, 2 cloth buffer read, 3 the cloth's other buffer
+        uint64_t hash;
+    };
+    std::vector<StaleRegion> g_staleRegions, g_stalePrevious; // this frame's, the frame before's
+    bool g_staleCheck = ps2_diag::env("SOTC_STALE_CHECK") != nullptr;
+    uint64_t staleHash(uint32_t at, uint32_t bytes)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < bytes; ++i)
+            h = (h ^ g_ram[(at + i) & 0x1FFFFFFu]) * 1099511628211ull;
+        return h;
+    }
+    void staleRecord(uint32_t at, uint32_t bytes, uint32_t instance, uint8_t kind)
+    {
+        if (g_staleRegions.size() < 4096u)
+            g_staleRegions.push_back({at, bytes, instance, kind, staleHash(at, bytes)});
+    }
+    void staleCompare(const char *when, const std::vector<StaleRegion> &regions);
+    void staleCompare(const char *when) { staleCompare(when, g_staleRegions); }
+    void staleCompare(const char *when, const std::vector<StaleRegion> &regions)
+    {
+        static const char *kinds[4] = {"matrix", "palette", "cloth", "cloth-other"};
+        const int w = when[0] == 'k' ? (when[4] == '2' ? 2 : 0) : 1;
+        static uint64_t frames[3] = {}, checked[3][4] = {}, changed[3][4] = {}, framesChanged[3] = {}, told = 0;
+        uint32_t now = 0;
+        for (const StaleRegion &r : regions)
+        {
+            ++checked[w][r.kind];
+            if (staleHash(r.at, r.bytes) != r.hash)
+            {
+                ++changed[w][r.kind], ++now;
+                if (w != 1 && r.kind != 1 && told++ < 200u)
+                    std::fprintf(stderr, "[stale] frame %llu at %s: %s %08x (%u bytes) instance %08x object %08x header %08x\n", (unsigned long long)g_frame, when,
+                                 kinds[r.kind], r.at, r.bytes, r.instance, word(r.instance), word(word(r.instance) + 0x20u));
+            }
+        }
+        if (now)
+            ++framesChanged[w];
+        if (++frames[w] % 600u == 0u)
+        {
+            std::fprintf(stderr, "[stale] %s: %llu frames, %llu with changes;", when, (unsigned long long)frames[w], (unsigned long long)framesChanged[w]);
+            for (int k = 0; k < 4; ++k)
+                std::fprintf(stderr, " %s %llu / %llu", kinds[k], (unsigned long long)changed[w][k], (unsigned long long)checked[w][k]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    // SOTC_VIEW_CHECK=1 (debugging, round 12): a draw's matrix as the
+    // native path makes it (the camera now x the model) against what the
+    // console's VU1 gets (the projection x the matrix the game put in the
+    // instance's chain, or in the cloth buffer, when it made them).
+    void viewCheck(int kind, const float *mine, const float *view)
+    {
+        static const bool on = ps2_diag::env("SOTC_VIEW_CHECK") != nullptr;
+        if (!on || !g_cameraContext)
+            return;
+        float projection[16], theirs[16];
+        for (int i = 0; i < 16; ++i)
+            projection[i] = real(g_cameraContext + 0x40u + i * 4u);
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k)
+                    sum += projection[k * 4 + r] * view[c * 4 + k];
+                theirs[c * 4 + r] = sum;
+            }
+        float diff = 0.0f, scale = 1e-6f;
+        for (int i = 0; i < 16; ++i)
+            diff = std::max(diff, std::fabs(mine[i] - theirs[i])), scale = std::max(scale, std::fabs(theirs[i]));
+        const float rel = diff / scale;
+        static uint64_t n[2] = {}, over[2] = {}, lastFrame = 0;
+        static float worst[2] = {};
+        ++n[kind];
+        if (rel > 1e-3f)
+            ++over[kind];
+        worst[kind] = std::max(worst[kind], rel);
+        if (g_frame / 100u != lastFrame / 100u)
+        {
+            std::fprintf(stderr, "[view] frame %llu: rigid %llu (%llu differ, worst %.4f) cloth %llu (%llu differ, worst %.4f)\n", (unsigned long long)g_frame,
+                         (unsigned long long)n[0], (unsigned long long)over[0], worst[0], (unsigned long long)n[1], (unsigned long long)over[1], worst[1]);
+            n[0] = n[1] = over[0] = over[1] = 0;
+            worst[0] = worst[1] = 0.0f;
+        }
+        lastFrame = g_frame;
+    }
+    bool readChainPalette(uint32_t own, VuPalette &vu);
+    bool readPalette(uint32_t instance, VuPalette &vu)
+    {
+        return readChainPalette(word(instance + 0xCu), vu);
+    }
+    bool readChainPalette(uint32_t own, VuPalette &palette)
+    {
+        SOTC_READ_SITE(7);
+        if (((word(own) >> 28) & 7u) != 2u)
+            return false;
+        const uint32_t ret = word(own + 4u), qwc = word(ret) & 0xFFFFu;
+        if (qwc <= 5u)
+            return false;
+        std::vector<float> &vu = palette.vu;
+        if (palette.hi > palette.lo)
+            std::fill(vu.begin() + palette.lo * 4u, vu.begin() + palette.hi * 4u, 0.0f);
+        uint32_t lo = 1024u, hi = 0u;
+        const uint32_t end = ret + 16u + qwc * 16u;
+        for (uint32_t p = ret + 8u; p < end;)
+        {
+            const uint32_t code = word(p);
+            p += 4;
+            const uint32_t cmd = (code >> 24) & 0x7Fu;
+            if ((cmd & 0x6Fu) != 0x6Cu)
+                continue; // NOP / STCYCL / MSCAL: one word
+            const uint32_t n = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u, at = code & 0x3FFu;
+            const uint32_t last = std::min(at + n, 1024u);
+            for (uint32_t q = at; q < last; ++q)
+            {
+                const uint32_t from = p + (q - at) * 16u;
+                noteRead(from, 16u);
+                if ((from & 0x1FFFFFCu) + 16u <= 0x2000000u)
+                    std::memcpy(&vu[q * 4u], g_ram + (from & 0x1FFFFFCu), 16);
+                else
+                    for (uint32_t k = 0; k < 4u; ++k)
+                        vu[q * 4u + k] = real(from + k * 4u);
+            }
+            if (last > at)
+            {
+                lo = std::min(lo, at);
+                hi = std::max(hi, last);
+            }
+            p += n * 16u;
+        }
+        palette.lo = lo;
+        palette.hi = hi;
+        return true;
+    }
+    // Round 32 (g_hookLean): readChainPalette's qwords lo..hi straight into
+    // `out` (what modelDispHook copied out of the VU picture: the same
+    // values, zero where no UNPACK wrote, later UNPACKs over earlier ones),
+    // without the 16 KB picture in between; the palette's lines asked for
+    // ahead of the copy. *bytes: how far the packet reaches (the next
+    // draw's prefetch).
+    bool readChainPaletteLean(uint32_t own, uint32_t &lo, uint32_t &hi, std::vector<float> &out, uint32_t &ret, uint32_t &bytes)
+    {
+        SOTC_READ_SITE(7);
+        ret = 0;
+        bytes = 0;
+        if (((word(own) >> 28) & 7u) != 2u)
+            return false;
+        ret = word(own + 4u);
+        const uint32_t qwc = word(ret) & 0xFFFFu;
+        if (qwc <= 5u)
+        {
+            ret = 0;
+            return false;
+        }
+        const uint32_t end = ret + 16u + qwc * 16u;
+        bytes = end - ret;
+        lo = 1024u;
+        hi = 0u;
+        for (uint32_t p = ret + 8u; p < end;)
+        {
+            const uint32_t code = word(p);
+            p += 4;
+            const uint32_t cmd = (code >> 24) & 0x7Fu;
+            if ((cmd & 0x6Fu) != 0x6Cu)
+                continue;
+            const uint32_t n = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u, at = code & 0x3FFu;
+            const uint32_t last = std::min(at + n, 1024u);
+            if (last > at)
+            {
+                lo = std::min(lo, at);
+                hi = std::max(hi, last);
+                for (uint32_t k = 0; k < 4u && k * 32u < (last - at) * 16u; ++k)
+                    prefetchGuest(p + k * 32u);
+            }
+            p += n * 16u;
+        }
+        if (hi <= lo)
+        {
+            out.clear();
+            return true;
+        }
+        out.assign((hi - lo) * 4u, 0.0f);
+        for (uint32_t p = ret + 8u; p < end;)
+        {
+            const uint32_t code = word(p);
+            p += 4;
+            const uint32_t cmd = (code >> 24) & 0x7Fu;
+            if ((cmd & 0x6Fu) != 0x6Cu)
+                continue;
+            const uint32_t n = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u, at = code & 0x3FFu;
+            const uint32_t last = std::min(at + n, 1024u);
+            for (uint32_t q = at; q < last; ++q)
+            {
+                const uint32_t from = p + (q - at) * 16u;
+                if (((q - at) & 1u) == 0u)
+                    prefetchGuest(from + 128u);
+                float *const to = out.data() + (q - lo) * 4u;
+                noteRead(from, 16u);
+                if ((from & 0x1FFFFFCu) + 16u <= 0x2000000u)
+                    std::memcpy(to, g_ram + (from & 0x1FFFFFCu), 16);
+                else
+                    for (uint32_t k = 0; k < 4u; ++k)
+                        to[k] = real(from + k * 4u);
+            }
+            p += n * 16u;
+        }
+        return true;
+    }
+
+
+    // A skinned packet's strip vertices as the posing reads them: bind pose,
+    // each bone as its matrix's offset in the palette (floats), the weights,
+    // and what is copied as is (ST, colour).
+    struct SkinBind
+    {
+        float x, y, z, nx, ny, nz;
+        float weight[3];
+        uint16_t at[3];
+        uint8_t bones;
+        float u, v;         // as native_renderer::Vertex has them:
+        uint8_t r, g, b, a; // u, v, then the colour
+    };
+    static_assert(offsetof(SkinBind, r) == offsetof(SkinBind, u) + 8u && offsetof(native_renderer::Vertex, u) == 24u &&
+                      offsetof(native_renderer::Vertex, r) == 32u && sizeof(native_renderer::Vertex) == 36u,
+                  "poseSkinned copies u, v and the colour as 12 bytes");
+    struct SkinnedPacket
+    {
+        std::vector<Strip> strips;      // bind pose
+        std::vector<SkinBind> bind;     // the strips' vertices, one strip after another
+        std::vector<uint32_t> stripEnd; // where each strip ends in `bind`
+        uint32_t maxVertices = 0;       // 3 x the strips' triangles (joins included)
+        // Drawn lit (lit(strips), g_litPackets). Unlit draws do not read the
+        // normals (the vertex programs use them only for lighting): they are
+        // left at 0 instead of posed.
+        bool lit = false;
+        // Posed by the GPU when it can be (native_renderer::gpuSkinning): its
+        // matrices within kSkinPaletteQwords of each other (qwords lo..hi of
+        // the palette), and no lit vertex without a normal (those take each
+        // triangle's own normal).
+        bool gpu = false;
+        uint32_t lo = 0, hi = 0;
+        uint64_t used = 0;              // the last frame (g_frame) that drew it
+        uint64_t bytes = 0;             // held here (the [gl:mem] log)
+    };
+
+    SkinnedPacket makeSkinnedPacket(std::vector<Strip> &&strips)
+    {
+        SkinnedPacket packet;
+        for (const Strip &strip : strips)
+        {
+            for (const BatchVertex &v : strip)
+            {
+                SkinBind b{};
+                b.x = v.x, b.y = v.y, b.z = v.z;
+                b.nx = v.nx, b.ny = v.ny, b.nz = v.nz;
+                b.bones = v.bones;
+                for (uint32_t k = 0; k < v.bones; ++k)
+                {
+                    b.weight[k] = v.weight[k];
+                    b.at[k] = static_cast<uint16_t>((v.bone[k] * 4u % 1024u) * 4u);
+                }
+                b.u = v.u, b.v = v.v;
+                b.r = v.r, b.g = v.g, b.b = v.b, b.a = v.a;
+                packet.bind.push_back(b);
+            }
+            packet.stripEnd.push_back(static_cast<uint32_t>(packet.bind.size()));
+            if (strip.size() > 2u)
+                packet.maxVertices += static_cast<uint32_t>(strip.size() - 2u) * 3u;
+        }
+        packet.lit = lit(strips);
+        uint32_t lo = ~0u, hi = 0u;
+        bool noNormal = false;
+        for (const SkinBind &b : packet.bind)
+        {
+            for (uint32_t k = 0; k < b.bones; ++k)
+            {
+                lo = std::min<uint32_t>(lo, b.at[k] / 4u);
+                hi = std::max<uint32_t>(hi, b.at[k] / 4u + 4u);
+            }
+            noNormal = noNormal || (b.nx == 0.0f && b.ny == 0.0f && b.nz == 0.0f);
+        }
+        packet.lo = lo == ~0u ? 0u : lo;
+        packet.hi = std::max(hi, packet.lo);
+        packet.gpu = (!packet.lit || !noNormal) && packet.hi - packet.lo <= native_renderer::kSkinPaletteQwords;
+        packet.strips = std::move(strips);
+        packet.bytes = packet.strips.capacity() * sizeof(Strip) + packet.bind.capacity() * sizeof(SkinBind) + packet.stripEnd.capacity() * 4u;
+        for (const Strip &strip : packet.strips)
+            packet.bytes += strip.capacity() * sizeof(BatchVertex);
+        return packet;
+    }
+
+    // A skinned packet's bind pose for the GPU (native_renderer::uploadSkinnedMesh):
+    // the strip vertices, and the strips' triangles as indices (those with two
+    // corners the same vertex left out: no matrix pulls them apart).
+    void uploadSkinned(uint64_t id, const SkinnedPacket &packet)
+    {
+        static std::vector<native_renderer::SkinVertex> vertices;
+        static std::vector<uint32_t> indices;
+        vertices.resize(packet.bind.size());
+        for (size_t i = 0; i < packet.bind.size(); ++i)
+        {
+            const SkinBind &b = packet.bind[i];
+            native_renderer::SkinVertex &o = vertices[i];
+            o = {};
+            o.x = b.x, o.y = b.y, o.z = b.z;
+            o.nx = b.nx, o.ny = b.ny, o.nz = b.nz;
+            o.u = b.u, o.v = b.v;
+            o.r = b.r, o.g = b.g, o.b = b.b, o.a = b.a;
+            for (uint32_t k = 0; k < b.bones; ++k)
+            {
+                o.bone[k] = static_cast<float>(b.at[k] / 4u - packet.lo);
+                o.weight[k] = b.weight[k];
+            }
+        }
+        const auto same = [&](uint32_t a, uint32_t b) { return std::memcmp(&packet.bind[a], &packet.bind[b], sizeof(SkinBind)) == 0; };
+        indices.clear();
+        uint32_t first = 0;
+        for (const uint32_t end : packet.stripEnd)
+        {
+            for (uint32_t i = first + 2u; i < end; ++i)
+                if (!same(i - 2u, i - 1u) && !same(i - 1u, i) && !same(i - 2u, i))
+                    indices.insert(indices.end(), {i - 2u, i - 1u, i});
+            first = end;
+        }
+        native_renderer::uploadSkinnedMesh(id, vertices.data(), static_cast<uint32_t>(vertices.size()), indices.data(), static_cast<uint32_t>(indices.size()));
+    }
+
+    // Poses a skinned packet (camera space) into `out` (room for
+    // max(bind.size(), maxVertices)): the triangles triangulate() with the
+    // posing lambda of modelDispHook gives, each strip vertex posed once.
+    // Written as the strip vertices plus indices (a third of the vertices to
+    // write and to upload); as the triangle list itself when a lit packet
+    // has a posed normal of 0 (that vertex takes each triangle's own face
+    // normal, so it cannot be shared). The vertices keep the same values
+    // either way: the same picture.
+    struct Posed
+    {
+        float p[3], n[3];
+    };
+    struct PosedMesh
+    {
+        uint32_t vertices = 0, indices = 0;
+        const uint32_t *index = nullptr; // indexed: the indices (from `base`)
+        uint32_t base = 0;
+    };
+    PosedMesh poseSkinned(const SkinnedPacket &packet, const float *palette, native_renderer::Vertex *out)
+    {
+        static std::vector<Posed> posed;
+        const size_t count = packet.bind.size();
+        if (posed.size() < count)
+            posed.resize(count);
+        const bool lit = packet.lit;
+        uint32_t zeroNormals = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const SkinBind &v = packet.bind[i];
+            float x = 0.0f, y = 0.0f, z = 0.0f, nx = 0.0f, ny = 0.0f, nz = 0.0f;
+            if (v.bones == 1u)
+            {
+                // One bone, weight 1: 0 + 1 x t is t (the sign of a zero aside).
+                const float *m = palette + v.at[0];
+                x = m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12];
+                y = m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13];
+                z = m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14];
+                if (lit)
+                {
+                    nx = m[0] * v.nx + m[4] * v.ny + m[8] * v.nz;
+                    ny = m[1] * v.nx + m[5] * v.ny + m[9] * v.nz;
+                    nz = m[2] * v.nx + m[6] * v.ny + m[10] * v.nz;
+                }
+            }
+            else
+            for (uint32_t b = 0; b < v.bones; ++b)
+            {
+                const float *m = palette + v.at[b];
+                const float w = v.weight[b];
+                x += w * (m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12]);
+                y += w * (m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13]);
+                z += w * (m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14]);
+                if (!lit)
+                    continue;
+                nx += w * (m[0] * v.nx + m[4] * v.ny + m[8] * v.nz);
+                ny += w * (m[1] * v.nx + m[5] * v.ny + m[9] * v.nz);
+                nz += w * (m[2] * v.nx + m[6] * v.ny + m[10] * v.nz);
+            }
+            Posed &o = posed[i];
+            o.p[0] = x, o.p[1] = y, o.p[2] = z;
+            o.n[0] = nx, o.n[1] = ny, o.n[2] = nz;
+            if (lit)
+                zeroNormals |= static_cast<uint32_t>(nx == 0.0f && ny == 0.0f && nz == 0.0f);
+        }
+        // A triangle's (doubled) area: degenerate ones (strip joins) are left
+        // out, as triangulate() does (its sqrt of this is not > 0 either).
+        const auto cross = [](const Posed &a, const Posed &b, const Posed &c, float n[3])
+        {
+            const float ux = b.p[0] - a.p[0], uy = b.p[1] - a.p[1], uz = b.p[2] - a.p[2];
+            const float vx = c.p[0] - a.p[0], vy = c.p[1] - a.p[1], vz = c.p[2] - a.p[2];
+            n[0] = uy * vz - uz * vy, n[1] = uz * vx - ux * vz, n[2] = ux * vy - uy * vx;
+            return n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+        };
+        const auto put = [&](native_renderer::Vertex &o, size_t i, const float *normal)
+        {
+            const Posed &p = posed[i];
+            const SkinBind &src = packet.bind[i];
+            o.x = p.p[0], o.y = p.p[1], o.z = p.p[2];
+            o.nx = normal[0], o.ny = normal[1], o.nz = normal[2];
+            o.u = src.u, o.v = src.v;
+            o.r = src.r, o.g = src.g, o.b = src.b, o.a = src.a;
+        };
+        PosedMesh mesh;
+        uint32_t first = 0;
+        uint32_t base = 0, *indices = zeroNormals ? nullptr : native_renderer::frameMeshIndices(packet.maxVertices, base);
+        if (indices)
+        {
+            static const float none[3] = {0.0f, 0.0f, 0.0f}; // unlit: not read
+            for (size_t i = 0; i < count; ++i)
+                put(out[i], i, lit ? posed[i].n : none);
+            mesh.vertices = static_cast<uint32_t>(count);
+            for (const uint32_t end : packet.stripEnd)
+            {
+                for (uint32_t i = first + 2u; i < end; ++i)
+                {
+                    float n[3];
+                    if (!(cross(posed[i - 2u], posed[i - 1u], posed[i], n) > 0.0f))
+                        continue;
+                    indices[mesh.indices++] = base + i - 2u;
+                    indices[mesh.indices++] = base + i - 1u;
+                    indices[mesh.indices++] = base + i;
+                }
+                first = end;
+            }
+            mesh.index = indices;
+            mesh.base = base;
+            return mesh;
+        }
+        for (const uint32_t end : packet.stripEnd)
+        {
+            for (uint32_t i = first + 2u; i < end; ++i)
+            {
+                float n[3];
+                const float squared = cross(posed[i - 2u], posed[i - 1u], posed[i], n);
+                if (!(squared > 0.0f))
+                    continue;
+                float face[3];
+                bool haveFace = false;
+                for (uint32_t k = i - 2u; k <= i; ++k)
+                {
+                    const float *normal = posed[k].n;
+                    if (normal[0] == 0.0f && normal[1] == 0.0f && normal[2] == 0.0f) // unlit: all 0, so the face's
+                    {
+                        if (!haveFace)
+                        {
+                            const float len = std::sqrt(squared);
+                            face[0] = n[0] / len, face[1] = n[1] / len, face[2] = n[2] / len;
+                            haveFace = true;
+                        }
+                        normal = face;
+                    }
+                    put(out[mesh.vertices++], k, normal);
+                }
+            }
+            first = end;
+        }
+        return mesh;
+    }
+    std::unordered_map<uint64_t, SkinnedPacket> g_skinnedPackets; // by packet
+    uint64_t g_skinnedPacketBytes = 0;                               // what they hold
+    native_renderer::IdSet g_litPackets;                              // packets with normals
+    native_renderer::IdSet g_skinnedIds;                              // g_skinnedPackets' keys (most packets are not: no map lookup for them)
+    uint64_t g_skinnedDraws = 0;                                       // this frame's skinned meshes
+
+    // ---- Skinned parts as the display list's DMA reads them (round 12) -----
+    //
+    // A skinned instance's chain (instance + 0xc) ends in a CALL to its bone
+    // palette's RET packet, and several instances of one character can share
+    // that chain (Wander's models: one palette packet rewritten between their
+    // draws). The console's DMA reads it when the list goes to the VIF1, after
+    // the whole walk: every instance on a shared chain is drawn with the last
+    // matrices written there. The hook read them at the instance's draw, so
+    // a part drawn before the last write was posed from other matrices than
+    // the rest of the character: invisible at 60 fps (the same pose, a frame
+    // apart), parts from different poses at 11 fps (the parts desync). Now
+    // each skinned draw is recorded with the palette it used, and at the
+    // kick (ps2_stats::kickHook) the chains are read again; a draw whose
+    // palette changed is posed again (the same per-frame mesh id: the later
+    // upload wins) or its GPU palette rewritten. SOTC_SKIN_AT_KICK=0: off.
+    struct SkinRecord
+    {
+        uint32_t own = 0, lo = 0, hi = 0;
+        std::vector<float> used; // qwords lo..hi of the palette as posed
+    };
+    struct SkinDraw
+    {
+        uint32_t record = 0;
+        const SkinnedPacket *packet = nullptr;
+        uint64_t mesh = 0;    // posed on the CPU: its per-frame mesh
+        uint32_t handle = 0;  // posed by the GPU: its frame palette
+        uint32_t lo = 0, count = 0;
+    };
+    std::vector<SkinRecord> g_skinRecords;
+    std::vector<SkinDraw> g_skinDrawList;
+    const bool g_skinAtKick = []
+    {
+        const char *env = std::getenv("SOTC_SKIN_AT_KICK");
+        return !(env && std::atoi(env) == 0);
+    }();
+    struct SkinKickStats
+    {
+        uint64_t kicks = 0, records = 0, changed = 0, reposed = 0, rewritten = 0;
+        uint64_t deferred = 0, copied = 0, missed = 0; // round 34 (SOTC_KICK_DEFER)
+    } g_skinKickStats;
+
+    // Round 105 (SOTC_WORKER105, default on; A/B `worker105`, `r105all`): the
+    // shadow volumes' CPU on the hook worker (the Vita3K sampler at the altar:
+    // shadowDispDraw 35% of the worker, newlib's memcmp 12%, truncf 3.6%) with
+    // the same results bit for bit:
+    // - the parsed model's guest bytes compared 64 at a time in NEON (newlib's
+    //   memcmp is a word-at-a-time loop with a branch per word), equality only;
+    // - a skinned vertex's bone index and weight without the truncf call: for
+    //   |packed| < 2^23 trunc(packed) is (float)(int)packed (the same index;
+    //   the weight packed - index the same value: a -0 index only for
+    //   packed in (-1, 0), where packed - -0 == packed - +0), the rest as before;
+    //   the vertex's x / y / z held in registers (they were loaded again after
+    //   every store into the camera-space array: possible aliasing);
+    // - the corner table's 24-byte memcmp as six word compares;
+    // - the kick pass's palette compare (skinAtKickWith, the worker's kick
+    //   job: each skinned chain's bones against the last ones drawn) in NEON too.
+    // SOTC_WORKER105_CHECK=1 (checking): both ways at every use, the
+    // differences counted ([worker105c] lines every 2 000 shadow draws; the
+    // old way's vertices used, the new way's compare answers).
+    bool g_worker105 = true;       // SOTC_WORKER105 (start105)
+    bool g_worker105Check = false; // SOTC_WORKER105_CHECK
+    bool envOn105(const char *name)
+    {
+        const char *e = std::getenv(name);
+        return !e || std::atoi(e) != 0;
+    }
+    // Round 105's switches as env.txt sets them (the first frame: the Vita's
+    // env.txt is read after the static initialisers ran).
+    void start105()
+    {
+        g_worker105 = envOn105("SOTC_WORKER105");
+        g_worker105Check = ps2_diag::env("SOTC_WORKER105_CHECK") && std::atoi(ps2_diag::env("SOTC_WORKER105_CHECK")) != 0;
+        native_renderer::g_build105 = envOn105("SOTC_BUILD105");
+        native_renderer::g_log105 = envOn105("SOTC_LOG105");
+        native_renderer::g_render105 = envOn105("SOTC_RENDER105");
+        std::fprintf(stderr, "[r105] worker105 %d (check %d), build105 %d, log105 %d, render105 %d\n", g_worker105 ? 1 : 0, g_worker105Check ? 1 : 0,
+                     native_renderer::g_build105 ? 1 : 0, native_renderer::g_log105 ? 1 : 0, native_renderer::g_render105 ? 1 : 0);
+    }
+    struct Worker105Stats
+    {
+        std::atomic<uint64_t> bytes{0}, bytesDiffer{0}, verts{0}, vertsDiffer{0}, probes{0}, probesDiffer{0}, uses{0};
+    } g_worker105Stats;
+    // a[0, n) == b[0, n) (the bytes; no alignment asked of either).
+    inline bool sameBytes105(const uint8_t *a, const uint8_t *b, size_t n)
+    {
+#if defined(__arm__) && defined(__ARM_NEON)
+        while (n >= 64u)
+        {
+            const uint8x16_t x0 = veorq_u8(vld1q_u8(a), vld1q_u8(b));
+            const uint8x16_t x1 = veorq_u8(vld1q_u8(a + 16), vld1q_u8(b + 16));
+            const uint8x16_t x2 = veorq_u8(vld1q_u8(a + 32), vld1q_u8(b + 32));
+            const uint8x16_t x3 = veorq_u8(vld1q_u8(a + 48), vld1q_u8(b + 48));
+            const uint8x16_t o = vorrq_u8(vorrq_u8(x0, x1), vorrq_u8(x2, x3));
+            const uint32x2_t h = vreinterpret_u32_u8(vorr_u8(vget_low_u8(o), vget_high_u8(o)));
+            if ((vget_lane_u32(h, 0) | vget_lane_u32(h, 1)) != 0u)
+                return false;
+            a += 64;
+            b += 64;
+            n -= 64u;
+        }
+#endif
+        uint32_t diff = 0;
+        while (n >= 4u)
+        {
+            uint32_t x, y;
+            std::memcpy(&x, a, 4);
+            std::memcpy(&y, b, 4);
+            diff |= x ^ y;
+            a += 4;
+            b += 4;
+            n -= 4u;
+        }
+        while (n--)
+            diff |= static_cast<uint32_t>(*a++ ^ *b++);
+        return diff == 0u;
+    }
+
+    // The kick's pass, `now` taken by fetch(rec.own, now) (true: a palette,
+    // as readChainPalette leaves the VU picture). One picture for both ways
+    // (zero but for the last palette's qwords).
+    VuPalette g_kickNow;
+    template <typename Fetch>
+    void skinAtKickWith(Fetch &&fetch)
+    {
+        SOTC_READ_SITE(10);
+        if (g_skinDrawList.empty())
+            return;
+        VuPalette &now = g_kickNow;
+        SkinKickStats &st = g_skinKickStats;
+        ++st.kicks;
+        for (uint32_t r = 0; r < g_skinRecords.size(); ++r)
+        {
+            SkinRecord &rec = g_skinRecords[r];
+            ++st.records;
+            if (!fetch(rec.own, now))
+                continue;
+            if (now.lo == rec.lo && now.hi == rec.hi &&
+                (g_worker105 ? sameBytes105(reinterpret_cast<const uint8_t *>(now.data() + rec.lo * 4u), reinterpret_cast<const uint8_t *>(rec.used.data()),
+                                            rec.used.size() * sizeof(float))
+                             : std::memcmp(now.data() + rec.lo * 4u, rec.used.data(), rec.used.size() * sizeof(float)) == 0))
+                continue;
+            ++st.changed;
+            rec.lo = now.lo;
+            rec.hi = now.hi;
+            rec.used.assign(now.data() + now.lo * 4u, now.data() + now.hi * 4u);
+            for (const SkinDraw &d : g_skinDrawList)
+            {
+                if (d.record != r)
+                    continue;
+                if (d.handle)
+                {
+                    native_renderer::rewriteFramePalette(d.handle, now.data() + d.lo * 4u, d.count);
+                    ++st.rewritten;
+                }
+                else if (d.mesh)
+                {
+                    const SkinnedPacket &packet = *d.packet;
+                    if (native_renderer::Vertex *out = native_renderer::frameMesh(std::max<uint32_t>(packet.maxVertices, static_cast<uint32_t>(packet.bind.size()))))
+                    {
+                        const PosedMesh written = poseSkinned(packet, now.data(), out);
+                        native_renderer::commitFrameMesh(d.mesh, written.vertices, written.indices);
+                        ++st.reposed;
+                    }
+                }
+            }
+        }
+        static const bool log = ps2_diag::env("SOTC_SKIN_KICK_LOG") != nullptr;
+        if (log && st.kicks % 600u == 0u)
+            std::fprintf(stderr, "[skin-kick] %llu kicks: %llu instance palettes, %llu changed after their draws: %llu parts posed again, %llu GPU palettes rewritten; "
+                         "deferred kicks %llu (joined %llu: a draw without a plan), palettes copied at the kick %llu, records not among them %llu; "
+                         "scroll rows from the hook %llu, read late %llu\n",
+                         (unsigned long long)st.kicks, (unsigned long long)st.records, (unsigned long long)st.changed, (unsigned long long)st.reposed,
+                         (unsigned long long)st.rewritten, (unsigned long long)st.deferred, (unsigned long long)g_kickJoined, (unsigned long long)st.copied,
+                         (unsigned long long)st.missed, (unsigned long long)g_scrollTaken, (unsigned long long)g_scrollMissed);
+    }
+    void skinAtKick()
+    {
+        skinAtKickWith([](uint32_t own, VuPalette &now) { return readChainPalette(own, now); });
+    }
+
+    // ---- The kick without its join (round 34) -----------------------------
+    //
+    // Round 23 joined the model jobs at the kick: skinAtKick reads their
+    // records, and the jobs read guest memory the PS2's DMA reads at the kick.
+    // With a slow worker (the console's) the game thread waited 3-4 ms a
+    // frame there, about the worker's whole job time. Now (SOTC_KICK_DEFER,
+    // default 1, with the worker on) the game thread copies, at the kick, the
+    // bone palettes of every chain its hooks saw with one this frame
+    // (g_kickOwns: what skinAtKick would read there, the same moment) and
+    // hands the pass over as a job behind the frame's model jobs (kJobKick:
+    // skinAtKickWith on the copies); the jobs are joined at the next frame's
+    // first hook (syncFrame), the garbage pass's moves (k_move) or any other
+    // join, so the worker runs them while the game goes on with the next
+    // frame's logic. The draws keep their order (one ring); what the jobs
+    // read of guest memory after the kick is what the DMA read there, which
+    // the game leaves alone until its next display list (checked on the Mac:
+    // SOTC_KICK_DEFER_CHECK=1 holds the jobs from the kick to the join, runs
+    // them on a copy of guest memory taken at the kick, and compares every
+    // page they read with the memory at the join).
+    struct KickPalette
+    {
+        uint32_t own = 0, lo = 0, hi = 0;
+        bool ok = false;
+        std::vector<float> data; // qwords lo..hi
+    };
+    struct KickJob
+    {
+        uint32_t count = 0;               // palettes[0..count) (each slot keeps its room)
+        std::vector<KickPalette> palettes; // by own, ascending
+    };
+    // The kick jobs' copies: a few kept apart from the ring (each slot keeps
+    // its vectors' room: 512 slots that held a kick's ~100 KB of palettes
+    // grew the heap by megabytes); kickRun counts the ones done.
+    constexpr uint32_t kKickJobs = 4;
+    KickJob g_kickJobs[kKickJobs];
+    uint32_t g_kickPushed = 0;
+    std::atomic<uint32_t> g_kickDone{0};
+    std::vector<uint32_t> g_kickOwns; // the frame's chains with a palette at their hook (game thread; cleared with the records)
+    bool g_kickDefer = true;          // SOTC_KICK_DEFER (read at the first frame)
+    bool g_kickMustJoin = false;      // a model job of this frame without its hook's scroll rows (no plan): the kick joins as before
+    // The game thread at the kick: the palettes copied into the job.
+    void kickCopy(KickJob &job)
+    {
+        std::sort(g_kickOwns.begin(), g_kickOwns.end());
+        g_kickOwns.erase(std::unique(g_kickOwns.begin(), g_kickOwns.end()), g_kickOwns.end());
+        if (job.palettes.size() < g_kickOwns.size())
+            job.palettes.resize(g_kickOwns.size());
+        job.count = static_cast<uint32_t>(g_kickOwns.size());
+        for (uint32_t i = 0; i < job.count; ++i)
+        {
+            KickPalette &k = job.palettes[i];
+            uint32_t ret = 0, bytes = 0;
+            k.own = g_kickOwns[i];
+            k.ok = readChainPaletteLean(k.own, k.lo, k.hi, k.data, ret, bytes);
+        }
+        g_skinKickStats.copied += job.count;
+        ++g_skinKickStats.deferred;
+    }
+    // The worker: the pass on the kick's copies (a chain not among them, which
+    // the verify would show, read as before).
+    void kickRun(const KickJob &job)
+    {
+        skinAtKickWith([&job](uint32_t own, VuPalette &now)
+        {
+            const KickPalette *const first = job.palettes.data(), *const last = first + job.count;
+            const KickPalette *k = std::lower_bound(first, last, own, [](const KickPalette &a, uint32_t o) { return a.own < o; });
+            if (k == last || k->own != own)
+            {
+                ++g_skinKickStats.missed;
+                return readChainPalette(own, now);
+            }
+            if (!k->ok)
+                return false;
+            // As readChainPalette leaves the picture: the last palette's
+            // qwords cleared, this one's written (zero where no UNPACK wrote).
+            if (now.hi > now.lo)
+                std::fill(now.vu.begin() + now.lo * 4u, now.vu.begin() + now.hi * 4u, 0.0f);
+            if (k->hi > k->lo)
+                std::copy(k->data.begin(), k->data.end(), now.vu.begin() + k->lo * 4u);
+            now.lo = k->lo;
+            now.hi = k->hi;
+            return true;
+        });
+    }
+
+    // ---- Draw plans (round 8) --------------------------------------------
+    //
+    // A model's packet list (header +0x60, 32 bytes a packet, every LOD one
+    // after the other) walked once, not twice a draw (modelDispState and the
+    // hook): for each (header, LOD) the packets of that LOD in their order
+    // with their part, surface and data, and what the hook found out about
+    // each (its id, skinned or not, its meshes there, lit). Kept across
+    // frames. What is still read per draw: the part tree's results, the
+    // surfaces' flags / textures / scroll (the per-frame surface memo), the
+    // instance's matrix, opacity, lights and palette.
+    //
+    // Invalidation: each frame a plan is used, the header's packet list and
+    // surface table pointers and the list's first packet are compared; one
+    // frame in 16 (by header) the whole list (size, LOD, surface, part, data
+    // of every packet) is hashed again; a header that moved (an area's heap
+    // compaction) or a LOD switch is another plan. A packet's id is taken
+    // again from packetId whenever packetId itself would look at the packet
+    // (not drawn the frame before, its stagger frame, or a packet seen
+    // rewritten in place: every frame), so the ids are packetId's.
+    // The meshes' presence is asked again after the backend lets meshes go
+    // (meshEvictions) and the skinned packets' after their sweep.
+    // SOTC_PLAN=0: off (the packet walk as before). SOTC_PLAN_VERIFY=<n>:
+    // every n-th frame each draw's packets go through both paths, the old
+    // one dry (hashed by the draw tap, not drawn), and the draw hashes are
+    // compared ([plan-verify] lines).
+    struct PlanPacket
+    {
+        uint32_t data = 0, size = 0, part = 0;
+        uint32_t surface = 0, s = 0, slot = 0; // the surface: index, record, g_surfaceInfo slot
+        uint64_t id = 0, idFrame = ~0ull;      // the packet's id, the frame it was last taken
+        SkinnedPacket *skinned = nullptr;
+        bool rewritten = false; // packetId saw it rewritten in place: asked every frame
+        bool resolved = false;  // skinned / ready / lit known for `id`
+        bool ready = false, readyTwo = false, lit = false;
+    };
+    struct ModelPlan
+    {
+        uint32_t header = 0, lod = 0, packets = 0, surfaces = 0, count = 0;
+        uint32_t first[5] = {};
+        uint64_t listHash = 0, checked = ~0ull, used = 0, meshEpoch = 0, skinEpoch = 0;
+        std::vector<PlanPacket> pk;
+        std::vector<uint32_t> surfaceRecords; // round 34: the packets' surface records, each once (hookScrolls)
+    };
+    std::unordered_map<uint64_t, ModelPlan> g_plans;
+    struct PlanCache97
+    {
+        uint64_t key = 0;
+        ModelPlan *plan = nullptr;
+    };
+    PlanCache97 g_planCache97[1024];
+    void planCache97Clear()
+    {
+        for (PlanCache97 &c : g_planCache97)
+            c = PlanCache97{};
+    }
+    ModelPlan *planChecked(ModelPlan &p, uint32_t header, uint32_t lod);
+    int32_t g_planBudget = 0; // packets the frame's new plans may still walk (SOTC_PLAN_BUDGET, default 3000)
+    uint64_t g_skinnedEpoch = 0; // g_skinnedPackets lost an entry (their sweep)
+    struct PlanStats
+    {
+        uint64_t builds = 0, rebuilds = 0, uses = 0, asked = 0, trusted = 0, checks = 0, draws = 0, differ = 0, countDiffer = 0, ranges = 0, drawn = 0, merged = 0, deferred = 0;
+        // Round 33: the jobs' plan walk (planPackets): packets looked at, left
+        // out by the part test / by the surface test, part runs (a change of
+        // part from the packet before) and the runs the part test left out.
+        uint64_t visited = 0, partSkipped = 0, surfaceSkipped = 0, partRuns = 0, partRunsSkipped = 0;
+    } g_planStats;
+    // A run of one surface's packets of one draw, drawn as one (drawMulti):
+    // the state of its first packet, the meshes of all (round 8). The packets
+    // after the first are taken only when their draw would be the same: the
+    // same surface record (its flags, texture, layer ... this frame), lit or
+    // not alike, a plain mesh already there, one draw a packet (no second
+    // texture, no reflection passes). Flushed before any other draw.
+    struct PlanRun
+    {
+        uint32_t n = 0, s = 0;
+        bool lit = false;
+        const float *transform = nullptr;
+        native_renderer::DrawState state;
+        std::vector<uint64_t> ids;
+        void flush()
+        {
+            if (!n)
+                return;
+            native_renderer::drawMulti(ids.data(), n, transform, state);
+            g_planStats.ranges += n > 1u;
+            g_planStats.merged += n - 1u;
+            n = 0;
+            ids.clear();
+        }
+    } g_planRun;
+    bool g_planRuns = true; // SOTC_PLAN_RUNS=0: one draw a packet
+    bool g_planStatsOn = false; // SOTC_PLAN_STATS=1 (set once a frame: no guard per packet)
+    inline bool planStatsOn() { return g_planStatsOn; }
+    inline uint64_t planMix(uint64_t h, uint32_t v) { return (h ^ v) * 0x100000001b3ull; }
+    // The list's size / LOD / surface / part / data words, every packet.
+    uint64_t packetListHash(uint32_t packets, uint32_t &count)
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        count = 0;
+        for (uint32_t pk = packets; count < 0x10000u; pk += 32u)
+        {
+            const uint32_t size = word(pk);
+            if (size == 0u)
+                break;
+            ++count;
+            for (uint32_t i = 0; i < 20u; i += 4u)
+                h = planMix(h, word(pk + i));
+        }
+        return h;
+    }
+    void buildPlan(ModelPlan &p, uint32_t header, uint32_t lod)
+    {
+        SOTC_PROF_SCOPE(kHookPlan);
+        p.header = header;
+        p.lod = lod;
+        p.packets = word(header + 0x60u);
+        p.surfaces = word(header + 0x50u);
+        p.pk.clear();
+        uint64_t h = 0xcbf29ce484222325ull;
+        uint32_t count = 0;
+        for (uint32_t pk = p.packets; count < 0x10000u; pk += 32u)
+        {
+            const uint32_t size = word(pk);
+            if (size == 0u)
+                break;
+            ++count;
+            for (uint32_t i = 0; i < 20u; i += 4u)
+                h = planMix(h, word(pk + i));
+            if (word(pk + 4u) != lod)
+                continue;
+            PlanPacket e;
+            e.size = size;
+            e.surface = word(pk + 8u);
+            e.part = word(pk + 12u);
+            e.data = word(pk + 16u);
+            e.s = p.surfaces + e.surface * 0x120u;
+            e.slot = surfaceSlot(e.s);
+            p.pk.push_back(e);
+        }
+        p.surfaceRecords.clear();
+        for (const PlanPacket &e : p.pk)
+            if (std::find(p.surfaceRecords.begin(), p.surfaceRecords.end(), e.s) == p.surfaceRecords.end())
+                p.surfaceRecords.push_back(e.s);
+        p.count = count;
+        p.listHash = h;
+        for (uint32_t i = 0; i < 5u; ++i)
+            p.first[i] = word(p.packets + i * 4u);
+        p.meshEpoch = native_renderer::meshEvictions();
+        p.skinEpoch = g_skinnedEpoch;
+    }
+    // The plan of (header, LOD), checked once a frame; nullptr: none (LOD out of range).
+    ModelPlan *modelPlan(uint32_t header, uint32_t lod)
+    {
+        if (lod >= 8u)
+            return nullptr;
+        // Round 97 (SOTC_PLAN97): the plans' map lookup (a 64-bit key's
+        // bucket: a software division on the A9, ~0.6-0.8% of the game thread)
+        // through a direct-mapped table of the map's own nodes in front of
+        // it; the map keeps its nodes where they are until they are erased,
+        // and every erase clears the table. The same plan, the same steps.
+        const uint64_t key97 = (static_cast<uint64_t>(header) << 3) | lod;
+        PlanCache97 &c97 = g_planCache97[((header >> 4) * 0x9E3779B1u + lod) >> 22];
+        const bool use97 = sotc_decomp::plan97On();
+        if (use97 && c97.plan && c97.key == key97)
+        {
+            ModelPlan &p = *c97.plan;
+            p.used = g_frame;
+            return planChecked(p, header, lod);
+        }
+        const auto [it, fresh] = g_plans.try_emplace(key97);
+        ModelPlan &p = it->second;
+        p.used = g_frame;
+        // Builds spread over frames (an area load brings hundreds of new
+        // models at once): past this frame's budget of packets a model is
+        // drawn by the packet walk, its plan made at a later frame.
+        if ((fresh || p.checked != g_frame) && g_planBudget <= 0)
+        {
+            if (fresh)
+            {
+                g_plans.erase(it);
+                planCache97Clear();
+                ++g_planStats.deferred;
+                return nullptr;
+            }
+        }
+        if (use97)
+        {
+            c97.key = key97;
+            c97.plan = &p;
+        }
+        if (fresh)
+        {
+            buildPlan(p, header, lod);
+            g_planBudget -= static_cast<int32_t>(p.count) + 16;
+            p.checked = g_frame;
+            ++g_planStats.builds;
+            return &p;
+        }
+        return planChecked(p, header, lod);
+    }
+    // modelPlan's steps for a plan already in the map (split out for round 97's table).
+    ModelPlan *planChecked(ModelPlan &p, uint32_t header, uint32_t lod)
+    {
+        (void)lod;
+        if (p.checked == g_frame)
+            return &p;
+        p.checked = g_frame;
+        bool ok = p.packets == word(header + 0x60u) && p.surfaces == word(header + 0x50u);
+        for (uint32_t i = 0; ok && i < 5u; ++i)
+            ok = p.first[i] == word(p.packets + i * 4u);
+        if (ok && ((g_frame + (header >> 5)) & 15u) == 0u)
+        {
+            uint32_t count = 0;
+            ok = packetListHash(p.packets, count) == p.listHash && count == p.count;
+        }
+        if (!ok)
+        {
+            if (g_planBudget <= 0)
+            {
+                p.checked = ~0ull; // looked at again next time
+                ++g_planStats.deferred;
+                return nullptr;
+            }
+            buildPlan(p, header, lod);
+            g_planBudget -= static_cast<int32_t>(p.count) + 16;
+            ++g_planStats.rebuilds;
+            return &p;
+        }
+        const uint64_t evictions = native_renderer::meshEvictions();
+        if (p.meshEpoch != evictions || p.skinEpoch != g_skinnedEpoch)
+        {
+            p.meshEpoch = evictions;
+            p.skinEpoch = g_skinnedEpoch;
+            for (PlanPacket &e : p.pk)
+                e.resolved = false;
+        }
+        return &p;
+    }
+    // Plans no draw used for 10 s go (every 256 frames).
+    void sweepPlans()
+    {
+        planCache97Clear();
+        for (auto it = g_plans.begin(); it != g_plans.end();)
+            if (it->second.used + 600u < g_frame)
+                it = g_plans.erase(it);
+            else
+                ++it;
+    }
+
+
+    void flush2D();
+
+    // zFog (0x10ac0a8, layer 4): after the opaque world (layers 2-3) it
+    // writes a fog amount into the frame's alpha by depth, in N + 1 slices
+    // (globals at 0x118c46c: N, width, margin; 0x118c480: far) from
+    // far - margin - width to far - margin (view depth), and bgDraw then
+    // blends the background buffer (the sky, layer 1) over the scene by it.
+    constexpr uint32_t kZFog = 0x010AC0A8u;
+    PS2Runtime::RecompiledFunction g_zFog = nullptr;
+    native_renderer::Fog g_fog;
+
+    // The bloom chain (0x109e2a0, layer 0x14; it runs in pieces, so it is
+    // seen through gsReg): a mask of what lies beyond GS Z 0x118c094 (0:
+    // only empty pixels, the sky) in colour 0x118c0d0, reduced, blurred with
+    // 12 shifted sprites (weights at 0x118c0f0/100/110), lerped with the last
+    // frame's by 0x118c12c / 128 and added over the frame in colour
+    // 0x118c140 (alpha 0x118c14c). The native renderer does the same with
+    // its own passes; the values are read when the chain ran.
+    bool g_bloomRan = false;
+
+    native_renderer::Bloom bloomParams()
+    {
+        native_renderer::Bloom b;
+        const native_renderer::Tuning &tune = native_renderer::tuning();
+        b.enabled = g_cameraContext != 0 && tune.bloom;
+        b.order = 20;
+        b.threshold = static_cast<float>(word(0x118C094u));
+        b.zA = real(g_cameraContext + 0x4A0u + 10u * 4u);
+        b.zB = real(g_cameraContext + 0x4A0u + 14u * 4u);
+        for (int i = 0; i < 3; ++i)
+            b.maskColor[i] = static_cast<float>(word(0x118C0D0u + i * 4u) & 0xFFu) / 255.0f;
+        for (int i = 0; i < 3; ++i)
+            b.color[i] = static_cast<float>(word(0x118C140u + i * 4u) & 0xFFu) / 128.0f;
+        // The add is Cs x As + Cd, As the composite colour's alpha (the GS
+        // chain: mask in 0x118c0d0, a lerp blur of 12 shifted copies by alpha
+        // 0x40 / 0x20 / 0x10, the temporal lerp, then this add at full
+        // strength; SOTC_BLOOM_SCALE overrides).
+        const float scale = tune.bloomStrength;
+        b.color[3] = static_cast<float>(word(0x118C14Cu) & 0xFFu) / 128.0f * scale;
+        const uint32_t temporal = word(0x118C12Cu) & 0xFFu;
+        b.temporal = temporal ? static_cast<float>(temporal) / 128.0f : 1.0f;
+        if (ps2_stats::bloomLogNow() && g_cameraContext) // SOTC_BLOOM_LOG: the camera context's matrices (round 65e: layer 1's clip)
+            for (uint32_t off : {0x40u, 0x1A0u, 0x220u, 0x260u, 0x4A0u, 0x520u})
+            {
+                std::fprintf(stderr, "[bloom:game] f=%llu camera +0x%x:", (unsigned long long)ps2_stats::vif1Chains.load(std::memory_order_relaxed), off);
+                for (uint32_t i = 0; i < 16u; ++i)
+                    std::fprintf(stderr, " %g", real(g_cameraContext + off + i * 4u));
+                std::fprintf(stderr, "\n");
+            }
+        if (ps2_stats::bloomLogNow()) // SOTC_BLOOM_LOG: what the game set for the chain this frame, raw and as handed on
+            std::fprintf(stderr,
+                         "[bloom:game] f=%llu on=%d threshold=%u zA=%.2f zB=%.1f mask=(%u,%u,%u) blurA=(%u,%u,%u) temporal=%u add=(%u,%u,%u) addA=%u "
+                         "-> mask=(%.3f,%.3f,%.3f) color=(%.3f,%.3f,%.3f) strength=%.3f temporal=%.4f\n",
+                         (unsigned long long)ps2_stats::vif1Chains.load(std::memory_order_relaxed), b.enabled ? 1 : 0, word(0x118C094u), b.zA, b.zB,
+                         word(0x118C0D0u) & 0xFFu, word(0x118C0D4u) & 0xFFu, word(0x118C0D8u) & 0xFFu, word(0x118C0FCu) & 0xFFu, word(0x118C10Cu) & 0xFFu,
+                         word(0x118C11Cu) & 0xFFu, temporal, word(0x118C140u) & 0xFFu, word(0x118C144u) & 0xFFu, word(0x118C148u) & 0xFFu,
+                         word(0x118C14Cu) & 0xFFu, b.maskColor[0], b.maskColor[1], b.maskColor[2], b.color[0], b.color[1], b.color[2], b.color[3],
+                         b.temporal);
+        return b;
+    }
+
+    void zFogHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Round 32: no wait here (SOTC_ZFOG_JOIN=1: as before). The hook's own
+        // part (g_fog) is the game thread's alone; whatever zFog draws comes
+        // through gsReg's 2D path, which keeps the jobs' order itself. With
+        // the textured 2D draws no longer waiting, this was the frame's one
+        // join left before the kick: with a slow worker (the console's) the
+        // game thread waited here for nearly all of the frame's model jobs.
+        // Checked on the Mac route with each job held 150 us
+        // (SOTC_HOOK_WORKER_DELAY_US): no game-thread draw while jobs were
+        // pending (SOTC_HOOK_ORDER_CHECK) and nothing the jobs read changed
+        // under them (SOTC_HOOK_ASYNC_VERIFY).
+        static const bool join = std::getenv("SOTC_ZFOG_JOIN") && std::atoi(std::getenv("SOTC_ZFOG_JOIN")) != 0;
+        if (join)
+            hookJoin(hookjobs::k_zfog);
+        g_ram = rdram;
+        const int32_t slices = static_cast<int32_t>(word(0x118C46Cu));
+        const float width = real(0x118C470u), margin = real(0x118C474u), farDistance = real(0x118C480u);
+        static const bool log = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+        static uint64_t logged = 0;
+        if (log && g_frame >= logged + 300u)
+        {
+            logged = g_frame;
+            std::fprintf(stderr, "[native-fog] frame %llu slices %d width %g margin %g far %g c478 %g c47c %g near %g\n", (unsigned long long)g_frame, slices, width, margin,
+                         farDistance, real(0x118C478u), real(0x118C47Cu), real(0x118C484u));
+        }
+        // The native renderer redoes it as one pass over the picture by depth
+        // (native_renderer::Fog); SOTC_NATIVE_ZFOG=0 leaves it out.
+        const bool zFogOn = native_renderer::tuning().zFog;
+        if (zFogOn && slices > 0 && width > 0.0f)
+        {
+            g_fog.enabled = true;
+            g_fog.width = width;
+            g_fog.start = farDistance - margin - width;
+            g_fog.steps = slices;
+        }
+        // SOTC_SKIP_ZFOG=1 (debugging): the game's own zFog does not run.
+        static const bool skip = std::getenv("SOTC_SKIP_ZFOG") != nullptr;
+        if (!skip)
+            g_zFog(rdram, ctx, runtime);
+    }
+
+    // Round mem99: the hook jobs' room trim (runJob) off in `keep99` A/B windows.
+    bool g_jobTrimOff = false;
+
+    // SOTC_AB_FLAG=<name>[,<name>...] SOTC_AB_PERIOD=<n> (fidelity A/B, round 37):
+    // those tuning switches off in every other window of n frames (from
+    // frame n on), so pictures 30 frames apart of one run compare the
+    // native picture with and without them against the same GS picture.
+    // Names: bloom, vfog, zfog, glow, dof, shadows, sblur, feedback, ptcl,
+    // reflect, refract, subtract, additive, overlays, sky; round 38:
+    // alphatest, bgdepth, bodyshadows.
+    PS2Runtime *g_runtimeForLog = nullptr; // the [audio] line's thread and heap part
+    // Round 59 (screenBlurHook): SOTC_SBLUR_JOIN=0 or an A/B with `sblurlazy`.
+    bool g_sblurLazyJoin = false;
+    // Round 100 (stutter): the round's switches, each with its own A/B name
+    // (its windows turn it off) and `r100all` (all off together).
+    // sblur100: screenBlurHook joins the model jobs only when it records a
+    // blur (round 59's lazy join, now the default; SOTC_SBLUR100=0: the join
+    // at every call). The console's frame logs: 'joins screenblur' in ~11% of
+    // the 3D frames, 5-25 ms each when the hook worker was behind (job lag
+    // 20-35 ms), 8-14% of the time over 1.4x the median in the frames over
+    // it. cameraBlur calls screenBlur near the frame's end whenever the camera
+    // moved and nearly every call is the identity (round 51), which records
+    // nothing: without the join the worker's backlog is joined at the frame
+    // change (syncFrame) as in every frame where the camera stood still, the
+    // guest's work between the two (the rest of graphFrameFinish, the next
+    // frame's start) overlapping it. Same draws in the same order: the
+    // guest screenBlur's own GS writes keep the jobs' order through gsReg's
+    // hooks, and a recorded blur still joins first.
+    bool g_sblur100 = true;
+    bool sblur100Start()
+    {
+        static const bool v = [] { const char *e = std::getenv("SOTC_SBLUR100"); return !e || std::atoi(e) != 0; }();
+        return v;
+    }
+    void abSwitches()
+    {
+        static const char *flags = ps2_diag::env("SOTC_AB_FLAG");
+        if (!flags)
+            return;
+        static const uint64_t period = std::max<uint64_t>(1u, ps2_diag::env("SOTC_AB_PERIOD") ? std::strtoull(ps2_diag::env("SOTC_AB_PERIOD"), nullptr, 10) : 30u);
+        native_renderer::Tuning &t = native_renderer::tuning();
+        static const native_renderer::Tuning start = t;
+        static const std::string list = []
+        {
+            std::string l = std::string(",") + flags + ",";
+            std::replace(l.begin(), l.end(), ':', ','); // ':' separates too (env lists split on commas)
+            return l;
+        }();
+        // SOTC_AB_ROTATE=1 (round 44, one console run for many switches): the
+        // windows take turns, window w turning off only the (w mod (n + 1))-th
+        // listed flag, 0 none (the baseline): "[ab] frame F: <flag> off" /
+        // "all on" at each change, so each flag's cost is its windows
+        // against the baseline's (build/agent-scratch/r44/abrot.py).
+        // Without it all listed flags go off together in odd windows.
+        static const bool rotate = ps2_diag::env("SOTC_AB_ROTATE") && std::atoi(ps2_diag::env("SOTC_AB_ROTATE")) != 0;
+        static const std::vector<std::string> names = []
+        {
+            std::vector<std::string> out;
+            size_t at = 1;
+            while (at < list.size())
+            {
+                const size_t end = list.find(',', at);
+                if (end == std::string::npos)
+                    break;
+                if (end > at)
+                    out.push_back(list.substr(at, end - at));
+                at = end + 1;
+            }
+            return out;
+        }();
+        const uint64_t window = g_frame / period;
+        const size_t slot = rotate ? static_cast<size_t>(window % (names.size() + 1u)) : 0u;
+        const bool odd = window % 2u == 1u;
+        // Round 124: `gfx124preset` (best listed alone, without
+        // SOTC_AB_ROTATE): the Graphics presets in turn, Max, High, Medium,
+        // Low, Off, one a window of SOTC_AB_PERIOD frames, each applied once at
+        // its window's start as the menu applies it (a resolution change waits
+        // for the GPU and makes the picture's targets again: leave a window's
+        // first frames out). "[gfx124ab] frame F: preset P" at each change and
+        // the [gfx124] line after it; build/agent-scratch/r124/gfx124.py splits
+        // a log by preset. Nothing of it is saved (host_menu keeps the file's).
+        static const bool gfxAb = list.find(",gfx124preset,") != std::string::npos;
+        if (gfxAb)
+        {
+            static const int order[5] = {native_renderer::kPresetMax, native_renderer::kPresetHigh, native_renderer::kPresetMedium, native_renderer::kPresetLow,
+                                         native_renderer::kPresetOff};
+            const int preset = order[window % 5u];
+            static int applied = -1;
+            if (preset != applied)
+            {
+                applied = preset;
+                native_renderer::applyPreset(t, preset);
+                std::fprintf(stderr, "[gfx124ab] frame %llu: preset %s (windows of %llu frames)\n", (unsigned long long)g_frame, native_renderer::presetName(preset),
+                             (unsigned long long)period);
+            }
+        }
+        // Round 58: the names' places in the list looked up once, not a
+        // string built and searched for each name every frame (that was ~1.3%
+        // of the game thread in every A/B run: allocations, memmove, TLS).
+        // A name is "off" in odd windows (all together) or in its own
+        // rotating slot (applied every frame, as before).
+        auto indexOf = [&](const std::string &name) -> int
+        {
+            for (size_t i = 0; i < names.size(); ++i)
+                if (names[i] == name)
+                    return static_cast<int>(i);
+            return -1;
+        };
+        auto isOffAt = [&](int at)
+        {
+            if (!rotate)
+                return odd;
+            return slot > 0 && static_cast<int>(slot - 1u) == at;
+        };
+        static size_t lastSlot = ~size_t(0);
+        if (rotate && slot != lastSlot)
+        {
+            lastSlot = slot;
+            std::fprintf(stderr, "[ab] frame %llu: %s%s\n", (unsigned long long)g_frame, slot ? names[slot - 1u].c_str() : "all on", slot ? " off" : "");
+        }
+        struct TuningFlag
+        {
+            const char *name;
+            bool native_renderer::Tuning::*field;
+        };
+        static const TuningFlag kTuningFlags[] = {
+            {"bloom", &native_renderer::Tuning::bloom},
+            {"vfog", &native_renderer::Tuning::vertexFog},
+            {"zfog", &native_renderer::Tuning::zFog},
+            {"glow", &native_renderer::Tuning::glow},
+            {"dof", &native_renderer::Tuning::depthOfField},
+            {"shadows", &native_renderer::Tuning::shadows},
+            {"sblur", &native_renderer::Tuning::screenBlur},
+            {"feedback", &native_renderer::Tuning::feedback},
+            {"ptcl", &native_renderer::Tuning::particles},
+            {"reflect", &native_renderer::Tuning::reflections},
+            {"refract", &native_renderer::Tuning::refraction},
+            {"subtract", &native_renderer::Tuning::subtract},
+            {"additive", &native_renderer::Tuning::additive},
+            {"overlays", &native_renderer::Tuning::overlays},
+            {"sky", &native_renderer::Tuning::skyImage},
+            {"alphatest", &native_renderer::Tuning::alphaTest},
+            {"bgdepth", &native_renderer::Tuning::backgroundDepth},
+            {"bodyshadows", &native_renderer::Tuning::bodyShadows},
+            {"allsides", &native_renderer::Tuning::shadowAllSides},
+            {"lighting", &native_renderer::Tuning::lighting},
+            // Round 45: the console GPU's savings, each switchable to measure it.
+            {"depthkeep", &native_renderer::Tuning::glDepthKeep},
+            {"fewcopies", &native_renderer::Tuning::glFewCopies},
+            {"sblurapart", &native_renderer::Tuning::blurApart}, // round 55
+            {"leandraw", &native_renderer::Tuning::glLeanDraw},  // round 56
+            {"scenes73", &native_renderer::Tuning::glFewScenes}, // round 73
+            {"swizzle73", &native_renderer::Tuning::glSwizzle},  // round 73 (with SOTC_GL_SWIZZLE_BOTH=1)
+            {"plainread73", &native_renderer::Tuning::glPlainReads}, // round 73
+            {"pass74", &native_renderer::Tuning::glLeanPass},        // round 74
+            {"layout74", &native_renderer::Tuning::glKeepLayout},    // round 74
+            {"rprio74", &native_renderer::Tuning::renderPrio},       // round 74 (with SOTC_RENDER_PRIO=1)
+            {"soft75", &native_renderer::Tuning::glSoftCut},         // round 75
+            {"guard75", &native_renderer::Tuning::glFarGuard},       // round 75
+            {"present86", &native_renderer::Tuning::glPresent86},    // round 86
+            {"sort87", &native_renderer::Tuning::glSort87},          // round 87
+            {"vol87", &native_renderer::Tuning::glVol87},            // round 87 (GPU candidate: its windows flip it)
+            {"shmask87", &native_renderer::Tuning::glShmask87},      // round 87 (GPU candidate: its windows flip it)
+            {"inflight87", &native_renderer::Tuning::glInflight87},  // round 87 (GPU candidate: its windows flip it)
+            {"inflight100", &native_renderer::Tuning::glInflight100}, // round 100 (r100all too)
+            {"cdahead100", &native_renderer::Tuning::cdAhead100},     // round 100 (r100all too)
+            {"prio100", &native_renderer::Tuning::prio100},           // round 100 (r100all too)
+            {"fat116", &native_renderer::Tuning::glFat116},           // round 116
+            {"bgsmall87", &native_renderer::Tuning::glBgSmall87},    // round 87 (GPU candidate: its windows flip it)
+            {"opaque88", &native_renderer::Tuning::glOpaque88},      // round 88 (GPU candidate: its windows flip it)
+            {"mirror88", &native_renderer::Tuning::glMirror88},      // round 88 (GPU candidate: its windows flip it)
+            {"diag92px", &native_renderer::Tuning::glDiag92Px},      // round 92 (GPU diagnostic, picture wrong: its windows flip it)
+            {"diag92tex", &native_renderer::Tuning::glDiag92Tex},    // round 92 (GPU diagnostic, picture wrong: its windows flip it)
+            {"diag92half", &native_renderer::Tuning::glDiag92Half},  // round 92 (GPU diagnostic, picture wrong: its windows flip it)
+            {"noscreen92", &native_renderer::Tuning::glNoScreen92},  // round 92 (r92all too)
+            {"mirror93", &native_renderer::Tuning::glMirror93},      // round 93 (r93all too)
+            {"atop93", &native_renderer::Tuning::glAtOpaque93},      // round 93 (r93all too)
+            {"post93", &native_renderer::Tuning::glPost93},          // round 93 (r93all too)
+            {"blur93", &native_renderer::Tuning::glBlur93},          // round 93 (candidate, not the same picture: its windows flip it)
+            {"glow93", &native_renderer::Tuning::glGlow93},          // round 93 (candidate, not the same picture: its windows flip it)
+            {"bgcopy94", &native_renderer::Tuning::glBgCopy94},      // round 94 (its windows flip it; r94all too)
+            {"glow94", &native_renderer::Tuning::glGlow94},          // round 94 (its windows flip it; r94all too)
+            {"fx94", &native_renderer::Tuning::glFx94},              // round 94 (its windows flip it; r94all too)
+            {"bloom94", &native_renderer::Tuning::glBloom94},        // round 94 (its windows flip it; r94all too)
+            {"diag98", &native_renderer::Tuning::glDiag98},          // round 98 (GPU diagnostic, picture wrong: its windows flip it)
+            {"at98", &native_renderer::Tuning::glAt98},              // round 98 (r98all too)
+            {"untex98", &native_renderer::Tuning::glUntex98},        // round 98 (r98all too)
+            {"glow98", &native_renderer::Tuning::glGlow98},          // round 98 (r98all too)
+            {"nofog98", &native_renderer::Tuning::glNoFog98},        // round 98 (r98all too)
+            {"lod0_98", &native_renderer::Tuning::glLod0_98},        // round 98 (r98all too)
+            {"psoft98", &native_renderer::Tuning::glPlainSoft98},    // round 98 (r98all too)
+            {"volprog", &native_renderer::Tuning::glVolumeProgram},
+            {"atmerge", &native_renderer::Tuning::alphaTestMerge},
+            {"shadowidx", &native_renderer::Tuning::shadowIndexed},
+            // Round 65: the Quality menu's cuts (on at start through their
+            // variables, "<name> off" windows without the cut); `sacall`
+            // below turns all four off together.
+            {"saccam", &native_renderer::Tuning::sacCamColl},
+            {"sacchara", &native_renderer::Tuning::sacFarChara},
+            {"sacfx", &native_renderer::Tuning::sacFxHalf},
+            {"sacdraw", &native_renderer::Tuning::sacDrawDist},
+        };
+        constexpr size_t kTuningCount = sizeof(kTuningFlags) / sizeof(kTuningFlags[0]);
+        static int tuningAt[kTuningCount];
+        // The decomp rounds' subsystem switches (sotc_decomp.h's table).
+        static const char *const switchNames[sotc_decomp::kSwitchCount] = {"camcoll", "collprobe", "motion", "leaves", "hotlist", "hotlist44", "hotlist46", "hotlist47", "scriptvm", "isys", "hotlist48", "fastnative", "fastnative2", "fastnative3", "ptcl62", "coll63", "tex64", "walk67", "pref69", "coll71", "charlod78", "ptcl79", "seg80", "pose82", "walk83", "ptcl83", "probe84", "find84", "ground85", "ptcl89", "ptcl91", "join95", "draw95", "early95", "obj96", "sel96", "sel97", "links97", "path97", "plan97", "walk101", "skin101", "leaf101", "obj101", "sw102", "ptcl103", "solid103", "grp106", "oan106", "ai106", "coll115", "pkt117", "glv117", "draw117", "leaf117", "sym120", "heap120", "flush119", "walk119", "part119", "view119", "ptcl123", "blend123", "seg123", "gaze122", "cloth122", "quat122", "keys122", "fin125", "obj125", "scroll127", "geo126", "ctl126", "imm128", "texr128", "pf134", "clip134"};
+        static int switchAt[sotc_decomp::kSwitchCount];
+        static bool switchStart[sotc_decomp::kSwitchCount];
+        static int layerAt[32];
+        static int xferAt = -1, sblurLazyAt = -1, dmaAsyncAt = -1, mdsLaneAt = -1, lazySnapAt = -1, sacAllAt = -1, laneHelpAt = -1, r74AllAt = -1, log76At = -1, r79AllAt = -1, r80AllAt = -1, r82AllAt = -1, r83AllAt = -1, r84AllAt = -1, r85AllAt = -1, r86AllAt = -1, r87AllAt = -1, r89AllAt = -1, newDirAt = -1, aud90vAt = -1, aud90cAt = -1, r90AllAt = -1, chunk90At = -1, flush90At = -1, r91AllAt = -1, r92AllAt = -1, r93AllAt = -1, r94AllAt = -1, r94OnAt = -1, r95AllAt = -1, r96AllAt = -1, r98AllAt = -1, keep99At = -1, r97AllAt = -1, sblur100At = -1, r100AllAt = -1, r101AllAt = -1, fmt102At = -1, r102AllAt = -1, r103AllAt = -1, char104At = -1, r104AllAt = -1, r106AllAt = -1, r120AllAt = -1, r117AllAt = -1;
+        static int r119AllAt = -1; // round 119
+        static int r123AllAt = -1; // round 123
+        static int r122AllAt = -1; // round 122
+        static int r125AllAt = -1; // round 125
+        static int r127AllAt = -1; // round 127
+        static int r126AllAt = -1; // round 126
+        static int r128AllAt = -1; // round 128
+        static int sacMaxAt = -1, sacPtclAt = -1, sacLodAt = -1; // round 77
+        static const bool placesRead = [&]
+        {
+            for (size_t i = 0; i < kTuningCount; ++i)
+                tuningAt[i] = indexOf(kTuningFlags[i].name);
+            for (int i = 0; i < sotc_decomp::kSwitchCount; ++i)
+            {
+                switchStart[i] = sotc_decomp::switchOn(i);
+                switchAt[i] = indexOf(switchNames[i]);
+            }
+            for (uint32_t layer = 0; layer < 32u; ++layer) // L<n>: display list layer n hidden
+                layerAt[layer] = indexOf("L" + std::to_string(layer));
+            xferAt = indexOf("xferreturn");
+            sblurLazyAt = indexOf("sblurlazy");
+            dmaAsyncAt = indexOf("dmaasync");
+            mdsLaneAt = indexOf("mdslane");
+            laneHelpAt = indexOf("lanehelp");
+            lazySnapAt = indexOf("lazysnap");
+            sacAllAt = indexOf("sacall");
+            r74AllAt = indexOf("r74all");
+            r79AllAt = indexOf("r79all");
+            r80AllAt = indexOf("r80all");
+            r82AllAt = indexOf("r82all");
+            r83AllAt = indexOf("r83all");
+            r84AllAt = indexOf("r84all");
+            r85AllAt = indexOf("r85all");
+            r86AllAt = indexOf("r86all");
+            r87AllAt = indexOf("r87all");
+            r89AllAt = indexOf("r89all");
+            aud90vAt = indexOf("aud90v"); // round 90: the mixer's paths (ps2x::iop::audio_stats::mix90*)
+            aud90cAt = indexOf("aud90c");
+            r90AllAt = indexOf("r90all");
+            chunk90At = indexOf("chunk90");
+            flush90At = indexOf("revflush90");
+            r92AllAt = indexOf("r92all"); // round 92: the round's GPU fixes (noscreen92) off together
+            r93AllAt = indexOf("r93all"); // round 93: the round's exact GPU savings (mirror93, atop93, post93) off together
+            r94AllAt = indexOf("r94all"); // round 94: the round's scene savings (bgcopy94, glow94, fx94, bloom94) off together
+            r94OnAt = indexOf("r94on");   // round 94: the same four ON together (they ship off)
+            newDirAt = indexOf("newdir");
+            r91AllAt = indexOf("r91all"); // round 91: the guest worker's job (ptcl91)
+            r95AllAt = indexOf("r95all"); // round 95: the round's switches (join95, ...) off together
+            r96AllAt = indexOf("r96all"); // round 96: the round's game-thread cuts (obj96, ...) off together
+            r97AllAt = indexOf("r97all"); // round 97: the round's game-thread cuts off together
+            r101AllAt = indexOf("r101all"); // round 101: the collision rewrites off together
+            r103AllAt = indexOf("r103all"); // round 103: the display path's PS2-only layers back on together
+            r106AllAt = indexOf("r106all"); // round 106: the scripts' subsystems' A9 rewrites off together
+            r117AllAt = indexOf("r117all"); // round 117: the particle frame's rewrites off together
+            r120AllAt = indexOf("r120all"); // round 120: the symbol resolution and the heap allocator natives off together
+            r119AllAt = indexOf("r119all"); // round 119: the collision slices 2-3 off together
+            r125AllAt = indexOf("r125all"); // round 125: the native collision object system's switches off together
+            r127AllAt = indexOf("r127all"); // round 127: the display path's switches off together
+            r128AllAt = indexOf("r128all"); // round 128: the immediate quads / texreset switches off together
+            r123AllAt = indexOf("r123all"); // round 123: the particle step / blend in host floats and the validated segment memo off together
+            r122AllAt = indexOf("r122all"); // round 122: the characters' host rewrites off together
+            r126AllAt = indexOf("r126all"); // round 126: the camera / control rewrites off together
+            r98AllAt = indexOf("r98all"); // round 98: the round's GPU switches (at98, ...) off together
+            log76At = indexOf("log76");
+            keep99At = indexOf("keep99"); // round mem99: the hook jobs' room trim
+            sblur100At = indexOf("sblur100"); // round 100: screenBlurHook's join only for a recorded blur
+            r100AllAt = indexOf("r100all");   // round 100: the round's switches off together
+            fmt102At = indexOf("fmt102");     // round 102: the game's vsprintf fast path
+            r102AllAt = indexOf("r102all");   // round 102: the round's switches (sw102, fmt102) off together
+            char104At = indexOf("char104");   // round 104: the characters' geometry on the guest worker
+            r104AllAt = indexOf("r104all");   // round 104: the round's switches off together
+            sacMaxAt = indexOf("sacmax");
+            sacPtclAt = indexOf("sacptcl");
+            sacLodAt = indexOf("saclod");
+            return true;
+        }();
+        (void)placesRead;
+        for (int i = 0; i < sotc_decomp::kSwitchCount; ++i)
+            if (switchAt[i] >= 0)
+                sotc_decomp::setSwitch(i, isOffAt(switchAt[i]) ? false : switchStart[i]);
+        if (r79AllAt >= 0) // round 79: the round's switches off together
+            for (int i : {static_cast<int>(sotc_decomp::kPtcl79)})
+                if (isOffAt(r79AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r79AllAt) ? false : switchStart[i]);
+        // Round 80: `r80all` the round's switches off together; `newdir` every
+        // switch of the port's new direction (rounds 78-80: charlod78, ptcl79
+        // and round 80's) off together.
+        {
+            // Round 82: `r82all` the round's switches (pose82) off together;
+            // `newdir` takes them in too.
+            static const int r80Switches[] = {static_cast<int>(sotc_decomp::kSeg80)};
+            // Round 83: `r83all` (walk83, ptcl83) likewise, in `newdir` too.
+            static const int r82Switches[] = {static_cast<int>(sotc_decomp::kPose82)};
+            static const int r83Switches[] = {static_cast<int>(sotc_decomp::kWalk83), static_cast<int>(sotc_decomp::kPtcl83)};
+            // Round 84: `r84all` (probe84) likewise, in `newdir` too.
+            static const int r84Switches[] = {static_cast<int>(sotc_decomp::kProbe84)};
+            // Round 85: `r85all` (ground85) likewise, in `newdir` too.
+            static const int r85Switches[] = {static_cast<int>(sotc_decomp::kGround85)};
+            // Round 89: `r89all` (ptcl89, and ptcl83, on by default since round 89) likewise, in `newdir` too.
+            static const int r89Switches[] = {static_cast<int>(sotc_decomp::kPtcl89), static_cast<int>(sotc_decomp::kPtcl83)};
+            static const int newDirSwitches[] = {static_cast<int>(sotc_decomp::kCharLod78), static_cast<int>(sotc_decomp::kPtcl79), static_cast<int>(sotc_decomp::kSeg80),
+                                                 static_cast<int>(sotc_decomp::kPose82), static_cast<int>(sotc_decomp::kWalk83), static_cast<int>(sotc_decomp::kPtcl83),
+                                                 static_cast<int>(sotc_decomp::kProbe84), static_cast<int>(sotc_decomp::kGround85), static_cast<int>(sotc_decomp::kPtcl89),
+                                                 static_cast<int>(sotc_decomp::kPtcl83)};
+            if (r80AllAt >= 0 || r82AllAt >= 0 || r83AllAt >= 0 || r84AllAt >= 0 || r85AllAt >= 0 || r89AllAt >= 0 || newDirAt >= 0)
+                for (int i : newDirSwitches)
+                {
+                    const bool groupOff = (newDirAt >= 0 && isOffAt(newDirAt)) ||
+                                          (r80AllAt >= 0 && isOffAt(r80AllAt) && std::find(std::begin(r80Switches), std::end(r80Switches), i) != std::end(r80Switches)) ||
+                                          (r82AllAt >= 0 && isOffAt(r82AllAt) && std::find(std::begin(r82Switches), std::end(r82Switches), i) != std::end(r82Switches)) ||
+                                          (r83AllAt >= 0 && isOffAt(r83AllAt) && std::find(std::begin(r83Switches), std::end(r83Switches), i) != std::end(r83Switches)) ||
+                                          (r84AllAt >= 0 && isOffAt(r84AllAt) && std::find(std::begin(r84Switches), std::end(r84Switches), i) != std::end(r84Switches)) ||
+                                          (r85AllAt >= 0 && isOffAt(r85AllAt) && std::find(std::begin(r85Switches), std::end(r85Switches), i) != std::end(r85Switches)) ||
+                                          (r89AllAt >= 0 && isOffAt(r89AllAt) && std::find(std::begin(r89Switches), std::end(r89Switches), i) != std::end(r89Switches)) ||
+                                          (i == static_cast<int>(sotc_decomp::kPtcl79) && r79AllAt >= 0 && isOffAt(r79AllAt));
+                    if (groupOff)
+                        sotc_decomp::setSwitch(i, false);
+                    else if (switchAt[i] < 0)
+                        sotc_decomp::setSwitch(i, switchStart[i]);
+                }
+        }
+        // Round 91: `r91all` the round's switch (ptcl91) off in its windows.
+        if (r91AllAt >= 0)
+            sotc_decomp::setSwitch(sotc_decomp::kPtcl91, isOffAt(r91AllAt) ? false : switchStart[sotc_decomp::kPtcl91]);
+        // Round 95: `r95all` the round's switches off in its windows.
+        if (r95AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kJoin95), static_cast<int>(sotc_decomp::kDraw95), static_cast<int>(sotc_decomp::kEarly95)})
+                if (isOffAt(r95AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r95AllAt) ? false : switchStart[i]);
+        // Round 96: `r96all` the round's switches off in its windows.
+        if (r96AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kObj96), static_cast<int>(sotc_decomp::kSel96)})
+                if (isOffAt(r96AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r96AllAt) ? false : switchStart[i]);
+        // Round 97: `r97all` the round's switches off in its windows.
+        if (r97AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kSel97), static_cast<int>(sotc_decomp::kPlan97), static_cast<int>(sotc_decomp::kPath97), static_cast<int>(sotc_decomp::kLinks97)})
+                if (isOffAt(r97AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r97AllAt) ? false : switchStart[i]);
+        // Round 101: `r101all` the round's collision rewrites off in its windows.
+        if (r101AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kWalk101), static_cast<int>(sotc_decomp::kSkin101), static_cast<int>(sotc_decomp::kLeaf101), static_cast<int>(sotc_decomp::kObj101)})
+                if (isOffAt(r101AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r101AllAt) ? false : switchStart[i]);
+        // Round 103: `r103all` the round's switches off in its windows.
+        if (r103AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kPtcl103), static_cast<int>(sotc_decomp::kSolid103)})
+                if (isOffAt(r103AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r103AllAt) ? false : switchStart[i]);
+        // Round 119: `r119all` the round's switches (flush119, walk119, part119, view119) off in its windows.
+        if (r119AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kFlush119), static_cast<int>(sotc_decomp::kWalk119), static_cast<int>(sotc_decomp::kPart119), static_cast<int>(sotc_decomp::kView119)})
+                if (isOffAt(r119AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r119AllAt) ? false : switchStart[i]);
+        // Round 123: `r123all` the round's switches (ptcl123, blend123, seg123) off in its windows.
+        if (r123AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kPtcl123), static_cast<int>(sotc_decomp::kBlend123), static_cast<int>(sotc_decomp::kSeg123)})
+                if (isOffAt(r123AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r123AllAt) ? false : switchStart[i]);
+        // Round 122: `r122all` the round's switches (gaze122, cloth122, quat122, keys122) off in its windows.
+        if (r122AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kGaze122), static_cast<int>(sotc_decomp::kCloth122), static_cast<int>(sotc_decomp::kQuat122),
+                          static_cast<int>(sotc_decomp::kKeys122)})
+                if (isOffAt(r122AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r122AllAt) ? false : switchStart[i]);
+        // Round 125: `r125all` the round's switches (fin125, obj125) off in its windows.
+        if (r125AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kFin125), static_cast<int>(sotc_decomp::kObj125)})
+                if (isOffAt(r125AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r125AllAt) ? false : switchStart[i]);
+        // Round 127: `r127all` the round's switches (scroll127) off in its windows.
+        if (r127AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kScroll127)})
+                if (isOffAt(r127AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r127AllAt) ? false : switchStart[i]);
+        // Round 126: `r126all` the round's switches (geo126, ctl126) off in its windows.
+        if (r126AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kGeo126), static_cast<int>(sotc_decomp::kCtl126)})
+                if (isOffAt(r126AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r126AllAt) ? false : switchStart[i]);
+        // Round 128: `r128all` the round's switches (imm128, texr128) off in its windows.
+        if (r128AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kImm128), static_cast<int>(sotc_decomp::kTexr128)})
+                if (isOffAt(r128AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r128AllAt) ? false : switchStart[i]);
+        // Round 106: `r106all` the round's switches (grp106, oan106, ai106) off in its windows.
+        if (r106AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kGrp106), static_cast<int>(sotc_decomp::kOan106), static_cast<int>(sotc_decomp::kAi106)})
+                if (isOffAt(r106AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r106AllAt) ? false : switchStart[i]);
+        // Round 117: `r117all` the round's switches (pkt117, glv117, draw117, leaf117) off in its windows.
+        if (r117AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kPkt117), static_cast<int>(sotc_decomp::kGlv117), static_cast<int>(sotc_decomp::kDraw117),
+                          static_cast<int>(sotc_decomp::kLeaf117)})
+                if (isOffAt(r117AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r117AllAt) ? false : switchStart[i]);
+        // Round 120: `r120all` the round's switches (sym120, heap120) off in its windows.
+        if (r120AllAt >= 0)
+            for (int i : {static_cast<int>(sotc_decomp::kSym120), static_cast<int>(sotc_decomp::kHeap120)})
+                if (isOffAt(r120AllAt) || switchAt[i] < 0)
+                    sotc_decomp::setSwitch(i, isOffAt(r120AllAt) ? false : switchStart[i]);
+        // Round 90: the sound mixer's voice / core paths (`aud90v`, `aud90c`,
+        // `r90all` both); exact, so only the audio thread's time changes.
+        if (aud90vAt >= 0 || aud90cAt >= 0 || r90AllAt >= 0)
+        {
+            namespace as = ps2x::iop::audio_stats;
+            static const bool voiceStart = as::mix90Voice(), coreStart = as::mix90Core();
+            const bool all = r90AllAt >= 0 && isOffAt(r90AllAt);
+            as::setMix90Voice((all || (aud90vAt >= 0 && isOffAt(aud90vAt))) ? false : voiceStart);
+            as::setMix90Core((all || (aud90cAt >= 0 && isOffAt(aud90cAt))) ? false : coreStart);
+        }
+        if (flush90At >= 0 || r90AllAt >= 0) // round 90: the reverb's residue clear (`revflush90`)
+        {
+            namespace as = ps2x::iop::audio_stats;
+            static const bool flushStart = as::mix90Flush();
+            const bool off = (flush90At >= 0 && isOffAt(flush90At)) || (r90AllAt >= 0 && isOffAt(r90AllAt));
+            as::setMix90Flush(off ? false : flushStart);
+        }
+        if (chunk90At >= 0 || r90AllAt >= 0) // round 90: the mix piece, 16 frames in its windows
+        {
+            namespace as = ps2x::iop::audio_stats;
+            static const int chunkStart = as::mix90Chunk();
+            const bool off = (chunk90At >= 0 && isOffAt(chunk90At)) || (r90AllAt >= 0 && isOffAt(r90AllAt));
+            as::setMix90Chunk(off ? 16 : chunkStart);
+        }
+        // Round 52: the thread switch by returning (PS2X_XFER_RETURN).
+        if (g_runtimeForLog && xferAt >= 0)
+        {
+            static const bool xferStart = g_runtimeForLog->eeScheduler().xferReturn();
+            g_runtimeForLog->eeScheduler().setXferReturn(isOffAt(xferAt) ? false : xferStart);
+        }
+        if (sblurLazyAt >= 0) // round 59
+            g_sblurLazyJoin = !isOffAt(sblurLazyAt);
+        if (g_runtimeForLog && lazySnapAt >= 0) // round 62: the kernel snapshot only when asked
+        {
+            static const bool periodicStart = g_runtimeForLog->eeScheduler().snapshotPeriodic();
+            g_runtimeForLog->eeScheduler().setSnapshotPeriodic(isOffAt(lazySnapAt) ? true : periodicStart);
+        }
+        if (mdsLaneAt >= 0) // round 61: modelDispState on its lane (applied at the next frame's start)
+        {
+            static const bool laneStart = [] { return !std::getenv("SOTC_MDS_LANE") || std::atoi(std::getenv("SOTC_MDS_LANE")) != 0; }();
+            mdslane::g_switch = isOffAt(mdsLaneAt) ? false : laneStart;
+        }
+        if (keep99At >= 0) // round mem99
+            g_jobTrimOff = isOffAt(keep99At);
+        if (sblur100At >= 0 || r100AllAt >= 0) // round 100
+            g_sblur100 = !((sblur100At >= 0 && isOffAt(sblur100At)) || (r100AllAt >= 0 && isOffAt(r100AllAt)));
+        // Round 102: `sw102` (the switch table) and `fmt102` each off in their
+        // windows, `r102all` both.
+        if (fmt102At >= 0 || r102AllAt >= 0)
+        {
+            static const bool fmtStart = ps2_fast_paths::fmt102On();
+            const bool off = (fmt102At >= 0 && isOffAt(fmt102At)) || (r102AllAt >= 0 && isOffAt(r102AllAt));
+            ps2_fast_paths::g_fmt102 = off ? 0 : (fmtStart ? 1 : 0);
+        }
+        if (r102AllAt >= 0)
+            if (isOffAt(r102AllAt) || switchAt[sotc_decomp::kSw102] < 0)
+                sotc_decomp::setSwitch(sotc_decomp::kSw102, isOffAt(r102AllAt) ? false : switchStart[sotc_decomp::kSw102]);
+        if (char104At >= 0 || r104AllAt >= 0) // round 104
+            char104::setAb(!((char104At >= 0 && isOffAt(char104At)) || (r104AllAt >= 0 && isOffAt(r104AllAt))));
+        {
+            // Round 108: `nat108` (the worker's natives), `snap108` (the group walks' snapshot), `anime108` (the anime
+            // tables at the batch's end) each off in their windows, `r108all` the three.
+            static const int at108[4] = {indexOf("r108all"), indexOf("nat108"), indexOf("snap108"), indexOf("anime108")};
+            if (at108[0] >= 0 || at108[1] >= 0 || at108[2] >= 0 || at108[3] >= 0)
+            {
+                const bool all = at108[0] >= 0 && isOffAt(at108[0]);
+                const auto on = [&](int k) { return !(all || (at108[k] >= 0 && isOffAt(at108[k]))); };
+                char104::setAb108(on(1), on(2), on(3));
+            }
+        }
+        {
+            // Round 109: `anime109` (the anime tables beside the game thread), `open109` (the worker's open queue),
+            // `obj109` (the collision / parent gates by object) each off in their windows, `r109all` the three.
+            static const int at109[4] = {indexOf("r109all"), indexOf("anime109"), indexOf("open109"), indexOf("obj109")};
+            if (at109[0] >= 0 || at109[1] >= 0 || at109[2] >= 0 || at109[3] >= 0)
+            {
+                const bool all = at109[0] >= 0 && isOffAt(at109[0]);
+                const auto on = [&](int k) { return !(all || (at109[k] >= 0 && isOffAt(at109[k]))); };
+                char104::setAb109(on(1), on(2), on(3));
+            }
+        }
+#if defined(__vita__)
+        {
+            // Round 110: `pace110` (the per-picture display timing) off in its windows.
+            static const int at110 = indexOf("pace110");
+            if (at110 >= 0)
+                ps2x_vita_pace_ab(isOffAt(at110) ? 0 : 1);
+        }
+        {
+            // Round 132: `pace132` (the display's slot pulled when it holds the game) off in its windows.
+            static const int at132 = indexOf("pace132");
+            if (at132 >= 0)
+                ps2x_vita_pace132_ab(isOffAt(at132) ? 0 : 1);
+        }
+#endif
+        {
+            // Round 111: `hold111` (characters read by another object kept on the game thread), `delta111` (the areas
+            // handed over as a delta) each off in their windows, `r111all` the two.
+            static const int at111[3] = {indexOf("r111all"), indexOf("hold111"), indexOf("delta111")};
+            if (at111[0] >= 0 || at111[1] >= 0 || at111[2] >= 0)
+            {
+                const bool all = at111[0] >= 0 && isOffAt(at111[0]);
+                char104::setAb111(!(all || (at111[1] >= 0 && isOffAt(at111[1]))), !(all || (at111[2] >= 0 && isOffAt(at111[2]))));
+            }
+        }
+        {
+            // Round 114: `gain114` (characters whose hand-overs gained nothing kept on the game thread), `net114` (the jobs
+            // paused in scenes where their own account is negative) each off in their windows.
+            static const int at114[2] = {indexOf("gain114"), indexOf("net114")};
+            if (at114[0] >= 0 || at114[1] >= 0)
+                char104::setAb114(!(at114[0] >= 0 && isOffAt(at114[0])), !(at114[1] >= 0 && isOffAt(at114[1])));
+        }
+        if (log76At >= 0) // round 76: the frame log's lines formatted on its own thread
+            log76::g_switch = !isOffAt(log76At);
+        // Round 105: `worker105`, `build105`, `log105`, `render105` each off
+        // in their windows, `r105all` the four together.
+        {
+            static const int at105[5] = {indexOf("r105all"), indexOf("worker105"), indexOf("build105"), indexOf("log105"), indexOf("render105")};
+            if (at105[0] >= 0 || at105[1] >= 0 || at105[2] >= 0 || at105[3] >= 0 || at105[4] >= 0)
+            {
+                static const bool start[4] = {envOn105("SOTC_WORKER105"), envOn105("SOTC_BUILD105"), envOn105("SOTC_LOG105"), envOn105("SOTC_RENDER105")};
+                const bool all = at105[0] >= 0 && isOffAt(at105[0]);
+                const auto offAt = [&](int k) { return all || (at105[k] >= 0 && isOffAt(at105[k])); };
+                g_worker105 = !offAt(1) && start[0];
+                native_renderer::g_build105 = !offAt(2) && start[1];
+                native_renderer::g_log105 = !offAt(3) && start[2];
+                native_renderer::g_render105 = !offAt(4) && start[3];
+            }
+        }
+        if (laneHelpAt >= 0) // round 72: the lane's jobs run by the joins / the worker
+        {
+            static const int helpStart = [] { return std::getenv("SOTC_LANE_HELP") ? std::atoi(std::getenv("SOTC_LANE_HELP")) & 3 : 3; }();
+            mdslane::g_help.store(isOffAt(laneHelpAt) ? 0 : helpStart, std::memory_order_relaxed);
+        }
+        if (dmaAsyncAt >= 0) // round 60: the display list's walk on the DMA worker
+        {
+            static const bool dmaAsyncStart = ps2_fast_paths::g_dmaAsync;
+            ps2_fast_paths::g_dmaAsync = isOffAt(dmaAsyncAt) ? false : dmaAsyncStart;
+        }
+        for (size_t i = 0; i < kTuningCount; ++i)
+            if (tuningAt[i] >= 0)
+                t.*(kTuningFlags[i].field) = isOffAt(tuningAt[i]) ? false : start.*(kTuningFlags[i].field);
+        if (r74AllAt >= 0) // round 74: the round's render-thread savings off together
+        {
+            const bool off = isOffAt(r74AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "pass74") || !std::strcmp(kTuningFlags[i].name, "layout74")) && (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        // Round 86: `r86all` the round's switches (present86) off together;
+        // `newdir` takes them in too.
+        if (r86AllAt >= 0 || newDirAt >= 0)
+        {
+            const bool off = (r86AllAt >= 0 && isOffAt(r86AllAt)) || (newDirAt >= 0 && isOffAt(newDirAt));
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if (!std::strcmp(kTuningFlags[i].name, "present86") && (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        // Round 87: the GPU candidates ship off; their windows flip them (on
+        // in the window when off at the start, the console's A/B measures them
+        // without extra env lines). `r87all` turns the round's switches off
+        // together (sort87, and the candidates); `newdir` takes sort87 in.
+        // Round 88: bgsmall87 and vol87 now start on (the Vita): their
+        // windows turn them off. opaque88 / mirror88 (round 88's GPU
+        // candidates) start off and their windows turn them on, likewise.
+        for (size_t i = 0; i < kTuningCount; ++i)
+            if (tuningAt[i] >= 0 && (!std::strcmp(kTuningFlags[i].name, "vol87") || !std::strcmp(kTuningFlags[i].name, "shmask87") ||
+                                     !std::strcmp(kTuningFlags[i].name, "inflight87") || !std::strcmp(kTuningFlags[i].name, "bgsmall87") ||
+                                     !std::strcmp(kTuningFlags[i].name, "opaque88") || !std::strcmp(kTuningFlags[i].name, "mirror88") ||
+                                     !std::strncmp(kTuningFlags[i].name, "diag92", 6) || !std::strcmp(kTuningFlags[i].name, "blur93") ||
+                                     !std::strcmp(kTuningFlags[i].name, "glow93") || !std::strcmp(kTuningFlags[i].name, "bgcopy94") ||
+                                     !std::strcmp(kTuningFlags[i].name, "glow94") || !std::strcmp(kTuningFlags[i].name, "fx94") ||
+                                     !std::strcmp(kTuningFlags[i].name, "bloom94") || !std::strcmp(kTuningFlags[i].name, "diag98")))
+                t.*(kTuningFlags[i].field) = isOffAt(tuningAt[i]) ? !(start.*(kTuningFlags[i].field)) : start.*(kTuningFlags[i].field);
+        if (r92AllAt >= 0) // round 92: the round's GPU fixes off together
+        {
+            const bool off = isOffAt(r92AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if (!std::strcmp(kTuningFlags[i].name, "noscreen92") && (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        if (r93AllAt >= 0) // round 93: the round's exact GPU savings off together
+        {
+            const bool off = isOffAt(r93AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "mirror93") || !std::strcmp(kTuningFlags[i].name, "atop93") || !std::strcmp(kTuningFlags[i].name, "post93")) &&
+                    (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        if (r94OnAt >= 0) // round 94: the round's four switches on together in its window (outside it: their start, or their own window's)
+        {
+            const bool on = isOffAt(r94OnAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "bgcopy94") || !std::strcmp(kTuningFlags[i].name, "glow94") || !std::strcmp(kTuningFlags[i].name, "fx94") ||
+                     !std::strcmp(kTuningFlags[i].name, "bloom94")) &&
+                    (on || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = on ? true : start.*(kTuningFlags[i].field);
+        }
+        if (r94AllAt >= 0) // round 94: the round's scene savings off together
+        {
+            const bool off = isOffAt(r94AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "bgcopy94") || !std::strcmp(kTuningFlags[i].name, "glow94") || !std::strcmp(kTuningFlags[i].name, "fx94") ||
+                     !std::strcmp(kTuningFlags[i].name, "bloom94")) &&
+                    (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        if (r98AllAt >= 0) // round 98: the round's GPU switches off together
+        {
+            const bool off = isOffAt(r98AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "at98") || !std::strcmp(kTuningFlags[i].name, "untex98") || !std::strcmp(kTuningFlags[i].name, "glow98") ||
+                     !std::strcmp(kTuningFlags[i].name, "nofog98") || !std::strcmp(kTuningFlags[i].name, "lod0_98") || !std::strcmp(kTuningFlags[i].name, "psoft98") ||
+                     !std::strcmp(kTuningFlags[i].name, "plainread73")) &&
+                    (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        if (r100AllAt >= 0) // round 100: the round's switches off together
+        {
+            const bool off = isOffAt(r100AllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if ((!std::strcmp(kTuningFlags[i].name, "inflight100") || !std::strcmp(kTuningFlags[i].name, "cdahead100") || !std::strcmp(kTuningFlags[i].name, "prio100")) &&
+                    (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        if (r87AllAt >= 0 || newDirAt >= 0)
+        {
+            const bool r87Off = r87AllAt >= 0 && isOffAt(r87AllAt), dirOff = newDirAt >= 0 && isOffAt(newDirAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+            {
+                const bool sort = !std::strcmp(kTuningFlags[i].name, "sort87");
+                const bool gpu = !std::strcmp(kTuningFlags[i].name, "vol87") || !std::strcmp(kTuningFlags[i].name, "shmask87") ||
+                                 !std::strcmp(kTuningFlags[i].name, "inflight87") || !std::strcmp(kTuningFlags[i].name, "bgsmall87");
+                if (!sort && !gpu)
+                    continue;
+                const bool off = r87Off || (sort && dirOff);
+                if (off)
+                    t.*(kTuningFlags[i].field) = false;
+                else if (tuningAt[i] < 0)
+                    t.*(kTuningFlags[i].field) = start.*(kTuningFlags[i].field);
+            }
+        }
+        if (sacAllAt >= 0) // round 65: every cut off together
+        {
+            const bool off = isOffAt(sacAllAt);
+            for (size_t i = 0; i < kTuningCount; ++i)
+                if (!std::strncmp(kTuningFlags[i].name, "sac", 3) && (off || tuningAt[i] < 0))
+                    t.*(kTuningFlags[i].field) = off ? false : start.*(kTuningFlags[i].field);
+        }
+        // Round 77: the opt-in cuts switched at run time, independent of the
+        // saved settings and of the start. With `sacmax` listed every cut
+        // (the four of SOTC_SAC_MAX and round 36's particles / detail) is on
+        // outside its windows and off in them; `saccam` / `sacchara` /
+        // `sacfx` / `sacdraw` / `sacptcl` / `saclod` (and `sacall`) then turn
+        // their own cut off in theirs, the rest on. Without `sacmax`,
+        // `sacptcl` / `saclod` are off in their windows against the start
+        // value, as the four's names are. Every site is safe to flip between
+        // frames: the camera memo and the far characters' pose replay only
+        // the frame just before (recorded only with the cut on), the effects'
+        // carried times go to the next stepping call either way, the detail
+        // and particle caps are read each call. Nothing here is saved
+        // (host_menu's save keeps the file's sac_* values under an A/B).
+        if (sacMaxAt >= 0 || sacPtclAt >= 0 || sacLodAt >= 0)
+        {
+            auto cutAt = [&](const char *name) -> int
+            {
+                for (size_t i = 0; i < kTuningCount; ++i)
+                    if (!std::strcmp(kTuningFlags[i].name, name))
+                        return tuningAt[i];
+                return -1;
+            };
+            static const int camAt = cutAt("saccam"), charaAt = cutAt("sacchara"), fxAt = cutAt("sacfx"), drawAt = cutAt("sacdraw");
+            const bool allOff = sacAllAt >= 0 && isOffAt(sacAllAt);
+            const struct
+            {
+                int at;
+                bool native_renderer::Tuning::*field;
+                bool alsoAll; // sacall's four
+            } cuts[] = {{camAt, &native_renderer::Tuning::sacCamColl, true}, {charaAt, &native_renderer::Tuning::sacFarChara, true},
+                        {fxAt, &native_renderer::Tuning::sacFxHalf, true}, {drawAt, &native_renderer::Tuning::sacDrawDist, true},
+                        {sacPtclAt, &native_renderer::Tuning::sacParticles, false}, {sacLodAt, &native_renderer::Tuning::sacLod, false}};
+            if (sacMaxAt >= 0)
+            {
+                const bool maxOff = isOffAt(sacMaxAt);
+                for (const auto &c : cuts)
+                    t.*(c.field) = !maxOff && !(c.at >= 0 && isOffAt(c.at)) && !(c.alsoAll && allOff);
+            }
+            else
+            {
+                if (sacPtclAt >= 0)
+                    t.sacParticles = isOffAt(sacPtclAt) ? false : start.sacParticles;
+                if (sacLodAt >= 0)
+                    t.sacLod = isOffAt(sacLodAt) ? false : start.sacLod;
+            }
+            // "[sac] frame F: cuts cam chara fx draw ptcl lod" at each change.
+            static int lastMask = -1;
+            int mask = 0;
+            for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); ++i)
+                mask |= (t.*(cuts[i].field) ? 1 : 0) << i;
+            if (mask != lastMask)
+            {
+                lastMask = mask;
+                std::fprintf(stderr, "[sac] frame %llu: cuts%s%s%s%s%s%s%s\n", (unsigned long long)g_frame, mask ? "" : " none", (mask & 1) ? " cam" : "",
+                             (mask & 2) ? " chara" : "", (mask & 4) ? " fx" : "", (mask & 8) ? " draw" : "", (mask & 16) ? " ptcl" : "", (mask & 32) ? " lod" : "");
+            }
+        }
+        for (uint32_t layer = 0; layer < 32u; ++layer)
+            if (layerAt[layer] >= 0)
+                t.hiddenLayers = isOffAt(layerAt[layer]) ? (t.hiddenLayers | (1u << layer)) : ((t.hiddenLayers & ~(1u << layer)) | (start.hiddenLayers & (1u << layer)));
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            std::fprintf(stderr, rotate ? "[ab] %s off one at a time, windows of %llu frames\n" : "[ab] %s off in odd windows of %llu frames\n", flags,
+                         (unsigned long long)period);
+        }
+    }
+
+    // Round 100 (Tuning prio100): the disc reader threads' priority, applied
+    // when the switch changes and every 120 frames (a reader started since
+    // keeps place()'s priority until then).
+    void prio100Apply()
+    {
+        static const int value = [] { const char *e = std::getenv("SOTC_PRIO100_VALUE"); return e ? std::clamp(std::atoi(e), 64, 191) : 145; }();
+        static int applied = -1;
+        static uint64_t at = 0;
+        const int want = native_renderer::tuning().prio100 ? 1 : 0;
+        if (want == applied && g_frame < at + 120u)
+            return;
+        native_renderer::threads::setKindPriority(native_renderer::threads::kLoader, want ? value : 0);
+        if (want != applied)
+            std::fprintf(stderr, "[prio100] frame %llu: disc readers at %s\n", (unsigned long long)g_frame, want ? std::to_string(value).c_str() : "their own priority");
+        applied = want;
+        at = g_frame;
+    }
+    void endFrame()
+    {
+        if (g_frame == 0)
+            return;
+        if (mdsTraceOn())
+            mdsTraceFrame();
+        lines67::frame(g_frame);
+        abSwitches();
+        prio100Apply();
+        native_renderer::gfxLogIfChanged(g_frame); // round 124: [gfx124] at start and at each change
+        flush2D();
+        // The GS vertex fog (every world batch has FGE): F = base + scale / w
+        // from getFogFactor0/1 (0x1089b70/bb0), the colour as
+        // graphSetFogParam last set FOGCOL (0x118b8dc/e0/e4).
+        {
+            const float nearD = real(0x12147DCu), farD = real(0x12147E0u), nearR = real(0x12147E4u), farR = real(0x12147E8u), k = real(0x12147ECu);
+            const native_renderer::Tuning &tune = native_renderer::tuning();
+            if (tune.vertexFog && farD != nearD)
+            {
+                static const float baseScale = std::getenv("SOTC_FOG_BASE_SCALE") ? static_cast<float>(std::atof(std::getenv("SOTC_FOG_BASE_SCALE"))) : 1.0f;
+                g_fog.vertexFog = true;
+                g_fog.scale = farD * nearD * (nearR - farR) / (farD - nearD);
+                // The camera packet of every layer (0x1098e20) carries these
+                // two values for the microcode: F = factor1 + factor0 / w.
+                g_fog.base = ((farR - nearR) * (farD + nearD) / (farD - nearD) + farR + nearR) * k * baseScale;
+                // The tuning's amount scales the fog's share: F' = 255 - (255 - F) x amount.
+                const float amount = std::max(0.0f, tune.vertexFogAmount);
+                g_fog.base = 255.0f - (255.0f - g_fog.base) * amount;
+                g_fog.scale *= amount;
+                for (int i = 0; i < 3; ++i)
+                    g_fog.colour[i] = static_cast<float>(word(0x118B8DCu + i * 4u) & 0xFFu) / 255.0f;
+            }
+            static const bool log = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+            static uint64_t logged = 0;
+            if (log && g_frame >= logged + 300u)
+            {
+                logged = g_frame;
+                std::fprintf(stderr, "[native-vfog] frame %llu near %g far %g rates %g %g k %g -> base %g scale %g colour %u %u %u\n", (unsigned long long)g_frame,
+                             nearD, farD, nearR, farR, k, g_fog.base, g_fog.scale, word(0x118B8DCu), word(0x118B8E0u), word(0x118B8E4u));
+            }
+        }
+        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+            std::fprintf(stderr, "[bossfx] frame %llu flags %08x a0 %d b0 %d b4 %d b8 %d bc %d c0 %d c4 %d 298 %g\n", (unsigned long long)g_frame, word(0x1186290u),
+                         static_cast<int32_t>(word(0x11862A0u)), static_cast<int32_t>(word(0x11862B0u)), static_cast<int32_t>(word(0x11862B4u)), static_cast<int32_t>(word(0x11862B8u)),
+                         static_cast<int32_t>(word(0x11862BCu)), static_cast<int32_t>(word(0x11862C0u)), static_cast<int32_t>(word(0x11862C4u)), real(0x1186298u));
+        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 120u == 0u)
+            std::fprintf(stderr, "[dof] frame %llu on %u rounds %d slices %d focus %g colour %08x %08x %08x %08x\n", (unsigned long long)g_frame, word(0x11862D0u),
+                         static_cast<int32_t>(word(0x11862D4u)), static_cast<int32_t>(word(0x11862D8u)), static_cast<float>(static_cast<int32_t>(word(0x11862DCu))),
+                         word(0x11862E0u), word(0x11862E4u), word(0x11862E8u), word(0x11862ECu));
+        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+        {
+            std::fprintf(stderr, "[bloomcol] %llu:", (unsigned long long)g_frame);
+            for (uint32_t a = 0x118C0C0u; a < 0x118C150u; a += 4u)
+                std::fprintf(stderr, " %x", word(a));
+            std::fprintf(stderr, "\n");
+        }
+        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+            std::fprintf(stderr, "[native-frame] %llu bloomZ %u ran %d zfog %d start %g width %g vfog %d base %g scale %g col %g %g %g models %u\n", (unsigned long long)g_frame, word(0x118C094u), g_bloomRan ? 1 : 0, g_fog.enabled ? 1 : 0,
+                         g_fog.start, g_fog.width, g_fog.vertexFog ? 1 : 0, g_fog.base, g_fog.scale, g_fog.colour[0], g_fog.colour[1], g_fog.colour[2], g_modelDraws);
+        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 120u == 0u)
+        {
+            const uint32_t table = word(0x118BFCCu);
+            for (uint32_t layer : {1u, 2u, 3u})
+            {
+                const uint32_t pk = table ? word(table + layer * 4u) : 0u;
+                if (pk)
+                    std::fprintf(stderr, "[layerfog] frame %llu layer %u q22 %g %g q23 %g %g q24 %g %g q25 %g %g\n", (unsigned long long)g_frame, layer,
+                                 real(pk + 0x110u), real(pk + 0x114u), real(pk + 0x118u), real(pk + 0x11Cu), real(pk + 0x120u), real(pk + 0x124u),
+                                 real(pk + 0x128u), real(pk + 0x12Cu));
+            }
+        }
+        {
+            // bossDeathEffect (on while the word 0x1186290 is set; most of the
+            // game): layer 8 is drawn apart and laid over the picture sharp
+            // (alpha 0x11862c4) and blurred (0x11862c0, 0x11862a0 rounds), in the
+            // tint 0x11862b0..b8 (0x80 = 1). SOTC_NATIVE_NOGLOW=1 draws it plainly.
+            native_renderer::GlowComposite gc;
+            gc.enabled = native_renderer::tuning().glow && word(0x1186290u) != 0u && g_modelDraws != 0u;
+            gc.order = 8;
+            gc.rounds = std::clamp(static_cast<int32_t>(word(0x11862A0u)), 0, 8);
+            for (int i = 0; i < 3; ++i)
+                gc.tint[i] = static_cast<float>(static_cast<int32_t>(word(0x11862B0u + i * 4u))) / 128.0f;
+            gc.amountA = static_cast<float>(static_cast<int32_t>(word(0x11862C4u))) / 128.0f;
+            gc.amountB = static_cast<float>(static_cast<int32_t>(word(0x11862C0u))) / 128.0f;
+            native_renderer::setGlowComposite(gc);
+        }
+        {
+            // depthOfField (0x10874e8, on while 0x11862d0 is set): focus
+            // distance 0x11862dc taken to GS Z by the camera's 0x4a0 matrix,
+            // slices 0x11862d8, blur rounds 0x11862d4.
+            native_renderer::DepthOfField dof;
+            if (native_renderer::tuning().depthOfField && g_cameraContext && word(0x11862D0u) != 0u && g_modelDraws != 0u)
+            {
+                const float focus = static_cast<float>(static_cast<int32_t>(word(0x11862DCu)));
+                const uint32_t m = g_cameraContext + 0x4A0u;
+                const float w = real(m + 11u * 4u) * focus + real(m + 15u * 4u);
+                dof.enabled = w != 0.0f;
+                dof.zA = real(m + 10u * 4u);
+                dof.zB = real(m + 14u * 4u);
+                dof.focusZ = dof.enabled ? static_cast<uint32_t>(std::max(0.0f, (real(m + 10u * 4u) * focus + real(m + 14u * 4u)) / w)) : 0u;
+                dof.slices = std::clamp(static_cast<int32_t>(word(0x11862D8u)), 0, 8);
+                dof.rounds = std::clamp(static_cast<int32_t>(word(0x11862D4u)), 0, 4);
+            }
+            native_renderer::setDepthOfField(dof);
+        }
+        {
+            // Layer 1's near plane (0x1098e20's third camera packet, round 65e):
+            // max(getZFogNear (0x118c480 - 0x118c474 - 0x118c470) - *0x118c478, 10).
+            const float zFogNear = real(0x118C480u) - real(0x118C474u) - real(0x118C470u);
+            g_fog.skyNear = std::max(zFogNear - real(0x118C478u), 10.0f);
+            if (ps2_stats::bloomLogNow())
+                std::fprintf(stderr, "[bloom:game] f=%llu layer 1 near %.3f (zFog near %.3f, margin %.3f)\n", (unsigned long long)ps2_stats::vif1Chains.load(std::memory_order_relaxed),
+                             g_fog.skyNear, zFogNear, real(0x118C478u));
+        }
+        native_renderer::setFog(g_fog);
+        g_fog = native_renderer::Fog{};
+        // Without 3D this frame (loading, menus over black) the bloom mask would
+        // take the empty screen for sky and glow all over it.
+        native_renderer::setBloom(g_bloomRan && g_modelDraws ? bloomParams() : native_renderer::Bloom{});
+        g_modelDraws = 0;
+        g_bloomRan = false;
+        // Drawn larger than the PS2's 512 x 448 (F10 / SOTC_RENDER_SCALE): the
+        // geometry has no resolution; the effects measure in PS2 pixels.
+        const float scale = std::clamp(native_renderer::tuning().renderScale, native_renderer::kMinRenderScale, native_renderer::kMaxRenderScale);
+        native_renderer::endFrame(static_cast<uint32_t>(512.0f * scale + 0.5f), static_cast<uint32_t>(448.0f * scale + 0.5f));
+        // SOTC_NATIVE=2: both drawn, the emulated picture shown unless F9
+        // asked for the native one (Tuning::bothShowNative).
+        static const bool both = std::atoi(std::getenv("SOTC_NATIVE")) == 2;
+        const native_renderer::Tuning &shownTune = native_renderer::tuning();
+        const bool wantNative = both ? shownTune.bothShowNative : shownTune.showNative;
+        native_renderer::setShown(wantNative && !shownTune.forceEmulated && g_frameDraws != 0);
+    }
+
+    void getCameraContextHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_getCameraContext(rdram, ctx, runtime);
+        if (runtime->transferPending())
+            return; // a thread switch below (round 52): nothing more here
+        g_cameraContext = GPR_U32(ctx, 2);
+        sotc_decomp::g_cameraContextAddr = g_cameraContext;
+    }
+
+    // The performance overlay's numbers (round 20, Tuning::perfOverlay):
+    // the frame log's split averaged over ~0.5 s of frames, the worst frame of
+    // the last ~4 s and the last 120 frame times, handed to the host's
+    // overlay (native_renderer::perfPublish) every ~0.5 s.
+    void perfOverlayFrame(uint64_t period, const native_renderer::FrameCounters &c)
+    {
+        struct Window
+        {
+            uint64_t frames = 0, period = 0, hooks = 0, render = 0, present = 0, wait = 0, blocked = 0, draws = 0;
+            bool threaded = false;
+        };
+        static Window w;
+        static native_renderer::PerfStats out;
+        static uint64_t worst[8] = {}; // the worst frame of each ~0.5 s window
+        static unsigned worstAt = 0;
+        constexpr int kH = native_renderer::PerfStats::kHistory;
+        std::memmove(out.history, out.history + 1, sizeof(float) * (kH - 1));
+        out.history[kH - 1] = period / 1000.0f;
+        ++w.frames;
+        w.period += period;
+        w.hooks += c.hookUs;
+        w.render += c.renderUs;
+        w.present += c.presentUs;
+        w.wait += c.waitUs;
+        w.blocked += c.waitUs ? c.waitUs : c.renderUs + c.presentUs;
+        w.draws += c.draws;
+        w.threaded |= c.renderThread;
+        worst[worstAt] = std::max(worst[worstAt], period);
+        if (w.period < 500000u)
+            return;
+        const double n = static_cast<double>(w.frames);
+        out.fps = static_cast<float>(n * 1e6 / static_cast<double>(w.period));
+        out.frameMs = static_cast<float>(w.period / n / 1000.0);
+        out.gameMs = static_cast<float>((static_cast<double>(w.period) - w.hooks - w.blocked) / n / 1000.0);
+        out.hooksMs = static_cast<float>(w.hooks / n / 1000.0);
+        out.renderMs = static_cast<float>(w.render / n / 1000.0);
+        out.presentMs = static_cast<float>(w.present / n / 1000.0);
+        out.waitMs = static_cast<float>(w.wait / n / 1000.0);
+        out.draws = static_cast<float>(w.draws / n);
+        out.renderThread = w.threaded;
+        out.frame = g_frame;
+        uint64_t worstAll = 0;
+        for (uint64_t x : worst)
+            worstAll = std::max(worstAll, x);
+        out.worstMs = worstAll / 1000.0f;
+        worstAt = (worstAt + 1u) % 8u;
+        worst[worstAt] = 0;
+        native_renderer::perfPublish(out);
+        w = Window{};
+    }
+
+    // Round 76 (SOTC_LOG76, default on; A/B `log76`): the frame log's
+    // per-frame lines ("[frame] each" / "[frame] slow") formatted on a thread
+    // of their own (`log`, cores 1-2 on the Vita) instead of the game thread.
+    // The console's r74 log: the game thread spent 0.88 ms a frame in the
+    // frame log (`sync ... log 0.9`, the shrine's frames), ~60 float
+    // conversions and two long vsnprintf a frame on the Cortex-A9. The game
+    // thread now takes the numbers as they are (a copy of the frame's
+    // counters, the waits' and joins' sites, the threads' run clocks) and
+    // hands them over; the text is the same, made from the same numbers.
+    // Only when the lines come out changes: a little later than other lines
+    // (the readers match lines by frame number). Nothing the game computes
+    // depends on it. A full queue (the thread behind) formats on the game
+    // thread as before. SOTC_LOG76=0: as before.
+    namespace log76
+    {
+        // Round 105 (log105, default on): the lines' text by fmt105 /
+        // logf105 (the same text; ~60 float conversions a line without
+        // newlib's dtoa, on the log thread on cores 1-2).
+        template <typename... Args>
+        int sfmt105(char *out, size_t room, const char *format, Args... args)
+        {
+            return native_renderer::g_log105 ? native_renderer::fmt105(out, room, format, args...) : std::snprintf(out, room, format, args...);
+        }
+        using LogFn = void (*)(const char *, ...);
+        LogFn logLine105() { return native_renderer::g_log105 ? &native_renderer::logf105 : &native_renderer::logf; }
+        // Round 130: the 60-frame window's sums (frameLog's "[frame] N:" line), handed to the log thread as they are.
+        struct FrameSum
+        {
+            uint64_t frames = 0, period = 0, worst = 0, hooks = 0, decode = 0, tex = 0, mesh = 0, render = 0, present = 0, wait = 0, blocked = 0, threaded = 0;
+            uint64_t draws = 0, targets = 0, texUploads = 0, texBytes = 0, meshUploads = 0, meshBytes = 0;
+            uint64_t jobs = 0, join = 0, jobCount = 0, lag = 0, lagMax = 0;
+            uint64_t held = 0, heldTerrain = 0, heldPictures = 0;
+            uint64_t sync[kSyncParts] = {}, site[hookjobs::kSites] = {};
+        };
+        struct Line
+        {
+            // Round 130: 0 a frame's line ("each" / "slow"), 1 the 60-frame window's ("[frame] N:", sum, cpuFrames).
+            int kind = 0;
+            FrameSum sum;
+            uint64_t cpuFrames = 0;
+            bool slow = false;
+            unsigned long long frame = 0;
+            double periodMs = 0;
+            native_renderer::FrameCounters c;
+            double schedMs = 0, cdMs = 0, cdKB = 0, cdGameMs = 0, sprMs = 0, sprKB = 0, dtMs = 0;
+            unsigned long long cdReads = 0, vblanks = 0, sprs = 0;
+            uint32_t siteMask = 0;
+            double siteMs[ps2_load::kSites] = {};
+            bool lane = false;
+            double laneMs = 0;
+            unsigned long long laneJobs = 0, laneJoins = 0, laneWorker = 0;
+            uint64_t sync[kSyncParts] = {}, joinSite[hookjobs::kSites] = {};
+            native_renderer::threads::Snapshot cpu;
+            int gfx = 0; // round 124: the Graphics preset (native_renderer::gfxPresetNow)
+        };
+        bool g_switch = true; // the A/B's (applied each frame)
+        bool on()
+        {
+            static const bool start = [] { const char *e = std::getenv("SOTC_LOG76"); return !e || std::atoi(e) != 0; }();
+            return start && g_switch;
+        }
+        constexpr uint32_t kRing = 64u;
+        Line g_ring[kRing];
+        std::atomic<uint32_t> g_head{0}, g_tail{0};
+        std::mutex g_mutex;
+        std::condition_variable g_wake;
+        std::atomic<bool> g_sleeping{false};
+        bool g_started = false;
+        uint64_t g_full = 0;
+
+        // The frame change's parts and the joins by site (frameLog's `splits`).
+        void splits(const uint64_t *syncUs, const uint64_t *siteUs, double n, char *out, size_t room)
+        {
+            uint64_t total = 0;
+            for (int k = 0; k < kSyncParts; ++k)
+                total += syncUs[k];
+            int at = sfmt105(out, room, " | sync %.1f (join %.1f end %.1f log %.1f audio %.1f idle %.1f rest %.1f) | joins", total / n / 1000.0,
+                                   syncUs[kSyncJoin] / n / 1000.0, syncUs[kSyncEnd] / n / 1000.0, syncUs[kSyncLog] / n / 1000.0, syncUs[kSyncAudio] / n / 1000.0,
+                                   syncUs[kSyncIdle] / n / 1000.0, syncUs[kSyncRest] / n / 1000.0);
+            bool any = false;
+            for (int k = 0; k < hookjobs::kSites && at > 0 && static_cast<size_t>(at) < room; ++k)
+                if (siteUs[k])
+                {
+                    at += sfmt105(out + at, room - at, " %s %.2f", hookjobs::kSiteNames[k], siteUs[k] / n / 1000.0);
+                    any = true;
+                }
+            if (!any && at > 0 && static_cast<size_t>(at) < room)
+                sfmt105(out + at, room - at, " none");
+        }
+        // The line as frameLog writes it.
+        void write(const Line &L)
+        {
+            const native_renderer::FrameCounters &c = L.c;
+            char split[640];
+            int at = sfmt105(split, sizeof(split), " lag %.0f us max %.2f", c.jobs ? c.lagUs / static_cast<double>(c.jobs) : 0.0, c.lagMaxUs / 1000.0);
+            at += sfmt105(split + at, sizeof(split) - at, " | waits");
+            for (int k = 0; k < ps2_load::kSites && at > 0 && static_cast<size_t>(at) < sizeof(split); ++k)
+                if (L.siteMask & (1u << k))
+                    at += sfmt105(split + at, sizeof(split) - at, " %s %.1f", ps2_load::kSiteNames[k], L.siteMs[k]);
+            if (L.lane && at > 0 && static_cast<size_t>(at) < sizeof(split))
+                at += sfmt105(split + at, sizeof(split) - at, " | lanehelp %.1f (%llu jobs, %llu joins, worker %llu)", L.laneMs, L.laneJobs, L.laneJoins, L.laneWorker);
+            if (at > 0 && static_cast<size_t>(at) < sizeof(split))
+                splits(L.sync, L.joinSite, 1.0, split + at, sizeof(split) - at);
+            at = static_cast<int>(std::strlen(split));
+            native_renderer::threads::lineOf(L.cpu, split + at, sizeof(split) - at);
+            at = static_cast<int>(std::strlen(split));
+            sfmt105(split + at, sizeof(split) - at, " | gfx %s", native_renderer::presetName(L.gfx)); // round 124
+            if (L.slow)
+                logLine105()("[frame] slow %llu: %.1f ms: hooks %.1f (decode %.1f, %u textures %.0f KB, up %.1f; %u meshes %.0f KB, up %.1f) render %.1f (lock %.1f up %.1f draw %.1f [plan %.1f pass %.1f calls %.1f %u] sweep %.1f, runs %u/%u) present %.1f wait %.1f draws %u targets %u scenes %u (depth %u KB) verts %uk async %u/%u held %u (terrain %u)%s"
+                                     " | sched %.1f cd %.1f (%llu reads %.0f KB, game %.1f) vb %llu dt %.1f spr %.1f (%llu, %.0f KB) | jobs %.1f (%u) join %.1f%s\n",
+                             L.frame, L.periodMs, c.hookUs / 1000.0, c.decodeUs / 1000.0, c.texUploads, c.texBytes / 1024.0, c.texUs / 1000.0,
+                             c.meshUploads, c.meshBytes / 1024.0, c.meshUs / 1000.0, c.renderUs / 1000.0, c.renderLockUs / 1000.0, c.renderUploadUs / 1000.0,
+                             c.renderDrawUs / 1000.0, c.renderPlanUs / 1000.0, c.renderPassUs / 1000.0, c.renderCallUs / 1000.0, c.renderCalls, c.renderSweepUs / 1000.0, c.renderRunCopies, c.renderRunScans, c.presentUs / 1000.0, c.waitUs / 1000.0, c.draws, c.targets, c.scenes, c.depthKB, (c.vertices + 500u) / 1000u,
+                             c.asyncJobs, c.asyncDone, c.heldDraws, c.heldTerrain, c.heldPicture ? " picture held" : "", L.schedMs, L.cdMs,
+                             L.cdReads, L.cdKB, L.cdGameMs, L.vblanks, L.dtMs, L.sprMs, L.sprs, L.sprKB, c.jobUs / 1000.0, c.jobs, c.joinUs / 1000.0, split);
+            else
+                logLine105()("[frame] each %llu: %.1f ms: hooks %.1f (decode %.1f, %u textures, %u meshes, up %.1f) render %.1f present %.1f wait %.1f draws %u targets %u scenes %u verts %uk async %u/%u held %u (terrain %u)%s | sched %.1f cd %.1f (%llu reads %.0f KB) vb %llu dt %.1f spr %.1f (%llu, %.0f KB) | jobs %.1f (%u) join %.1f%s\n",
+                             L.frame, L.periodMs, c.hookUs / 1000.0, c.decodeUs / 1000.0, c.texUploads, c.meshUploads,
+                             (c.texUs + c.meshUs) / 1000.0, c.renderUs / 1000.0, c.presentUs / 1000.0, c.waitUs / 1000.0, c.draws, c.targets, c.scenes, (c.vertices + 500u) / 1000u, c.asyncJobs, c.asyncDone, c.heldDraws, c.heldTerrain, c.heldPicture ? " picture held" : "",
+                             L.schedMs, L.cdMs, L.cdReads, L.cdKB, L.vblanks, L.dtMs, L.sprMs, L.sprs, L.sprKB, c.jobUs / 1000.0, c.jobs, c.joinUs / 1000.0, split);
+        }
+        // Round 130: the 60-frame line as frameLog wrote it on the game thread (the same text).
+        void writeSum(const Line &L)
+        {
+            const FrameSum &sum = L.sum;
+            const double n = sum.frames ? static_cast<double>(sum.frames) : 1.0, game = (static_cast<double>(sum.period) - sum.hooks - sum.blocked) / n / 1000.0;
+            char avgSplit[640];
+            int at = sfmt105(avgSplit, sizeof(avgSplit), " lag %.0f us max %.2f", sum.jobCount ? sum.lag / static_cast<double>(sum.jobCount) : 0.0, sum.lagMax / 1000.0);
+            if (at > 0 && static_cast<size_t>(at) < sizeof(avgSplit))
+                splits(sum.sync, sum.site, n, avgSplit + at, sizeof(avgSplit) - at);
+            at = static_cast<int>(std::strlen(avgSplit));
+            native_renderer::threads::line(avgSplit + at, sizeof(avgSplit) - at, static_cast<double>(L.cpuFrames ? L.cpuFrames : 1u), true);
+            at = static_cast<int>(std::strlen(avgSplit));
+            sfmt105(avgSplit + at, sizeof(avgSplit) - at, " | gfx %s", native_renderer::presetName(L.gfx)); // round 124
+            logLine105()("[frame] %llu: %.1f ms (%.1f fps, slowest %.1f) | game %.1f hooks %.1f (decode %.2f tex up %.2f mesh up %.2f) render %.1f present %.1f wait %.1f%s | "
+                         "draws %.0f targets %.1f textures %.2f (%.0f KB) meshes %.0f (%.0f KB) | jobs %.1f join %.1f | held %llu (terrain %llu) pictures held %llu%s\n",
+                         L.frame, sum.period / n / 1000.0, n * 1e6 / static_cast<double>(sum.period ? sum.period : 1u), sum.worst / 1000.0, game, sum.hooks / n / 1000.0,
+                         sum.decode / n / 1000.0, sum.tex / n / 1000.0, sum.mesh / n / 1000.0, sum.render / n / 1000.0, sum.present / n / 1000.0,
+                         sum.wait / n / 1000.0, sum.threaded ? " (render thread)" : "",
+                         sum.draws / n, sum.targets / n, sum.texUploads / n, sum.texBytes / n / 1024.0, sum.meshUploads / n, sum.meshBytes / n / 1024.0,
+                         sum.jobs / n / 1000.0, sum.join / n / 1000.0, (unsigned long long)sum.held, (unsigned long long)sum.heldTerrain,
+                         (unsigned long long)sum.heldPictures, avgSplit);
+        }
+        void run()
+        {
+            ThreadNaming::SetCurrentThreadName("framelog");
+            native_renderer::threads::place(native_renderer::threads::kLog);
+            unsigned long long sampled = 0; // round 130: the frame the threads' run clocks were last read at
+            native_renderer::threads::Snapshot perFrame;
+            for (;;)
+            {
+                uint32_t tail = g_tail.load(std::memory_order_relaxed);
+                if (tail == g_head.load(std::memory_order_acquire))
+                {
+                    // Round 130: no wake-up per line (the game thread signals only a half-full ring): a look every
+                    // 20 ms, a few lines each time.
+                    std::unique_lock<std::mutex> lock(g_mutex);
+                    g_sleeping.store(true, std::memory_order_seq_cst);
+                    g_wake.wait_for(lock, std::chrono::milliseconds(20), [&] { return tail != g_head.load(std::memory_order_acquire); });
+                    g_sleeping.store(false, std::memory_order_relaxed);
+                    continue;
+                }
+                Line &L = g_ring[tail % kRing];
+                // Round 130: the threads' run clocks read here (sceKernelGetThreadInfo, ~14 a frame: the console's
+                // `sync ... log 0.8` on the game thread). A frame's `cpu` column is the CPU since the last read
+                // divided by the frames since then (the log thread keeps up within ~20 ms: about one frame); the
+                // 60-frame line's is the window's total, as before.
+                if (L.frame > sampled)
+                {
+                    native_renderer::threads::sample();
+                    native_renderer::threads::lastFrame(perFrame);
+                    const uint64_t span = sampled ? L.frame - sampled : 1u;
+                    for (int k = 0; k < native_renderer::threads::kKinds; ++k)
+                        perFrame.cpu[k] /= span, perFrame.pre[k] /= span, perFrame.mov[k] /= span;
+                    sampled = L.frame;
+                }
+                if (L.kind == 1)
+                    writeSum(L);
+                else
+                {
+                    L.cpu = perFrame;
+                    write(L);
+                }
+                g_tail.store(tail + 1u, std::memory_order_release);
+            }
+        }
+        // The slot the game thread fills (nullptr: the queue is full, write it there).
+        Line *slot()
+        {
+            if (!g_started)
+            {
+                g_started = true;
+                std::thread(run).detach();
+            }
+            const uint32_t head = g_head.load(std::memory_order_relaxed);
+            if (head - g_tail.load(std::memory_order_acquire) >= kRing)
+            {
+                ++g_full;
+                return nullptr;
+            }
+            return &g_ring[head % kRing];
+        }
+        void post()
+        {
+            const uint32_t head = g_head.load(std::memory_order_relaxed) + 1u;
+            g_head.store(head, std::memory_order_seq_cst);
+            // Round 130: the log thread looks every 20 ms; woken (a mutex and a semaphore signal on the game
+            // thread) only when the ring is half full.
+            if (head - g_tail.load(std::memory_order_relaxed) >= kRing / 2u && g_sleeping.load(std::memory_order_seq_cst))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_wake.notify_one();
+            }
+        }
+    }
+
+    // The frame timing log: every 60 frames the average and the slowest
+    // frame (ms), split into the game's own work (what is left), the native
+    // hooks (decoding and uploads included), the backend's CPU side and the
+    // host's swap (with the render thread: that thread's, overlapping the
+    // game; "wait" is the game thread's wait for it); and each frame over
+    // 50 ms on its own line (hitches).
+    void frameLog()
+    {
+        native_renderer::FrameCounters &c = native_renderer::frameCounters();
+        static uint64_t last = 0;
+        const uint64_t now = native_renderer::nowUs();
+        // The log's printing (frameLog) and the overlay (perfOverlay) share
+        // the counters; with both off nothing is collected.
+        const native_renderer::Tuning &tune = native_renderer::tuning();
+        if (!tune.frameTiming())
+        {
+            last = 0;
+            c = {};
+            // The scene recorder armed (it starts here when the menu closes).
+            native_recorder::FrameInfo info;
+            info.gameFrame = g_frame;
+            native_recorder::frameInfo(info, hostmenu::isOpen());
+            return;
+        }
+        const bool print = tune.frameLog;
+        using Sum = log76::FrameSum;
+        static Sum sum;
+        // Round 130: SOTC_FRAME_SLOW_MS=<ms> (default 50): a frame over it gets its own "[frame] slow" line. The
+        // console's frames sit near 50 ms riding, so the default prints a long line for 30-50% of them; the
+        // cheap console env (r130/env-console.txt) raises it to the real hitches.
+        static const uint64_t slowUs = []
+        {
+            const char *e = std::getenv("SOTC_FRAME_SLOW_MS");
+            const long v = e ? std::atol(e) : 50;
+            return static_cast<uint64_t>(v > 0 ? v : 50) * 1000u;
+        }();
+        // Round 130: with log76 the log thread reads the threads' run clocks and formats every line; the game
+        // thread only copies the numbers (nothing of native_renderer::threads on the game thread).
+        const bool offThread = log76::on();
+        // Round 32: the frame change's parts and the joins by site, as text.
+        const auto splits = [](const uint64_t *syncUs, const uint64_t *siteUs, double n, char *out, size_t room)
+        {
+            uint64_t total = 0;
+            for (int k = 0; k < kSyncParts; ++k)
+                total += syncUs[k];
+            int at = std::snprintf(out, room, " | sync %.1f (join %.1f end %.1f log %.1f audio %.1f idle %.1f rest %.1f) | joins", total / n / 1000.0,
+                                   syncUs[kSyncJoin] / n / 1000.0, syncUs[kSyncEnd] / n / 1000.0, syncUs[kSyncLog] / n / 1000.0, syncUs[kSyncAudio] / n / 1000.0,
+                                   syncUs[kSyncIdle] / n / 1000.0, syncUs[kSyncRest] / n / 1000.0);
+            bool any = false;
+            for (int k = 0; k < hookjobs::kSites && at > 0 && static_cast<size_t>(at) < room; ++k)
+                if (siteUs[k])
+                {
+                    at += std::snprintf(out + at, room - at, " %s %.2f", hookjobs::kSiteNames[k], siteUs[k] / n / 1000.0);
+                    any = true;
+                }
+            if (!any && at > 0 && static_cast<size_t>(at) < room)
+                std::snprintf(out + at, room - at, " none");
+        };
+        // The game thread's scheduler waits (idle, VBlank pacing, a guest
+        // thread blocked), the disc reads, the guest VBlanks: this frame's.
+        struct Mark
+        {
+            uint64_t wait, cdUs, cdBytes, cdReads, vblanks, sprUs, sprBytes, sprs, cdGameUs;
+        };
+        const Mark mark{ps2_load::waitUs[ps2_load::kGame].load(std::memory_order_relaxed), ps2_stats::cdReadUs.load(std::memory_order_relaxed),
+                        ps2_stats::cdReadBytes.load(std::memory_order_relaxed), ps2_stats::cdReads.load(std::memory_order_relaxed),
+                        ps2_stats::vblanks.load(std::memory_order_relaxed), ps2_stats::sprDmaUs.load(std::memory_order_relaxed),
+                        ps2_stats::sprDmaBytes.load(std::memory_order_relaxed), ps2_stats::sprDmas.load(std::memory_order_relaxed),
+                        ps2_stats::cdReadGameUs.load(std::memory_order_relaxed)};
+        static Mark lastMark = mark;
+        // The game's own step this frame (GAMECORE's frame time, 0x1465650:
+        // +0x180 seconds, from the EE timer T0): what its movement, physics
+        // and animation advance by (round 10, the clock).
+        float gameDt = 0.0f;
+        if (g_ram)
+            std::memcpy(&gameDt, g_ram + 0x014657D0u, 4);
+        if (last)
+        {
+            const uint64_t period = now - last;
+            char split[640];
+            split[0] = 0;
+            // Round 33: the job lag (hand-over to the worker taking it up: avg
+            // us a job / the largest, ms) and, on the Vita, each thread kind's
+            // CPU time this frame (native_renderer::threads).
+            static uint64_t cpuFrames = 0;
+            if (!offThread)
+                native_renderer::threads::sample();
+#if !defined(__vita__) && !defined(__SWITCH__)
+            {
+                // Round 36 (the Mac, SOTC_CPU_LOG=1): the game thread's CPU time
+                // ([cpu] every 60 frames, game frame and VBlank), for A/B checks
+                // on the fixed-30 route, whose positions repeat run to run.
+                static const bool cpuLog = ps2_diag::env("SOTC_CPU_LOG") != nullptr;
+                if (cpuLog)
+                {
+                    timespec ts{};
+                    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+                    const uint64_t cpu = static_cast<uint64_t>(ts.tv_sec) * 1000000u + static_cast<uint64_t>(ts.tv_nsec) / 1000u;
+                    static uint64_t lastCpu = cpu, frames = 0;
+                    if (++frames % 60u == 0u)
+                    {
+                        std::fprintf(stderr, "[cpu] frame %llu vblank %llu: game %.3f ms a frame\n", (unsigned long long)g_frame,
+                                     (unsigned long long)ps2_stats::vblanks.load(std::memory_order_relaxed), (cpu - lastCpu) / 60000.0);
+                        lastCpu = cpu;
+                    }
+                }
+            }
+#endif
+            ++cpuFrames;
+            // Round 76: the line's numbers to the frame log's thread (log76 above).
+            log76::Line *line76 = (print && (period > slowUs || tune.frameLogAll) && offThread) ? log76::slot() : nullptr;
+            static uint64_t lastSite[ps2_load::kSites] = {};
+            if (line76)
+            {
+                log76::Line &L = *line76;
+                L.kind = 0;
+                L.slow = period > slowUs;
+                L.frame = (unsigned long long)g_frame;
+                L.periodMs = period / 1000.0;
+                L.c = c;
+                L.schedMs = (mark.wait - lastMark.wait) / 1000.0;
+                L.cdMs = (mark.cdUs - lastMark.cdUs) / 1000.0;
+                L.cdReads = (unsigned long long)(mark.cdReads - lastMark.cdReads);
+                L.cdKB = (mark.cdBytes - lastMark.cdBytes) / 1024.0;
+                L.cdGameMs = (mark.cdGameUs - lastMark.cdGameUs) / 1000.0;
+                L.vblanks = (unsigned long long)(mark.vblanks - lastMark.vblanks);
+                L.dtMs = gameDt * 1000.0;
+                L.sprMs = (mark.sprUs - lastMark.sprUs) / 1000.0;
+                L.sprs = (unsigned long long)(mark.sprs - lastMark.sprs);
+                L.sprKB = (mark.sprBytes - lastMark.sprBytes) / 1024.0;
+                L.siteMask = 0;
+                for (int k = 0; k < ps2_load::kSites; ++k)
+                {
+                    const uint64_t v = ps2_load::gameSiteUs[k].load(std::memory_order_relaxed);
+                    if (v != lastSite[k])
+                    {
+                        L.siteMask |= 1u << k;
+                        L.siteMs[k] = (v - lastSite[k]) / 1000.0;
+                    }
+                    lastSite[k] = v;
+                }
+                L.lane = mdslane::g_helpJobs || mdslane::g_workerHelpFrame.load(std::memory_order_relaxed);
+                if (L.lane)
+                {
+                    L.laneMs = mdslane::g_helpUs / 1000.0;
+                    L.laneJobs = (unsigned long long)mdslane::g_helpJobs;
+                    L.laneJoins = (unsigned long long)mdslane::g_helpJoins;
+                    L.laneWorker = (unsigned long long)mdslane::g_workerHelpFrame.exchange(0, std::memory_order_relaxed);
+                }
+                mdslane::g_helpUs = mdslane::g_helpJobs = mdslane::g_helpJoins = 0;
+                std::memcpy(L.sync, g_syncUs, sizeof(L.sync));
+                std::memcpy(L.joinSite, hookjobs::g_lastSiteUs, sizeof(L.joinSite));
+                L.gfx = native_renderer::gfxPresetNow();
+                log76::post();
+            }
+            else if (print && (period > slowUs || tune.frameLogAll))
+            {
+                int at = std::snprintf(split, sizeof(split), " lag %.0f us max %.2f", c.jobs ? c.lagUs / static_cast<double>(c.jobs) : 0.0, c.lagMaxUs / 1000.0);
+                {
+                    // Round 70: this frame's game-thread waits ("sched") by site.
+                    at += std::snprintf(split + at, sizeof(split) - at, " | waits");
+                    for (int k = 0; k < ps2_load::kSites && at > 0 && static_cast<size_t>(at) < sizeof(split); ++k)
+                    {
+                        const uint64_t v = ps2_load::gameSiteUs[k].load(std::memory_order_relaxed);
+                        if (v != lastSite[k])
+                            at += std::snprintf(split + at, sizeof(split) - at, " %s %.1f", ps2_load::kSiteNames[k], (v - lastSite[k]) / 1000.0);
+                        lastSite[k] = v;
+                    }
+                    // Round 72: the lane's jobs the game thread's joins ran
+                    // (work, not a wait) and the ones the hook worker ran.
+                    if (mdslane::g_helpJobs || mdslane::g_workerHelpFrame.load(std::memory_order_relaxed))
+                        at += std::snprintf(split + at, sizeof(split) - at, " | lanehelp %.1f (%llu jobs, %llu joins, worker %llu)", mdslane::g_helpUs / 1000.0,
+                                            (unsigned long long)mdslane::g_helpJobs, (unsigned long long)mdslane::g_helpJoins,
+                                            (unsigned long long)mdslane::g_workerHelpFrame.exchange(0, std::memory_order_relaxed));
+                    mdslane::g_helpUs = mdslane::g_helpJobs = mdslane::g_helpJoins = 0;
+                }
+                splits(g_syncUs, hookjobs::g_lastSiteUs, 1.0, split + at, sizeof(split) - at);
+                at = static_cast<int>(std::strlen(split));
+                if (!offThread) // (round 130: a full ring with log76: the log thread owns the run clocks, no cpu column)
+                    native_renderer::threads::line(split + at, sizeof(split) - at, 1.0, false, true); // this frame's alone
+                at = static_cast<int>(std::strlen(split));
+                std::snprintf(split + at, sizeof(split) - at, " | gfx %s", native_renderer::presetName(native_renderer::gfxPresetNow())); // round 124
+            }
+            if (!line76 && print && period > slowUs)
+                native_renderer::logf( "[frame] slow %llu: %.1f ms: hooks %.1f (decode %.1f, %u textures %.0f KB, up %.1f; %u meshes %.0f KB, up %.1f) render %.1f (lock %.1f up %.1f draw %.1f [plan %.1f pass %.1f calls %.1f %u] sweep %.1f, runs %u/%u) present %.1f wait %.1f draws %u targets %u scenes %u (depth %u KB) verts %uk async %u/%u held %u (terrain %u)%s"
+                                     " | sched %.1f cd %.1f (%llu reads %.0f KB, game %.1f) vb %llu dt %.1f spr %.1f (%llu, %.0f KB) | jobs %.1f (%u) join %.1f%s\n",
+                             (unsigned long long)g_frame, period / 1000.0, c.hookUs / 1000.0, c.decodeUs / 1000.0, c.texUploads, c.texBytes / 1024.0, c.texUs / 1000.0,
+                             c.meshUploads, c.meshBytes / 1024.0, c.meshUs / 1000.0, c.renderUs / 1000.0, c.renderLockUs / 1000.0, c.renderUploadUs / 1000.0,
+                             c.renderDrawUs / 1000.0, c.renderPlanUs / 1000.0, c.renderPassUs / 1000.0, c.renderCallUs / 1000.0, c.renderCalls, c.renderSweepUs / 1000.0, c.renderRunCopies, c.renderRunScans, c.presentUs / 1000.0, c.waitUs / 1000.0, c.draws, c.targets, c.scenes, c.depthKB, (c.vertices + 500u) / 1000u,
+                             c.asyncJobs, c.asyncDone, c.heldDraws, c.heldTerrain, c.heldPicture ? " picture held" : "", (mark.wait - lastMark.wait) / 1000.0, (mark.cdUs - lastMark.cdUs) / 1000.0,
+                             (unsigned long long)(mark.cdReads - lastMark.cdReads), (mark.cdBytes - lastMark.cdBytes) / 1024.0, (mark.cdGameUs - lastMark.cdGameUs) / 1000.0,
+                             (unsigned long long)(mark.vblanks - lastMark.vblanks), gameDt * 1000.0, (mark.sprUs - lastMark.sprUs) / 1000.0,
+                             (unsigned long long)(mark.sprs - lastMark.sprs), (mark.sprBytes - lastMark.sprBytes) / 1024.0, c.jobUs / 1000.0, c.jobs, c.joinUs / 1000.0, split);
+            // SOTC_FRAME_LOG_ALL=1: every frame on a line of its own (cuts, loads).
+            if (!line76 && print && tune.frameLogAll && period <= slowUs)
+                native_renderer::logf( "[frame] each %llu: %.1f ms: hooks %.1f (decode %.1f, %u textures, %u meshes, up %.1f) render %.1f present %.1f wait %.1f draws %u targets %u scenes %u verts %uk async %u/%u held %u (terrain %u)%s | sched %.1f cd %.1f (%llu reads %.0f KB) vb %llu dt %.1f spr %.1f (%llu, %.0f KB) | jobs %.1f (%u) join %.1f%s\n",
+                             (unsigned long long)g_frame, period / 1000.0, c.hookUs / 1000.0, c.decodeUs / 1000.0, c.texUploads, c.meshUploads,
+                             (c.texUs + c.meshUs) / 1000.0, c.renderUs / 1000.0, c.presentUs / 1000.0, c.waitUs / 1000.0, c.draws, c.targets, c.scenes, (c.vertices + 500u) / 1000u, c.asyncJobs, c.asyncDone, c.heldDraws, c.heldTerrain, c.heldPicture ? " picture held" : "",
+                             (mark.wait - lastMark.wait) / 1000.0, (mark.cdUs - lastMark.cdUs) / 1000.0, (unsigned long long)(mark.cdReads - lastMark.cdReads),
+                             (mark.cdBytes - lastMark.cdBytes) / 1024.0, (unsigned long long)(mark.vblanks - lastMark.vblanks), gameDt * 1000.0,
+                             (mark.sprUs - lastMark.sprUs) / 1000.0, (unsigned long long)(mark.sprs - lastMark.sprs), (mark.sprBytes - lastMark.sprBytes) / 1024.0,
+                             c.jobUs / 1000.0, c.jobs, c.joinUs / 1000.0, split);
+            ++sum.frames;
+            sum.period += period;
+            sum.worst = std::max(sum.worst, period);
+            sum.hooks += c.hookUs;
+            sum.decode += c.decodeUs;
+            sum.tex += c.texUs;
+            sum.mesh += c.meshUs;
+            sum.render += c.renderUs;
+            sum.present += c.presentUs;
+            sum.wait += c.waitUs;
+            // A render thread draws (and shows) the frame before while the
+            // game runs: the game thread's own time is what it did not wait.
+            sum.threaded += c.renderThread ? 1u : 0u;
+            // Without one (Metal) render and present were the game thread's.
+            sum.blocked += c.waitUs ? c.waitUs : c.renderUs + c.presentUs;
+            sum.jobs += c.jobUs;
+            sum.join += c.joinUs;
+            sum.jobCount += c.jobs;
+            sum.lag += c.lagUs;
+            sum.lagMax = std::max(sum.lagMax, c.lagMaxUs);
+            sum.draws += c.draws;
+            sum.targets += c.targets;
+            sum.texUploads += c.texUploads;
+            sum.texBytes += c.texBytes;
+            sum.meshUploads += c.meshUploads;
+            sum.meshBytes += c.meshBytes;
+            sum.held += c.heldDraws;
+            sum.heldTerrain += c.heldTerrain;
+            sum.heldPictures += c.heldPicture;
+            for (int k = 0; k < kSyncParts; ++k)
+                sum.sync[k] += g_syncUs[k];
+            for (int k = 0; k < hookjobs::kSites; ++k)
+                sum.site[k] += hookjobs::g_lastSiteUs[k];
+            if (tune.perfOverlay)
+                perfOverlayFrame(period, c);
+            if (sum.frames == 60u && print)
+            {
+                // Round 36 (measuring), SOTC_SAC_AB=<mask>: the sacrifices in the
+                // mask (1 particles, 4 detail) on for
+                // two of these 60-frame windows, off for the next two, and so on
+                // (one run, the same places: the route's positions drift from run
+                // to run); a "[sac-ab] on|off" line after each window's line.
+                static const int abMask = ps2_diag::env("SOTC_SAC_AB") ? std::atoi(ps2_diag::env("SOTC_SAC_AB")) : 0;
+                static uint64_t abWindows = 0;
+                const bool abOn = abMask && ((abWindows / 2u) & 1u) != 0u;
+                struct AbLine
+                {
+                    int mask;
+                    bool on;
+                    ~AbLine()
+                    {
+                        if (!mask)
+                            return;
+                        native_renderer::logf("[sac-ab] %s\n", on ? "on" : "off");
+                    }
+                } abLine{abMask, abOn};
+                if (abMask)
+                {
+                    ++abWindows;
+                    const bool next = ((abWindows / 2u) & 1u) != 0u;
+                    native_renderer::Tuning &t = native_renderer::tuning();
+                    if (abMask & 1)
+                        t.sacParticles = next;
+                    if (abMask & 4)
+                        t.sacLod = next;
+                }
+                // Round 130: the window's line made on the log thread (the same text from the same sums).
+                if (log76::Line *sumLine = offThread ? log76::slot() : nullptr)
+                {
+                    sumLine->kind = 1;
+                    sumLine->sum = sum;
+                    sumLine->cpuFrames = cpuFrames;
+                    sumLine->frame = (unsigned long long)g_frame;
+                    sumLine->gfx = native_renderer::gfxPresetNow();
+                    log76::post();
+                    cpuFrames = 0;
+                    sum = Sum{};
+                    goto summed;
+                }
+                const double n = 60.0, game = (static_cast<double>(sum.period) - sum.hooks - sum.blocked) / n / 1000.0;
+                char avgSplit[640];
+                int at = std::snprintf(avgSplit, sizeof(avgSplit), " lag %.0f us max %.2f", sum.jobCount ? sum.lag / static_cast<double>(sum.jobCount) : 0.0, sum.lagMax / 1000.0);
+                splits(sum.sync, sum.site, n, avgSplit + at, sizeof(avgSplit) - at);
+                at = static_cast<int>(std::strlen(avgSplit));
+                if (!offThread) // (a full ring with log76: no cpu column, the log thread owns the run clocks)
+                    native_renderer::threads::line(avgSplit + at, sizeof(avgSplit) - at, static_cast<double>(cpuFrames), true);
+                at = static_cast<int>(std::strlen(avgSplit));
+                std::snprintf(avgSplit + at, sizeof(avgSplit) - at, " | gfx %s", native_renderer::presetName(native_renderer::gfxPresetNow())); // round 124
+                cpuFrames = 0;
+                native_renderer::logf( "[frame] %llu: %.1f ms (%.1f fps, slowest %.1f) | game %.1f hooks %.1f (decode %.2f tex up %.2f mesh up %.2f) render %.1f present %.1f wait %.1f%s | "
+                             "draws %.0f targets %.1f textures %.2f (%.0f KB) meshes %.0f (%.0f KB) | jobs %.1f join %.1f | held %llu (terrain %llu) pictures held %llu%s\n",
+                             (unsigned long long)g_frame, sum.period / n / 1000.0, n * 1e6 / static_cast<double>(sum.period), sum.worst / 1000.0, game, sum.hooks / n / 1000.0,
+                             sum.decode / n / 1000.0, sum.tex / n / 1000.0, sum.mesh / n / 1000.0, sum.render / n / 1000.0, sum.present / n / 1000.0,
+                             sum.wait / n / 1000.0, sum.threaded ? " (render thread)" : "",
+                             sum.draws / n, sum.targets / n, sum.texUploads / n, sum.texBytes / n / 1024.0, sum.meshUploads / n, sum.meshBytes / n / 1024.0,
+                             sum.jobs / n / 1000.0, sum.join / n / 1000.0, (unsigned long long)sum.held, (unsigned long long)sum.heldTerrain,
+                             (unsigned long long)sum.heldPictures, avgSplit);
+                sum = Sum{};
+            }
+            else if (sum.frames >= 60u)
+                sum = Sum{};
+        summed:;
+        }
+        static const bool hashStats = ps2_diag::env("SOTC_HASH_STATS") != nullptr;
+        if (hashStats && g_hashBytes[0] + g_hashBytes[1] > 65536u)
+            native_renderer::logf( "[hash] frame %llu: packets %llu (%.0f KB), textures %llu (%.0f KB); memos carried by moves %llu, ids kept %llu\n", (unsigned long long)g_frame,
+                         (unsigned long long)g_hashCalls[0], g_hashBytes[0] / 1024.0, (unsigned long long)g_hashCalls[1], g_hashBytes[1] / 1024.0,
+                         (unsigned long long)g_rekeyed, (unsigned long long)g_rekeyHits);
+        if (hashStats)
+            g_rekeyed = g_rekeyHits = 0;
+        g_hashBytes[0] = g_hashBytes[1] = g_hashCalls[0] = g_hashCalls[1] = 0;
+        {
+            // The scene recorder (round 25): this frame's split, as the log has it.
+            native_recorder::FrameInfo info;
+            info.gameFrame = g_frame;
+            info.vblank = mark.vblanks;
+            info.timeUs = now;
+            info.periodUs = last ? now - last : 0u;
+            info.hookUs = c.hookUs, info.decodeUs = c.decodeUs, info.texUs = c.texUs, info.meshUs = c.meshUs, info.renderUs = c.renderUs;
+            info.presentUs = c.presentUs, info.waitUs = c.waitUs, info.jobUs = c.jobUs, info.joinUs = c.joinUs;
+            info.draws = c.draws, info.targets = c.targets, info.texUploads = c.texUploads, info.meshUploads = c.meshUploads, info.heldDraws = c.heldDraws;
+            info.asyncJobs = c.asyncJobs, info.asyncDone = c.asyncDone, info.jobs = c.jobs, info.texBytes = c.texBytes, info.meshBytes = c.meshBytes;
+            info.schedWaitUs = mark.wait - lastMark.wait, info.cdUs = mark.cdUs - lastMark.cdUs, info.cdBytes = mark.cdBytes - lastMark.cdBytes;
+            info.cdReads = mark.cdReads - lastMark.cdReads, info.vblanks = mark.vblanks - lastMark.vblanks;
+            info.gameDt = gameDt;
+            info.renderThread = c.renderThread;
+            // bossDeathEffect 0x1186290..0x11862cc, depthOfField 0x11862d0..0x11862ec
+            if (g_ram)
+                for (uint32_t i = 0; i < 24u; ++i)
+                    std::memcpy(&info.guestWords[i], g_ram + 0x1186290u + i * 4u, 4);
+            native_recorder::frameInfo(info, hostmenu::isOpen());
+        }
+        last = now;
+        lastMark = mark;
+        c = {};
+    }
+
+    // The sound continuity log (round 12; SOTC_FRAME_LOG=1 or SOTC_AUDIO_LOG=1,
+    // ps2x/iop/audio_stats.h): every 5 s of host time one "[audio]" line with
+    // the window's counts. Each frame it also looks at the loader's job queues
+    // (manager_sub_0115E3E0 takes one job a game frame from five FIFO lists,
+    // heads 0x12228b0 + 8 i, links at +0x2c, job type at +0; the sound
+    // streams' reads are type 7, queued on list 0 by sheetMgrAdpcmIntLoad;
+    // the running job at 0x118fe34): how many are waiting, and how long a
+    // stream read waited to start (first seen queued -> gone from the lists).
+    // The [loader] line (round 14, with the [audio] one): the console's ~50 s
+    // with the loader busy and no disc reads after a colossus (console-r13).
+    // Per frame: the running job (0x118fe34: its node, type +0) and how long
+    // it has run, guest thread 11's (the loader's) status by frame and its
+    // commonest pc / ra; every 5 s with the [audio] line: the garbage pass's
+    // counts (calls, stopped by its clock, moves, MB) and the heap the pass
+    // walks (0x1e0bf4: blocks, free bytes, the largest free block).
+    struct LoaderLog
+    {
+        uint32_t job = 0, jobType = 0;
+        uint64_t jobSince = 0, jobLongestUs = 0;
+        uint32_t longestJob = 0, longestType = 0;
+        uint64_t status[8] = {}; // thread 11's frames by EeThreadStatus (7: not found)
+        uint64_t reasons[8] = {}; // its waiting frames by EeWaitReason
+        std::unordered_map<uint64_t, uint32_t> where; // (pc << 32 | ra) -> frames
+        sotc_decomp::GcStats gc0;
+    };
+    LoaderLog g_loaderLog;
+    // The kernel's message boxes (iosSendMsg 0x1b0fc0 / iosRecvMsg 0x1b1138,
+    // hooked with the [loader] line on, round 14): a box is {+0 slots, +4
+    // capacity, +8 count, +0xc write index, ..., +0x18 waiting senders}; a
+    // blocking send (a2 = 1) to a full box sleeps the sender until a receive.
+    // The Vita3K 333 MHz route (r14/v10-333) shows the loader asleep 15 s in
+    // iosSendMsg with its job queue piling up, as the console's ~50 s.
+    struct MsgBox
+    {
+        uint64_t sends = 0, fullSends = 0, recvs = 0, emptyRecvs = 0, lastRecvUs = 0, lastFullUs = 0;
+        int lastSender = -1, lastReceiver = -1;
+        uint32_t lastMsg = 0;
+    };
+    std::unordered_map<uint32_t, MsgBox> g_msgBoxes;
+    PS2Runtime::RecompiledFunction g_sendMsg = nullptr, g_recvMsg = nullptr;
+    void sendMsgHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_ram != rdram) // (before the first frame too)
+            g_ram = rdram;
+        const uint32_t box = GPR_U32(ctx, 4);
+        if ((box & 0xFE000003u) == 0u && box)
+        {
+            MsgBox &b = g_msgBoxes[box];
+            ++b.sends;
+            b.lastSender = runtime->eeScheduler().currentThreadId();
+            b.lastMsg = GPR_U32(ctx, 5);
+            if (static_cast<int32_t>(word(box + 8u)) >= static_cast<int32_t>(word(box + 4u)))
+            {
+                ++b.fullSends;
+                b.lastFullUs = native_renderer::nowUs();
+            }
+        }
+        g_sendMsg(rdram, ctx, runtime);
+    }
+    void recvMsgHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_ram != rdram)
+            g_ram = rdram;
+        const uint32_t box = GPR_U32(ctx, 4);
+        if ((box & 0xFE000003u) == 0u && box)
+        {
+            MsgBox &b = g_msgBoxes[box];
+            ++b.recvs;
+            b.emptyRecvs += word(box + 8u) == 0u;
+            b.lastRecvUs = native_renderer::nowUs();
+            b.lastReceiver = runtime->eeScheduler().currentThreadId();
+        }
+        g_recvMsg(rdram, ctx, runtime);
+    }
+    void loaderFrame(uint64_t now)
+    {
+        LoaderLog &l = g_loaderLog;
+        const uint32_t job = word(0x118fe34u);
+        const uint32_t type = (job & 0xFE000003u) == 0u && job ? word(job) : 0u;
+        if (job != l.job || type != l.jobType)
+        {
+            l.job = job;
+            l.jobType = type;
+            l.jobSince = now;
+        }
+        if (job && now - l.jobSince > l.jobLongestUs)
+        {
+            l.jobLongestUs = now - l.jobSince;
+            l.longestJob = job;
+            l.longestType = type;
+        }
+        if (!g_runtimeForLog)
+            return;
+        const EeKernelSnapshot snap = g_runtimeForLog->eeScheduler().snapshot();
+        int found = 7;
+        for (const EeThreadSnapshot &t : snap.threads)
+            if (t.id == 11)
+            {
+                found = static_cast<int>(t.status) & 7;
+                if (t.status == EeThreadStatus::Waiting || t.status == EeThreadStatus::WaitingSuspended)
+                    ++l.reasons[static_cast<int>(t.waitReason) & 7];
+                if (job)
+                    ++l.where[(static_cast<uint64_t>(t.pc) << 32) | t.ra];
+                break;
+            }
+        ++l.status[found];
+    }
+    void loaderReport(uint64_t now)
+    {
+        LoaderLog &l = g_loaderLog;
+        std::string line = "[loader] frame " + std::to_string(g_frame);
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), ": job %08x type %u for %.1f s, longest %08x type %u %.1f s | t11 run %llu ready %llu wait %llu (sema %llu flag %llu vsync %llu ext %llu sleep %llu) susp %llu dormant %llu none %llu",
+                      l.job, l.jobType, l.job ? (now - l.jobSince) / 1e6 : 0.0, l.longestJob, l.longestType, l.jobLongestUs / 1e6,
+                      (unsigned long long)l.status[0], (unsigned long long)l.status[1], (unsigned long long)(l.status[2] + l.status[3]),
+                      (unsigned long long)l.reasons[2], (unsigned long long)l.reasons[3], (unsigned long long)l.reasons[4], (unsigned long long)l.reasons[5],
+                      (unsigned long long)l.reasons[1], (unsigned long long)l.status[4], (unsigned long long)l.status[5], (unsigned long long)l.status[7]);
+        line += buf;
+        {
+            namespace as = ps2x::iop::audio_stats;
+            const uint64_t since = as::cdPendingSinceUs.load(std::memory_order_relaxed), b = as::cdPendingBytes.load(std::memory_order_relaxed);
+            if (since)
+            {
+                std::snprintf(buf, sizeof(buf), " | cd read in flight %.1f s (%llu KB%s)", now > since ? (now - since) / 1e6 : 0.0,
+                              (unsigned long long)((b & ~(1ull << 63)) >> 10), (b >> 63) ? " iop" : "");
+                line += buf;
+            }
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> top;
+        for (const auto &[k, n] : l.where)
+            top.emplace_back(n, k);
+        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        for (size_t i = 0; i < top.size() && i < 3u; ++i)
+        {
+            std::snprintf(buf, sizeof(buf), " | pc %08x ra %08x x%u", static_cast<uint32_t>(top[i].second >> 32), static_cast<uint32_t>(top[i].second), top[i].first);
+            line += buf;
+        }
+        const sotc_decomp::GcStats &g = sotc_decomp::g_gcStats;
+        std::snprintf(buf, sizeof(buf), " | gc calls %llu stopped %llu (at once %llu, budget %llu, past clock %llu) blocks %llu moves %llu %.1f MB, elapsed last %lld max %lld",
+                      (unsigned long long)(g.calls - l.gc0.calls), (unsigned long long)(g.stopped - l.gc0.stopped),
+                      (unsigned long long)(g.stoppedAtOnce - l.gc0.stoppedAtOnce), (unsigned long long)(g.budgetStops - l.gc0.budgetStops),
+                      (unsigned long long)(g.budgetGoes - l.gc0.budgetGoes), (unsigned long long)(g.blocks - l.gc0.blocks),
+                      (unsigned long long)(g.moves - l.gc0.moves), (g.bytes - l.gc0.bytes) / 1048576.0, (long long)g.lastElapsed, (long long)g.maxElapsed);
+        line += buf;
+        // Message boxes full in this window, or full now.
+        for (auto &[box, b] : g_msgBoxes)
+        {
+            const int32_t count = static_cast<int32_t>(word(box + 8u)), cap = static_cast<int32_t>(word(box + 4u));
+            if (!b.fullSends && count < cap)
+                continue;
+            std::snprintf(buf, sizeof(buf), " | box %08x %d/%d waiting %08x: sends %llu (full %llu, last t%d msg %08x), recvs %llu (empty %llu, last t%d %.1f s ago)", box, count,
+                          cap, word(box + 0x18u), (unsigned long long)b.sends, (unsigned long long)b.fullSends, b.lastSender, b.lastMsg,
+                          (unsigned long long)b.recvs, (unsigned long long)b.emptyRecvs, b.lastReceiver, b.lastRecvUs ? (now - b.lastRecvUs) / 1e6 : -1.0);
+            line += buf;
+            // A sender asleep on it: who receives, and what that thread does.
+            if (word(box + 0x18u) != 0u && b.lastReceiver >= 0 && g_runtimeForLog)
+                for (const EeThreadSnapshot &t : g_runtimeForLog->eeScheduler().snapshot().threads)
+                    if (t.id == b.lastReceiver)
+                    {
+                        std::snprintf(buf, sizeof(buf), " (receiver t%d status %d wait %d id %d pc %08x ra %08x prio %d)", t.id, static_cast<int>(t.status),
+                                      static_cast<int>(t.waitReason), t.waitId, t.pc, t.ra, t.currentPriority);
+                        line += buf;
+                    }
+            b.sends = b.fullSends = b.recvs = b.emptyRecvs = 0;
+        }
+        // The pass's heap: its block list, as decomp_gctick walks it.
+        {
+            uint32_t b = (word(word(0x001E0BF4u) + 8u) & 0xFFFFFFu) << 2, blocks = 0, freeBlocks = 0, tail = 0;
+            uint64_t freeBytes = 0, largest = 0;
+            while (b != 0u && blocks < 65536u)
+            {
+                const uint32_t next = (word(b + 8u) & 0xFFFFFFu) << 2;
+                ++blocks;
+                if (!(g_ram[(b + 0xFu) & 0x1FFFFFFu] & 1u) && next != 0u)
+                {
+                    const uint64_t size = next > b ? next - b : b - next;
+                    ++freeBlocks;
+                    freeBytes += size;
+                    largest = std::max<uint64_t>(largest, size);
+                }
+                tail = b;
+                b = next;
+            }
+            std::snprintf(buf, sizeof(buf), " | heap blocks %u free %u (%.0f KB, largest %.0f KB), last %08x %s", blocks, freeBlocks, freeBytes / 1024.0,
+                          largest / 1024.0, tail, tail && (g_ram[(tail + 0xFu) & 0x1FFFFFFu] & 1u) ? "used" : "free");
+            line += buf;
+        }
+        // A job running over 5 s: its node's first 0x40 bytes and the loader's
+        // waits (once a report while it lasts).
+        if (l.job && (l.job & 0xFE000003u) == 0u && now - l.jobSince > 5000000u)
+        {
+            line += " | job words";
+            for (uint32_t i = 0; i < 0x40u; i += 4u)
+            {
+                std::snprintf(buf, sizeof(buf), " %08x", word(l.job + i));
+                line += buf;
+            }
+            if (g_runtimeForLog)
+            {
+                // Every thread (id:status/wait reason@pc,ra), the loader's in full below.
+                line += " | threads";
+                for (const EeThreadSnapshot &t : g_runtimeForLog->eeScheduler().snapshot().threads)
+                {
+                    std::snprintf(buf, sizeof(buf), " t%d:%d/%d@%08x,%08x", t.id, static_cast<int>(t.status), static_cast<int>(t.waitReason), t.pc, t.ra);
+                    line += buf;
+                }
+            }
+            if (g_runtimeForLog)
+                for (const EeThreadSnapshot &t : g_runtimeForLog->eeScheduler().snapshot().threads)
+                    if (t.id == 11)
+                    {
+                        std::snprintf(buf, sizeof(buf), " | t11 now status %d wait %d id %d pc %08x ra %08x sp %08x prio %d", static_cast<int>(t.status),
+                                      static_cast<int>(t.waitReason), t.waitId, t.pc, t.ra, t.sp, t.currentPriority);
+                        line += buf;
+                    }
+        }
+        native_renderer::logf( "%s\n", line.c_str());
+        const uint32_t job = l.job, type = l.jobType;
+        const uint64_t since = l.jobSince;
+        l = LoaderLog{};
+        l.job = job;
+        l.jobType = type;
+        l.jobSince = since;
+        l.gc0 = g;
+        sotc_decomp::g_gcStats.maxElapsed = 0;
+    }
+    void audioLog()
+    {
+        namespace as = ps2x::iop::audio_stats;
+        if (!as::level() || !g_ram)
+            return;
+        const uint64_t now = native_renderer::nowUs();
+        struct Waiting
+        {
+            uint64_t since;
+            bool seen;
+        };
+        static std::unordered_map<uint32_t, Waiting> waiting; // queued type-7 jobs by node address
+        static uint64_t frames = 0, queueMax = 0, adpcmMax = 0, adpcmWaitMaxUs = 0, adpcmWaitUs = 0, adpcmJobs = 0, busyFrames = 0;
+        ++frames;
+        {
+            for (auto &[node, w] : waiting)
+                w.seen = false;
+            uint64_t queued = 0, adpcm = 0;
+            for (uint32_t list = 0; list < 5u; ++list)
+            {
+                uint32_t node = word(0x12228b0u + list * 8u);
+                for (int guard = 0; node != 0u && guard < 256; ++guard)
+                {
+                    if ((node & 0xFE000003u) != 0u)
+                        break;
+                    ++queued;
+                    if (word(node) == 7u)
+                    {
+                        ++adpcm;
+                        auto [it, fresh] = waiting.try_emplace(node, Waiting{now, true});
+                        it->second.seen = true;
+                    }
+                    node = word(node + 0x2cu);
+                }
+            }
+            for (auto it = waiting.begin(); it != waiting.end();)
+            {
+                if (!it->second.seen)
+                {
+                    const uint64_t waited = now - it->second.since;
+                    adpcmWaitMaxUs = std::max(adpcmWaitMaxUs, waited);
+                    adpcmWaitUs += waited;
+                    ++adpcmJobs;
+                    it = waiting.erase(it);
+                }
+                else
+                    ++it;
+            }
+            queueMax = std::max(queueMax, queued);
+            adpcmMax = std::max(adpcmMax, adpcm);
+            if (word(0x118fe34u) != 0u)
+                ++busyFrames;
+        }
+        loaderFrame(now);
+        struct Totals
+        {
+            uint64_t status, gaps50, refills, halves, stale, staleSrc, stalls, stallUs, starts, stops, stopsStalled, keyOns, keyOffs, ends, retrig;
+            uint64_t pcmStarts, pcmUnder, pcmStale, pcmBlocks, callbacks, cbFrames, cbLate, mixUs, iopReads, iopUs, otherReads, wakeUs, vblanks, cacheHits, cacheBytes;
+        };
+        auto take = []
+        {
+            auto l = [](const std::atomic<uint64_t> &a) { return a.load(std::memory_order_relaxed); };
+            return Totals{l(as::status), l(as::statusGapsOver50), l(as::refills), l(as::halves), l(as::staleHalves), l(as::staleSources), l(as::stalls),
+                          l(as::stallUs), l(as::streamStarts), l(as::streamStops), l(as::stopsWhileStalled), l(as::keyOns), l(as::keyOffs), l(as::dataEnds),
+                          l(as::retriggers), l(as::pcmStarts), l(as::pcmUnderFrames), l(as::pcmStaleBlocks), l(as::pcmBlocks), l(as::callbacks),
+                          l(as::callbackFrames), l(as::callbacksLate), l(as::mixUs), l(as::iopReads), l(as::iopReadUs), l(as::otherReads), l(as::wakeUs),
+                          ps2_stats::vblanks.load(std::memory_order_relaxed), l(as::cacheHits), l(as::cacheBytes)};
+        };
+        static uint64_t last = now;
+        static Totals before = take();
+        // The VBlank thread's ticks (getVIntrCnt 0x1e1314) and the sound
+        // ticks (soundTickProcCnt 0x1e1564): one each a guest VBlank.
+        static uint32_t ticksBefore = word(0x1e1314u), soundBefore = word(0x1e1564u);
+        if (now - last < 5000000u)
+            return;
+        const uint32_t ticks = word(0x1e1314u), sound = word(0x1e1564u);
+        {
+            static uint64_t v0 = 0, c0 = 0, vb0 = 0, mb0 = 0;
+            const uint64_t v = as::voiceUs.load(std::memory_order_relaxed), c = as::coreUs.load(std::memory_order_relaxed),
+                           vb = as::voiceBlocks.load(std::memory_order_relaxed), mb = as::mixBlocks.load(std::memory_order_relaxed);
+            static uint64_t r0 = 0, l0 = 0;
+            const uint64_t r = as::rpcUs.load(std::memory_order_relaxed), l = as::rpcLockUs.load(std::memory_order_relaxed);
+            // Round 90: the reverb's 24 kHz steps per core, worked out / skipped (idle).
+            static uint64_t s0[2] = {}, i0[2] = {}, o0[2] = {}, f0[2] = {};
+            uint64_t st[2], id[2], ld[2], fd[2];
+            uint32_t qm[2], qw[2];
+            for (int k = 0; k < 2; ++k)
+                st[k] = as::reverbSteps[k].load(std::memory_order_relaxed), id[k] = as::reverbIdle[k].load(std::memory_order_relaxed),
+                ld[k] = as::reverbLoud[k].load(std::memory_order_relaxed), fd[k] = as::reverbFed[k].load(std::memory_order_relaxed),
+                qm[k] = as::reverbQuietMax[k].exchange(0, std::memory_order_relaxed), qw[k] = as::reverbQuietWordMax[k].exchange(0, std::memory_order_relaxed);
+            native_renderer::logf( "[audio-ticks] vblank thread %u sound %u | mix voices %.1f ms cores %.1f ms, %.1f voices playing | driver %.1f ms (lock wait %.1f) | reverb steps %llu/%llu (not silent %llu/%llu, fed %llu/%llu, unfed max return %u/%u word %u/%u) idle %llu/%llu cleared %llu/%llu (areas %x-%x%s %x-%x%s%s) | mix90 v%d c%d f%d\n",
+                         ticks - ticksBefore, sound - soundBefore, (v - v0) / 1000.0, (c - c0) / 1000.0, mb > mb0 ? double(vb - vb0) / double(mb - mb0) : 0.0,
+                         (r - r0) / 1000.0, (l - l0) / 1000.0, (unsigned long long)(st[0] - s0[0]), (unsigned long long)(st[1] - s0[1]),
+                         (unsigned long long)(ld[0] - o0[0]), (unsigned long long)(ld[1] - o0[1]), (unsigned long long)(fd[0] - f0[0]), (unsigned long long)(fd[1] - f0[1]),
+                         qm[0], qm[1], qw[0], qw[1], (unsigned long long)(id[0] - i0[0]), (unsigned long long)(id[1] - i0[1]),
+                         (unsigned long long)as::reverbFlushes[0].exchange(0, std::memory_order_relaxed), (unsigned long long)as::reverbFlushes[1].exchange(0, std::memory_order_relaxed),
+                         as::reverbStart[0].load(std::memory_order_relaxed), as::reverbEnd[0].load(std::memory_order_relaxed), as::reverbOnNow[0].load(std::memory_order_relaxed) ? " on" : "",
+                         as::reverbStart[1].load(std::memory_order_relaxed), as::reverbEnd[1].load(std::memory_order_relaxed), as::reverbOnNow[1].load(std::memory_order_relaxed) ? " on" : "",
+                         as::reverbShared.load(std::memory_order_relaxed) ? ", shared" : "", as::mix90Voice() ? 1 : 0, as::mix90Core() ? 1 : 0, as::mix90Flush() ? 1 : 0);
+            for (int k = 0; k < 2; ++k)
+                s0[k] = st[k], i0[k] = id[k], o0[k] = ld[k], f0[k] = fd[k];
+            v0 = v; c0 = c; vb0 = vb; mb0 = mb; r0 = r; l0 = l;
+        }
+        ticksBefore = ticks;
+        soundBefore = sound;
+        const Totals t = take();
+        auto d = [&](uint64_t Totals::*f) { return static_cast<unsigned long long>(t.*f - before.*f); };
+        auto mx = [](std::atomic<uint64_t> &a) { return a.exchange(0, std::memory_order_relaxed) / 1000.0; };
+        const double secs = (now - last) / 1e6;
+        const unsigned long long cb = d(&Totals::callbacks);
+        native_renderer::logf(
+                     "[audio] %.1f s frame %llu: frames %llu vb %llu | status %llu (gap max %.1f ms, %llu over 50) | streams start %llu stop %llu (%llu paused) pause %llu (%.0f ms, max %.0f)"
+                     " halves %llu stale %llu src-stale %llu refills %llu (wait max %.1f ms) | voices on %llu off %llu ends %llu retrig %llu | pcm start %llu blocks %llu stale %llu under %llu"
+                     " | out cb %llu (%.0f fr) late %llu gap max %.1f ms mix %.2f / max %.2f ms lock max %.2f | cd iop %llu (avg %.1f max %.1f ms) other %llu (max %.1f) wake avg %.2f max %.1f ms cache %llu (%.0f KB)"
+                     " | jobs queued max %llu adpcm max %llu, adpcm waits %llu (avg %.0f max %.0f ms), loader busy %llu frames\n",
+                     secs, (unsigned long long)g_frame, (unsigned long long)frames, d(&Totals::vblanks), d(&Totals::status), mx(as::statusGapMaxUs),
+                     d(&Totals::gaps50), d(&Totals::starts), d(&Totals::stops), d(&Totals::stopsStalled), d(&Totals::stalls), d(&Totals::stallUs) / 1000.0,
+                     mx(as::stallMaxUs), d(&Totals::halves), d(&Totals::stale), d(&Totals::staleSrc), d(&Totals::refills), mx(as::refillWaitMaxUs),
+                     d(&Totals::keyOns), d(&Totals::keyOffs), d(&Totals::ends), d(&Totals::retrig), d(&Totals::pcmStarts), d(&Totals::pcmBlocks),
+                     d(&Totals::pcmStale), d(&Totals::pcmUnder), cb, cb ? double(d(&Totals::cbFrames)) / cb : 0.0, d(&Totals::cbLate), mx(as::callbackGapMaxUs),
+                     cb ? d(&Totals::mixUs) / 1000.0 / cb : 0.0, mx(as::mixMaxUs), mx(as::lockWaitMaxUs), d(&Totals::iopReads),
+                     d(&Totals::iopReads) ? d(&Totals::iopUs) / 1000.0 / d(&Totals::iopReads) : 0.0, mx(as::iopReadMaxUs), d(&Totals::otherReads),
+                     mx(as::otherReadMaxUs), (d(&Totals::iopReads) + d(&Totals::otherReads)) ? d(&Totals::wakeUs) / 1000.0 / (d(&Totals::iopReads) + d(&Totals::otherReads)) : 0.0,
+                     mx(as::wakeMaxUs), d(&Totals::cacheHits), d(&Totals::cacheBytes) / 1024.0, (unsigned long long)queueMax, (unsigned long long)adpcmMax,
+                     (unsigned long long)adpcmJobs, adpcmJobs ? adpcmWaitUs / 1000.0 / adpcmJobs : 0.0, adpcmWaitMaxUs / 1000.0, (unsigned long long)busyFrames);
+        loaderReport(now);
+        last = now;
+        before = t;
+        frames = queueMax = adpcmMax = adpcmWaitMaxUs = adpcmWaitUs = adpcmJobs = busyFrames = 0;
+    }
+
+    // PGO on the Vita: the VitaSDK's libgcov has no file I/O (built without
+    // libc), so a build made with -fprofile-generate -fprofile-info-section=
+    // gcov_info (-fno-profile-values -fno-profile-reorder-functions: its
+    // value profilers are empty) writes its .gcda files here, through
+    // __gcov_info_to_gcda, each to the name compiled in (ux0:...).
+    // SOTC_GCOV_DUMP_FRAME=<n>: written at frame n and every n frames after
+    // (the counts so far; the last write wins). No-op in other builds.
+#ifdef PLATFORM_VITA
+    extern "C"
+    {
+        struct gcov_info;
+        extern const gcov_info *const __start_gcov_info[] __attribute__((weak));
+        extern const gcov_info *const __stop_gcov_info[] __attribute__((weak));
+        void __gcov_info_to_gcda(const gcov_info *, void (*)(const char *, void *), void (*)(const void *, unsigned, void *),
+                                 void *(*)(unsigned, void *), void *) __attribute__((weak));
+    }
+    void gcovDump(uint64_t frame)
+    {
+        static const uint64_t every = std::getenv("SOTC_GCOV_DUMP_FRAME") ? std::strtoull(std::getenv("SOTC_GCOV_DUMP_FRAME"), nullptr, 10) : 0u;
+        if (!every || frame % every != 0u || !__gcov_info_to_gcda || !__start_gcov_info)
+            return;
+        size_t files = 0;
+        for (const gcov_info *const *info = __start_gcov_info; info != __stop_gcov_info; ++info)
+        {
+            std::FILE *file = nullptr;
+            __gcov_info_to_gcda(
+                *info,
+                [](const char *name, void *arg)
+                {
+                    std::FILE *&f = *static_cast<std::FILE **>(arg);
+                    std::string dir(name);
+                    dir.resize(dir.find_last_of('/') == std::string::npos ? 0u : dir.find_last_of('/'));
+                    if (!dir.empty())
+                        mkdir(dir.c_str(), 0777);
+                    f = std::fopen(name, "wb");
+                },
+                [](const void *data, unsigned size, void *arg)
+                {
+                    if (std::FILE *f = *static_cast<std::FILE **>(arg))
+                        std::fwrite(data, 1, size, f);
+                },
+                [](unsigned size, void *) -> void * { return std::malloc(size); }, &file);
+            if (file)
+            {
+                std::fclose(file);
+                ++files;
+            }
+        }
+        std::fprintf(stderr, "[gcov] frame %llu: %u .gcda files written\n", static_cast<unsigned long long>(frame), static_cast<unsigned>(files));
+    }
+#else
+    void gcovDump(uint64_t) {}
+#endif
+
+    // ---- The model draws off the game thread (round 23) ----------------------
+    //
+    // modelDispHook's host part after the game's own results (modelDispState,
+    // the part test): the packet walk, ids, builds, palettes, skinning, the
+    // draws. Nothing of it is seen by the game (no guest write, no register):
+    // it goes to a worker thread of its own as a job (ModelDispJob) and the
+    // game thread goes on. What it reads of guest memory is what the PS2's
+    // DMA reads at the display list's kick (the model's packets, surfaces,
+    // textures, the instance's chain: palette and lights), which the game
+    // leaves as it is until then; what the game changes from one draw to the
+    // next (the instance's opacity and LOD, the part tree's +0x2c results
+    // modelDispState writes for this instance, the camera context's
+    // matrices, the ripple globals) is taken at the hook, into the job.
+    // The jobs run in their order; the game thread waits for them (hookJoin)
+    // before anything else touches what they use: the other hooks that draw
+    // or read the jobs' state (2D, cloth, shadows, particles, effects, fog),
+    // a new frame (syncFrame), the kick (kickHook: skinAtKick reads their
+    // records), a garbage move (copyViaSpr: the memos by address). So the
+    // draws reach the renderer in the same order as before.
+    // modelDispState keeps a surface memo of its own (g_surfaceInfoSync) while
+    // jobs run; the prefetch queue stays the game thread's.
+    // SOTC_HOOK_ASYNC=0 / 1 (Debug "Model draws on a worker"; default on on
+    // the Vita, off on the Mac). Off whenever a debugging check runs (the
+    // draw taps, the subsystem profiler, the checks below, SOTC_DIFFTEST).
+    // SOTC_HOOK_ASYNC_VERIFY=1: each job's inputs hashed at the hook and again
+    // when it runs ([hookjob] line every 600 frames: jobs, inputs changed).
+    struct ModelPlan;
+    struct ModelDispJob
+    {
+        uint32_t instance = 0, matrix = 0, header = 0, table = 0, lod = 0, gameLod = 0;
+        // Round 34 (SOTC_KICK_DEFER): what the game changes between the kick
+        // and the next frame's first hook, taken at the hook: the instance's
+        // chain (+0xc, double-buffered by frame), the mip K scale *0x118c180,
+        // the texture scroll rows of the plan's surfaces.
+        uint32_t own = 0;
+        float lodScale = 0.0f;
+        bool scrollsTaken = false; // scrolls hold every row of the plan's surfaces
+        std::vector<ScrollRow> scrolls;
+        bool fading = false, partCulled = false, planOn = false;
+        float opacity = 1.0f;
+        float clip[16] = {}, projection[16] = {};
+        float ripple[2] = {};
+        ModelPlan *plan = nullptr;
+        std::vector<uint8_t> partVisible;
+        // The instance's palette and lights as they are at the hook (as the
+        // hook read them before round 23: the draws are made with these;
+        // skinAtKick takes the kick's palette after, as before).
+        bool hasPalette = false, haveLights = false;
+        uint32_t paletteLo = 0, paletteHi = 0;
+        std::vector<float> palette; // qwords paletteLo..paletteHi
+        // Round 61 (SOTC_MDS_LANE): the state made on the lane (lane seq; the
+        // worker waits for it, takes the parts and skips a model the lane
+        // found out of view); paletteDeferred: lo / hi resolved by the worker
+        // (the last palette carried in the jobs' order).
+        bool lane = false, paletteDeferred = false;
+        uint64_t laneSeq = 0;
+        float lights[32] = {};
+        uint64_t inputs = 0; // SOTC_HOOK_ASYNC_VERIFY: the inputs' hash at the hook
+        uint64_t runInputs = 0; // round 32: what the job itself reads of guest memory, hashed at the hook (modelRunInputs)
+    };
+    void modelDispDraw(const ModelDispJob &job, bool onWorker);
+    uint64_t modelDispInputs(const ModelDispJob &job);
+    uint64_t modelRunInputs(const ModelDispJob &job);
+    ModelDispJob g_syncJob; // the job when it runs at once
+    // The last palette's lo / hi (a model without one draws with them): the
+    // hook's, or with the lane on the worker's in the jobs' order (round 61).
+    uint32_t g_palLastLo = 0, g_palLastHi = 0;
+    // The other hooks' host parts, as jobs too (they draw after the models'
+    // in the same order): cloth (meshDisp), shadow volumes (shadowDisp),
+    // particles (ptclVtx).
+    struct MeshDispJob
+    {
+        uint32_t object = 0, header = 0, layer = 0, rows = 0, columns = 0, buffer = 0;
+        float camera[16] = {}, projection[16] = {};
+        std::vector<uint8_t> grid; // the current buffer's bytes at the hook (view matrix, vertices)
+    };
+    struct ShadowDispJob
+    {
+        uint32_t chain = 0, model = 0;
+        bool skinned = false;
+        float projection[16] = {};
+        float rigid[16] = {}, extrude[3] = {};
+        uint32_t paletteLo = 0, paletteHi = 0;
+        std::vector<float> palette; // the bone palette at the hook (skinned)
+    };
+    struct ParticleEnv;
+    struct PtclVtxJob
+    {
+        uint32_t count = 0, header = 0, layer = 0, blend = 0;
+        float camera[16] = {}, eye[3] = {};
+        std::vector<uint8_t> env;  // the ParticleEnv then (its bytes)
+        std::vector<float> data; // the particles (12 words each)
+    };
+    void meshDispDraw(const MeshDispJob &job);
+    void shadowDispDraw(const ShadowDispJob &job);
+    void ptclVtxDraw(const PtclVtxJob &job, const ParticleEnv &e);
+    // Round 28: a 2D batch of glEnd's immediate path (no texture), drawn on
+    // the worker after the jobs before it instead of a join (flush2D).
+    struct Draw2DJob
+    {
+        std::vector<native_renderer::Vertex> batch;
+        native_renderer::DrawState state;
+        // Round 32: a textured batch's texture is looked up by the job
+        // (texture(), in the jobs' order, as the cloth's and the particles'
+        // jobs do theirs); SOTC_HOOK_ASYNC_VERIFY: its bytes' hash at the hook.
+        bool textured = false;
+        uint32_t textureHeader = 0;
+        uint64_t textureBytes = 0;
+    };
+    void draw2DRun(Draw2DJob &job);
+    enum : uint8_t
+    {
+        kJobModel,
+        kJobMesh,
+        kJobShadow,
+        kJobPtcl,
+        kJob2D,
+        kJobKick // round 34: skinAtKick on the kick's palettes (SOTC_KICK_DEFER)
+    };
+    struct HookJob
+    {
+        uint8_t kind = kJobModel;
+        ModelDispJob model;
+        MeshDispJob mesh;
+        ShadowDispJob shadow;
+        PtclVtxJob ptcl;
+        Draw2DJob draw2d;
+        uint32_t kick = 0; // round 34: its KickJob (g_kickJobs; not one a ring slot, which would keep every palette's room)
+    };
+    void runJob(HookJob &job);
+    // SOTC_HOOK_ASYNC_VERIFY: a hash of everything a job took at the hook
+    // (made at the hand-over and again when the worker takes it up: any
+    // difference is the job seeing other inputs than the hook's).
+    uint64_t jobCopyHash(const HookJob &job);
+
+    namespace hookjobs
+    {
+        bool g_on = false;  // this frame's jobs go to the worker (set by syncFrame)
+        bool g_verify = false; // SOTC_HOOK_ASYNC_VERIFY (read at the first frame: the Vita's env.txt comes after static init)
+        // Jobs outstanding at most (the game thread waits past it; an area
+        // change's cut frame has ~180). Each slot keeps its vectors' room.
+        constexpr uint32_t kRing = 512u;
+        HookJob g_ring[kRing];
+        uint64_t g_copyHash[kRing] = {};
+        uint64_t g_copyChecked = 0, g_copyDiffer = 0;
+        thread_local bool t_hookWorker = false;
+        uint64_t g_tex2dChecked = 0, g_tex2dChanged = 0;
+        uint64_t g_runChecked = 0, g_runChanged = 0; // round 32: model jobs, what they read themselves changed since the hook // round 32: textured 2D jobs, their texture changed since the hook
+
+        std::atomic<uint32_t> g_head{0}, g_tail{0}; // jobs handed over / done
+        // SOTC_HOOK_ORDER_CHECK=1 (round 32): a draw made by the game thread
+        // while jobs are pending would reach the renderer before theirs (out
+        // of the order without the worker): counted, every 600 frames.
+        uint64_t g_orderChecked = 0, g_orderEarly = 0;
+        void drawOrderCheck()
+        {
+            if (t_hookWorker)
+                return;
+            ++g_orderChecked;
+            if (g_on && g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed))
+                ++g_orderEarly;
+        }
+        std::mutex g_mutex;
+        std::condition_variable g_wake, g_done;
+        std::atomic<bool> g_sleeping{false}, g_joining{false};
+        bool g_started = false;
+        // Round 33 (Vita): the idle worker sleeps on a kernel semaphore
+        // (SOTC_HOOK_SEMA=0: the condition variable, as before). A hand-over
+        // to a sleeping worker is one sceKernelSignalSema, no mutex; the
+        // sleep has no 1 ms re-check (pthread's timed wait: the clock,
+        // TLS and semaphore calls every millisecond, and with the worker
+        // above the render thread's priority each re-check would take core
+        // 2 from it). A safety time-out of 20 ms stays.
+        bool g_sema = false;
+#if defined(__vita__)
+        SceUID g_semaId = -1;
+#endif
+        inline void wakeWorker()
+        {
+#if defined(__vita__)
+            if (g_sema)
+            {
+                sceKernelSignalSema(g_semaId, 1);
+                return;
+            }
+#endif
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_wake.notify_one();
+        }
+        // The worker's: job time (and the verify counts), read by the game
+        // thread after a join.
+        uint64_t g_jobUs = 0, g_jobs = 0, g_changed = 0, g_changedPart[4] = {};
+        // Round 33: each job's hand-over time (frame timing on) and its wait
+        // until the worker took it up, summed / the largest (the worker's).
+        uint64_t g_pushUs[kRing] = {};
+        uint64_t g_lagUs = 0, g_lagMaxUs = 0;
+        uint64_t g_joinUs = 0, g_joins = 0, g_waits = 0; // the game thread's
+        bool g_timing = false; // frameTiming() at the frame's start
+        // Round 130: the hand-over stamps for the job lag (`lag` in the frame log): one clock read per job on the
+        // game thread (~80 a frame riding; Vita3K's sampler: sceKernelGetProcessTimeWide from push 0.57% of the
+        // game thread). Only with SOTC_FRAME_LOG_ALL or SOTC_DIAG_TIMERS=1; never in the release build.
+        bool g_timingLag = false;
+
+#if !defined(__vita__) && !defined(__SWITCH__)
+        // SOTC_KICK_DEFER_CHECK=1 (Mac, round 34): what the deferred kick
+        // (SOTC_KICK_DEFER) changes, shown. At each kick the worker is held
+        // (after the job it is in) and guest memory copied; at the next join
+        // the held jobs run on that copy (g_ram: the game thread waits in the
+        // join meanwhile), which is protected so that each page they read
+        // faults once and is marked; then every page read is compared with
+        // guest memory as the game left it at the join. A page read that
+        // changed would be one a job, run as late as the join, would have read
+        // differently from the kick's ([kick-check] lines, the changed lines'
+        // guest addresses). With SOTC_HOOK_WORKER_DELAY_US most of the frame's
+        // jobs are still waiting at the kick.
+        bool g_deferCheck = false;
+        std::atomic<bool> g_hold{false}, g_inJob{false};
+        uint8_t *g_snap = nullptr;
+        const uint8_t *g_live = nullptr;
+        size_t g_pageBytes = 16384u;
+        std::atomic<uint8_t> *g_pagesRead = nullptr;
+        struct DeferCheckStats
+        {
+            uint64_t kicks = 0, checks = 0, held = 0, pagesRead = 0, pagesChanged = 0, linesChanged = 0, framesChanged = 0;
+            uint64_t wordsRead = 0, wordsChanged = 0, framesWordsChanged = 0, pagesUntracked = 0; // -DSOTC_READ_TRACK
+        } g_dc;
+#if defined(SOTC_READ_TRACK)
+        uint64_t g_dcBySite[16] = {};
+        std::map<uint32_t, std::pair<uint64_t, uint8_t>> *g_dcByAddr = nullptr;
+#endif
+        struct sigaction g_prevBus, g_prevSegv;
+        void snapFault(int sig, siginfo_t *si, void *uc)
+        {
+            uint8_t *const a = static_cast<uint8_t *>(si->si_addr);
+            if (g_snap && a >= g_snap && a < g_snap + 0x2000000u)
+            {
+                const size_t page = static_cast<size_t>(a - g_snap) / g_pageBytes;
+                g_pagesRead[page].store(1u, std::memory_order_relaxed);
+                mprotect(g_snap + page * g_pageBytes, g_pageBytes, PROT_READ);
+                return;
+            }
+            struct sigaction &prev = sig == SIGBUS ? g_prevBus : g_prevSegv;
+            if (prev.sa_flags & SA_SIGINFO)
+                prev.sa_sigaction(sig, si, uc);
+            else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN)
+                prev.sa_handler(sig);
+            else
+            {
+                signal(sig, SIG_DFL);
+                raise(sig);
+            }
+        }
+        void deferCheckInit()
+        {
+            g_pageBytes = static_cast<size_t>(getpagesize());
+            void *m = mmap(nullptr, 0x2000000u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (m == MAP_FAILED)
+                return;
+            g_snap = static_cast<uint8_t *>(m);
+            g_pagesRead = new std::atomic<uint8_t>[0x2000000u / g_pageBytes];
+            struct sigaction sa = {};
+            sa.sa_sigaction = snapFault;
+            sa.sa_flags = SA_SIGINFO;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGBUS, &sa, &g_prevBus);
+            sigaction(SIGSEGV, &sa, &g_prevSegv);
+            g_deferCheck = true;
+            std::fprintf(stderr, "[kick-check] on: jobs held from each kick to the next join, run on the kick's guest memory, %zu-byte pages compared\n", g_pageBytes);
+        }
+        void deferCheckKick()
+        {
+            g_hold.store(true, std::memory_order_seq_cst);
+            while (g_inJob.load(std::memory_order_seq_cst))
+                std::this_thread::yield();
+            std::memcpy(g_snap, g_ram, 0x2000000u);
+            ++g_dc.kicks;
+        }
+        bool deferCheckStart()
+        {
+            if (!g_hold.load(std::memory_order_relaxed))
+                return false;
+            g_dc.held += g_head.load(std::memory_order_relaxed) - g_tail.load(std::memory_order_acquire);
+            const size_t pages = 0x2000000u / g_pageBytes;
+            for (size_t i = 0; i < pages; ++i)
+                g_pagesRead[i].store(0u, std::memory_order_relaxed);
+#if defined(SOTC_READ_TRACK)
+            if (!g_readBits)
+            {
+                g_readBits = new uint8_t[0x2000000u / 32u];
+                g_readTag = new uint8_t[0x2000000u / 4u];
+            }
+            std::memset(g_readBits, 0, 0x2000000u / 32u);
+#endif
+            mprotect(g_snap, 0x2000000u, PROT_NONE);
+            g_live = g_ram;
+            g_ram = g_snap;
+            g_hold.store(false, std::memory_order_seq_cst);
+            if (g_sleeping.load(std::memory_order_seq_cst))
+                wakeWorker();
+            return true;
+        }
+        void deferCheckEnd()
+        {
+            g_ram = g_live;
+            mprotect(g_snap, 0x2000000u, PROT_READ | PROT_WRITE);
+            ++g_dc.checks;
+            const size_t pages = 0x2000000u / g_pageBytes;
+            uint64_t read = 0, changed = 0, lines = 0;
+            std::string where;
+            for (size_t i = 0; i < pages; ++i)
+            {
+                if (!g_pagesRead[i].load(std::memory_order_relaxed))
+                    continue;
+                ++read;
+                const uint8_t *a = g_snap + i * g_pageBytes, *b = g_live + i * g_pageBytes;
+                if (std::memcmp(a, b, g_pageBytes) == 0)
+                    continue;
+                ++changed;
+                for (size_t l = 0; l < g_pageBytes; l += 64u)
+                    if (std::memcmp(a + l, b + l, 64u) != 0)
+                    {
+                        ++lines;
+                        if (where.size() < 400u)
+                        {
+                            char item[24];
+                            std::snprintf(item, sizeof(item), " %07zx", i * g_pageBytes + l);
+                            where += item;
+                        }
+                    }
+            }
+#if defined(SOTC_READ_TRACK)
+            {
+                // The words the held jobs read (noteRead), against the memory
+                // at the join; and the pages that faulted with none of them
+                // (a read noteRead does not see).
+                uint64_t words = 0, differ = 0, untracked = 0;
+                std::string at;
+                for (size_t i = 0; i < pages; ++i)
+                {
+                    const size_t perPage = g_pageBytes / 32u; // bytes of bits a page
+                    bool any = false;
+                    for (size_t b = i * perPage; b < (i + 1) * perPage; ++b)
+                    {
+                        if (!g_readBits[b])
+                            continue;
+                        any = true;
+                        for (uint32_t k = 0; k < 8u; ++k)
+                            if (g_readBits[b] & (1u << k))
+                            {
+                                const size_t addr = (b * 8u + k) * 4u;
+                                ++words;
+                                if (std::memcmp(g_snap + addr, g_live + addr, 4) != 0)
+                                {
+                                    ++differ;
+                                    {
+                                        // By address and by reader, over the run.
+                                        static std::map<uint32_t, std::pair<uint64_t, uint8_t>> &byAddr = *new std::map<uint32_t, std::pair<uint64_t, uint8_t>>;
+                                        auto &e = byAddr[static_cast<uint32_t>(addr)];
+                                        ++e.first;
+                                        e.second = g_readTag[addr / 4u];
+                                        ++g_dcBySite[std::min<uint32_t>(e.second, 15u)];
+                                        g_dcByAddr = &byAddr;
+                                    }
+                                    if (at.size() < 600u)
+                                    {
+                                        uint32_t was, now;
+                                        std::memcpy(&was, g_snap + addr, 4);
+                                        std::memcpy(&now, g_live + addr, 4);
+                                        char item[48];
+                                        std::snprintf(item, sizeof(item), " %07zx:%08x>%08x", addr, was, now);
+                                        at += item;
+                                    }
+                                }
+                            }
+                    }
+                    if (!any && g_pagesRead[i].load(std::memory_order_relaxed))
+                    {
+                        ++untracked;
+                        if (at.size() < 600u)
+                        {
+                            char item[40];
+                            std::snprintf(item, sizeof(item), " untracked-page:%07zx", i * g_pageBytes);
+                            at += item;
+                        }
+                    }
+                }
+                g_dc.wordsRead += words;
+                g_dc.wordsChanged += differ;
+                g_dc.framesWordsChanged += differ ? 1u : 0u;
+                g_dc.pagesUntracked += untracked;
+                static uint32_t toldWords = 0;
+                if ((differ || untracked) && toldWords++ < 400u)
+                    std::fprintf(stderr, "[kick-check] frame %llu: words read %llu, changed since the kick %llu, faulted pages without a tracked read %llu:%s\n",
+                                 (unsigned long long)g_frame, (unsigned long long)words, (unsigned long long)differ, (unsigned long long)untracked, at.c_str());
+                if (g_dc.checks % 600u == 0u)
+                {
+                    std::fprintf(stderr, "[kick-check] words: %llu read, %llu changed in %llu frames; faulted pages without a tracked read %llu\n",
+                                 (unsigned long long)g_dc.wordsRead, (unsigned long long)g_dc.wordsChanged, (unsigned long long)g_dc.framesWordsChanged,
+                                 (unsigned long long)g_dc.pagesUntracked);
+                    std::string bySite;
+                    for (uint32_t k = 0; k < 16u; ++k)
+                        if (g_dcBySite[k])
+                        {
+                            char item[64];
+                            std::snprintf(item, sizeof(item), " %s %llu", k < sizeof(kReadSiteNames) / sizeof(kReadSiteNames[0]) ? kReadSiteNames[k] : "?",
+                                          (unsigned long long)g_dcBySite[k]);
+                            bySite += item;
+                        }
+                    std::fprintf(stderr, "[kick-check] changed words by reader:%s\n", bySite.c_str());
+                    if (g_dcByAddr)
+                    {
+                        std::vector<std::pair<uint64_t, uint32_t>> top;
+                        for (const auto &e : *g_dcByAddr)
+                            top.push_back({e.second.first, e.first});
+                        std::sort(top.rbegin(), top.rend());
+                        std::string list;
+                        for (size_t i = 0; i < top.size() && i < 80u; ++i)
+                        {
+                            char item[64];
+                            const uint8_t tag = (*g_dcByAddr)[top[i].second].second;
+                            std::snprintf(item, sizeof(item), " %07x(%s)x%llu", top[i].second, tag < sizeof(kReadSiteNames) / sizeof(kReadSiteNames[0]) ? kReadSiteNames[tag] : "?",
+                                          (unsigned long long)top[i].first);
+                            list += item;
+                        }
+                        std::fprintf(stderr, "[kick-check] %zu addresses changed; the most often:%s\n", top.size(), list.c_str());
+                    }
+                }
+            }
+            const bool pageLines = false; // the page-level lines (coarse: a 16 KB page holds much else)
+#else
+            const bool pageLines = true;
+#endif
+            g_dc.pagesRead += read;
+            g_dc.pagesChanged += changed;
+            g_dc.linesChanged += lines;
+            g_dc.framesChanged += changed ? 1u : 0u;
+            static uint32_t told = 0;
+            if (pageLines && changed && told++ < 300u)
+                std::fprintf(stderr, "[kick-check] frame %llu: pages read %llu, changed since the kick %llu (64-byte lines %llu:%s)\n", (unsigned long long)g_frame,
+                             (unsigned long long)read, (unsigned long long)changed, (unsigned long long)lines, where.c_str());
+            if (g_dc.checks % 600u == 0u)
+                std::fprintf(stderr, "[kick-check] %llu kicks, %llu checked: jobs held at the kick %llu, pages read %llu, changed %llu (lines %llu) in %llu frames\n",
+                             (unsigned long long)g_dc.kicks, (unsigned long long)g_dc.checks, (unsigned long long)g_dc.held, (unsigned long long)g_dc.pagesRead,
+                             (unsigned long long)g_dc.pagesChanged, (unsigned long long)g_dc.linesChanged, (unsigned long long)g_dc.framesChanged);
+        }
+#endif
+
+        void loop()
+        {
+            ThreadNaming::SetCurrentThreadName("HookWorker");
+            native_renderer::setRaceLabel("hook worker");
+            t_hookWorker = true;
+            ::sotc_prof::t_offGameThread = true; // (the subsystem profiler's scopes are the game thread's)
+#if defined(SOTC_READ_TRACK)
+            t_readTrack = true; // (the bits cleared at each check's start: only the held jobs' count)
+#endif
+            // Cores 1-2 beside the BuildWorker; round 33: above the render
+            // thread's and the builds' priority (SOTC_THREADS,
+            // SOTC_HOOK_WORKER_PRIO; [threads] line).
+            native_renderer::threads::place(native_renderer::threads::kWorker);
+            std::fprintf(stderr, "[hookjob] worker thread running\n");
+            uint32_t tail = g_tail.load(std::memory_order_relaxed);
+            for (;;)
+            {
+#if !defined(__vita__) && !defined(__SWITCH__)
+                if (g_deferCheck)
+                {
+                    // SOTC_KICK_DEFER_CHECK: held from the kick to the join.
+                    g_inJob.store(true, std::memory_order_seq_cst);
+                    if (g_hold.load(std::memory_order_seq_cst))
+                    {
+                        g_inJob.store(false, std::memory_order_seq_cst);
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        continue;
+                    }
+                }
+#endif
+                if (tail == g_head.load(std::memory_order_acquire))
+                {
+#if !defined(__vita__) && !defined(__SWITCH__)
+                    if (g_deferCheck)
+                        g_inJob.store(false, std::memory_order_seq_cst);
+#endif
+                    // A few hundred looks before sleeping: the display walk
+                    // hands a job over every few tens of microseconds.
+                    bool more = false;
+                    for (int spin = 0; spin < 256 && !more; ++spin)
+                        more = tail != g_head.load(std::memory_order_acquire);
+#if defined(__vita__)
+                    if (!more && g_sema)
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(g_mutex);
+                            g_sleeping.store(true, std::memory_order_seq_cst);
+                            if (g_joining.load(std::memory_order_seq_cst))
+                                g_done.notify_all();
+                        }
+                        while (tail == g_head.load(std::memory_order_seq_cst))
+                        {
+                            SceUInt timeout = 20000;
+                            sceKernelWaitSema(g_semaId, 1, &timeout);
+                        }
+                        g_sleeping.store(false, std::memory_order_relaxed);
+                        continue;
+                    }
+#endif
+                    if (!more)
+                    {
+                        std::unique_lock<std::mutex> lock(g_mutex);
+                        g_sleeping.store(true, std::memory_order_seq_cst);
+                        if (g_joining.load(std::memory_order_seq_cst))
+                            g_done.notify_all();
+                        while (tail == g_head.load(std::memory_order_seq_cst))
+                            g_wake.wait_for(lock, std::chrono::milliseconds(1)); // (lost wake-ups: Vita3K)
+                        g_sleeping.store(false, std::memory_order_relaxed);
+                    }
+                    continue;
+                }
+                HookJob &job = g_ring[tail % kRing];
+                // SOTC_HOOK_WORKER_DELAY_US=<us> (testing, round 32): each job
+                // that long later, so SOTC_HOOK_ORDER_CHECK sees the game
+                // thread's draws while jobs are still pending, as a slow
+                // worker (the console's) would have them.
+                static const uint64_t delayUs = std::getenv("SOTC_HOOK_WORKER_DELAY_US") ? std::strtoull(std::getenv("SOTC_HOOK_WORKER_DELAY_US"), nullptr, 10) : 0u;
+                if (delayUs)
+                    std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+                const uint64_t start = g_timing ? native_renderer::nowUs() : 0u;
+                if (start && g_pushUs[tail % kRing])
+                {
+                    const uint64_t lag = start > g_pushUs[tail % kRing] ? start - g_pushUs[tail % kRing] : 0u;
+                    g_lagUs += lag;
+                    g_lagMaxUs = std::max(g_lagMaxUs, lag);
+                }
+                if (g_verify)
+                {
+                    ++g_copyChecked;
+                    g_copyDiffer += jobCopyHash(job) != g_copyHash[tail % kRing] ? 1u : 0u;
+                }
+                if (g_verify && job.kind == kJobModel)
+                {
+                    const uint64_t now = modelDispInputs(job.model);
+                    if (now != job.model.inputs)
+                        ++g_changed;
+                    for (int k = 0; k < 4; ++k)
+                        g_changedPart[k] += ((now ^ job.model.inputs) >> (16 * k)) & 0xFFFFu ? 1u : 0u;
+                    ++g_runChecked;
+                    g_runChanged += modelRunInputs(job.model) != job.model.runInputs ? 1u : 0u;
+                }
+                runJob(job);
+                if (start)
+                    g_jobUs += native_renderer::nowUs() - start;
+                ++g_jobs;
+                g_tail.store(++tail, std::memory_order_release);
+#if !defined(__vita__) && !defined(__SWITCH__)
+                if (g_deferCheck)
+                    g_inJob.store(false, std::memory_order_seq_cst);
+#endif
+            }
+        }
+        void start()
+        {
+            if (g_started)
+                return;
+            g_started = true;
+#if defined(__vita__)
+            if (!std::getenv("SOTC_HOOK_SEMA") || std::atoi(std::getenv("SOTC_HOOK_SEMA")) != 0)
+            {
+                g_semaId = sceKernelCreateSema("HookWake", 0, 0, 1, nullptr);
+                g_sema = g_semaId >= 0;
+            }
+            std::fprintf(stderr, "[hookjob] idle worker sleeps on %s\n", g_sema ? "a kernel semaphore" : "the condition variable");
+            const unsigned int stackDefault = _pthread_stack_default_user;
+            _pthread_stack_default_user = 512u * 1024u; // the packet builds' strips / skinned packets
+#endif
+            std::thread(loop).detach();
+#if defined(__vita__)
+            _pthread_stack_default_user = stackDefault;
+#endif
+        }
+        inline bool pending() { return g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed); }
+        // Joins that waited and their time, by where (SOTC_HOOK_ASYNC_VERIFY).
+        uint64_t g_siteWaits[kSites] = {}, g_siteUs[kSites] = {};
+        // Round 32: this frame's join time by site with the frame timing on
+        // (the frame log's "join ... (glend a, 2d b, ...)"; the console's join
+        // had no split), and the last frame's, as frameLog prints it.
+        uint64_t g_frameSiteUs[kSites] = {}, g_lastSiteUs[kSites] = {};
+        extern const char *const kSiteNames[kSites];
+        const char *const kSiteNames[kSites] = {"zfog", "frame", "glend", "gsreg-feedback", "gsreg-refraction", "gsreg-2d", "meshdisp", "shadowdisp", "ptclenv", "ptclvtx", "screenblur", "move", "kick"};
+        // Waits until every job handed over has run.
+        void join(Site site)
+        {
+            mdslane::join(site == k_frame ? 5 : 3); // round 61: the lane first (kJFrame / kJHook)
+            if (sotc_decomp::g_offloadJoin) // round 64: the offload thread's work (decomp_tex64)
+                sotc_decomp::g_offloadJoin(100 + static_cast<int>(site));
+#if !defined(__vita__) && !defined(__SWITCH__)
+            struct CheckEnd // SOTC_KICK_DEFER_CHECK: after the held jobs ran
+            {
+                bool on;
+                ~CheckEnd()
+                {
+                    if (on)
+                        deferCheckEnd();
+                }
+            } checkEnd{g_deferCheck && deferCheckStart()};
+#endif
+            if (!pending())
+                return;
+            ps2_load::Wait waiting(ps2_load::kSiteHookJoin); // round 132: marked for prof129
+            const uint64_t start = g_timing || g_verify ? native_renderer::nowUs() : 0u;
+            ++g_waits;
+            ++g_siteWaits[site];
+            struct SiteTime
+            {
+                Site site;
+                uint64_t start;
+                ~SiteTime()
+                {
+                    if (start)
+                    {
+                        const uint64_t us = native_renderer::nowUs() - start;
+                        g_siteUs[site] += us;
+                        g_frameSiteUs[site] += us;
+                    }
+                }
+            } siteTime{site, start};
+            for (int spin = 0; spin < 512; ++spin)
+                if (!pending())
+                    goto done;
+            {
+                std::unique_lock<std::mutex> lock(g_mutex);
+                g_joining.store(true, std::memory_order_seq_cst);
+                while (pending())
+                {
+                    if (g_sleeping.load(std::memory_order_seq_cst))
+                    {
+#if defined(__vita__)
+                        if (g_sema)
+                            sceKernelSignalSema(g_semaId, 1);
+                        else
+#endif
+                            g_wake.notify_one();
+                    }
+                    g_done.wait_for(lock, std::chrono::milliseconds(1));
+                }
+                g_joining.store(false, std::memory_order_relaxed);
+            }
+        done:
+            if (start)
+                g_joinUs += native_renderer::nowUs() - start;
+        }
+        // The next free job (waits while the ring is full).
+        HookJob &next()
+        {
+            const uint32_t head = g_head.load(std::memory_order_relaxed);
+            if (head - g_tail.load(std::memory_order_acquire) >= kRing)
+            {
+                ps2_load::Wait waiting(ps2_load::kSiteHookRing); // round 132: marked for prof129
+                while (head - g_tail.load(std::memory_order_acquire) >= kRing)
+                    std::this_thread::yield();
+            }
+            return g_ring[head % kRing];
+        }
+        void push()
+        {
+            if (g_verify)
+                g_copyHash[g_head.load(std::memory_order_relaxed) % kRing] = jobCopyHash(g_ring[g_head.load(std::memory_order_relaxed) % kRing]);
+            g_pushUs[g_head.load(std::memory_order_relaxed) % kRing] = g_timingLag ? native_renderer::nowUs() : 0u;
+            g_head.store(g_head.load(std::memory_order_relaxed) + 1u, std::memory_order_seq_cst);
+            if (g_sleeping.load(std::memory_order_seq_cst))
+                wakeWorker();
+        }
+        // A frame's end (syncFrame, after its join): the jobs' and joins' time
+        // into the frame log's counters (hooks: the game thread's, joins
+        // included; jobs: the worker's).
+        void frameEnd()
+        {
+            native_renderer::FrameCounters &c = native_renderer::frameCounters();
+            c.hookUs += g_joinUs;
+            c.jobUs += g_jobUs;
+            c.joinUs += g_joinUs;
+            c.jobs += static_cast<uint32_t>(g_jobs);
+            c.lagUs += g_lagUs;
+            c.lagMaxUs = std::max(c.lagMaxUs, g_lagMaxUs);
+            g_jobUs = g_joinUs = g_jobs = 0;
+            g_lagUs = g_lagMaxUs = 0;
+            std::memcpy(g_lastSiteUs, g_frameSiteUs, sizeof(g_lastSiteUs));
+            std::fill(g_frameSiteUs, g_frameSiteUs + kSites, 0u);
+            static uint64_t frames = 0, changed = 0, jobs = 0;
+            jobs += c.jobs;
+            changed += g_changed;
+            g_changed = 0;
+            if (g_verify && frames % 600u == 599u)
+            {
+                std::string line;
+                char item[64];
+                for (int k = 0; k < kSites; ++k)
+                    if (g_siteWaits[k])
+                    {
+                        std::snprintf(item, sizeof(item), " %s %llu (%.1f ms)", kSiteNames[k], (unsigned long long)g_siteWaits[k], g_siteUs[k] / 1000.0);
+                        line += item;
+                    }
+                std::fprintf(stderr, "[hookjob] joins that waited, 600 frames:%s\n", line.c_str());
+                std::fill(g_siteWaits, g_siteWaits + kSites, 0u);
+                std::fill(g_siteUs, g_siteUs + kSites, 0u);
+            }
+            if (g_verify && ++frames % 600u == 0u)
+                std::fprintf(stderr, "[hookjob] %llu frames: %llu jobs on the worker, their inputs as taken at the hook: %llu checked, %llu differ | guest memory changed since the hook (not read by the jobs) in %llu (tags %llu lights %llu palette %llu lists %llu)\n",
+                             (unsigned long long)frames, (unsigned long long)jobs, (unsigned long long)g_copyChecked, (unsigned long long)g_copyDiffer,
+                             (unsigned long long)changed, (unsigned long long)g_changedPart[0],
+                             (unsigned long long)g_changedPart[1], (unsigned long long)g_changedPart[2], (unsigned long long)g_changedPart[3]);
+            static const bool orderCheck = ps2_diag::env("SOTC_HOOK_ORDER_CHECK") != nullptr;
+            if (orderCheck && g_frame % 600u == 0u)
+                std::fprintf(stderr, "[hookjob] order check, frame %llu: %llu game-thread draws, %llu of them while jobs were pending\n", (unsigned long long)g_frame,
+                             (unsigned long long)g_orderChecked, (unsigned long long)g_orderEarly);
+            if (g_verify && frames % 600u == 0u)
+                std::fprintf(stderr, "[hookjob] textured 2D jobs: %llu, their texture's bytes changed between the hook and the job in %llu; model jobs: %llu, "
+                             "what they read themselves (surface flags, scroll rows, texture headers, packet heads, LOD scale) changed in %llu\n",
+                             (unsigned long long)g_tex2dChecked, (unsigned long long)g_tex2dChanged, (unsigned long long)g_runChecked, (unsigned long long)g_runChanged);
+        }
+        // A frame's start: jobs on the worker this frame unless a check runs.
+        void frameStart()
+        {
+            static const bool checks = []
+            {
+                for (const char *name : {"SOTC_DIFFTEST", "SOTC_MODELDISP_CHECK", "SOTC_VIEW_CHECK", "SOTC_NATIVE_LOG", "SOTC_NATIVE_LOGMAT", "SOTC_LOG_LAYER",
+                                         "SOTC_NATIVE_IDCOLOR", "SOTC_STALE_CHECK", "SOTC_HOOK_STATS", "SOTC_R2_CHECK", "SOTC_PLAN_VERIFY", "SOTC_HIDE_HEADER"})
+                    if (std::getenv(name))
+                        return true;
+                return false;
+            }();
+            const native_renderer::Tuning &t = native_renderer::tuning();
+            // SOTC_HOOK_ASYNC_AB=<n> (measuring): on and off in turn, n frames each.
+            static const uint64_t ab = std::getenv("SOTC_HOOK_ASYNC_AB") ? std::strtoull(std::getenv("SOTC_HOOK_ASYNC_AB"), nullptr, 10) : 0u;
+            const bool abOn = !ab || (g_frame / ab) % 2u == 0u;
+            // (Round 24: the subsystem profiler no longer turns it off: its
+            // scopes are not timed on the worker, t_offGameThread. On the
+            // console in round 23 a settings.cfg that kept env.txt's
+            // SOTC_SUBSYS_PROF=1 of an earlier run had it off all game.)
+            const char *why = !t.hookWorker ? "off by SOTC_HOOK_ASYNC / settings.cfg dbg_hook_worker"
+                              : checks       ? "off: a debugging check runs (SOTC_DIFFTEST, SOTC_MODELDISP_CHECK, SOTC_VIEW_CHECK, a native log, ...)"
+                              : g_staleCheck ? "off: SOTC_STALE_CHECK"
+                              : hookStats().on ? "off: SOTC_HOOK_STATS"
+                              : g_planVerify ? "off: SOTC_PLAN_VERIFY"
+                              : native_renderer::drawTap() ? "off: a draw tap"
+                                                           : nullptr;
+            const bool on = !why && abOn;
+            // Said once at the first frame and again whenever it changes
+            // (not for the A/B's turns).
+            static int said = -1;
+            if (static_cast<int>(!why) != said)
+            {
+                said = static_cast<int>(!why);
+                std::fprintf(stderr, "[hookjob] model draws on a worker: %s (frame %llu%s%s)\n", why ? why : "on", (unsigned long long)g_frame,
+                             t.subsysProf || ::sotc_prof::g_on ? ", subsystem profiler on: the hooks' scopes count the game thread's part only" : "",
+                             ab ? ", SOTC_HOOK_ASYNC_AB: on and off in turns" : "");
+                std::fflush(stderr);
+            }
+            static const bool verify = ps2_diag::env("SOTC_HOOK_ASYNC_VERIFY") != nullptr;
+            g_verify = verify;
+            static const bool read105 = [] { start105(); return true; }(); // round 105's switches from env.txt (once)
+            (void)read105;
+            // Round 34: the kick without its join (default on; SOTC_KICK_DEFER=0: joined there as before).
+            static const bool defer = !std::getenv("SOTC_KICK_DEFER") || std::atoi(std::getenv("SOTC_KICK_DEFER")) != 0;
+            g_kickDefer = defer;
+#if !defined(__vita__) && !defined(__SWITCH__)
+            static const bool deferCheck = [] { if (ps2_diag::env("SOTC_KICK_DEFER_CHECK") && defer) deferCheckInit(); return true; }();
+            (void)deferCheck;
+#endif
+            if (on)
+                start();
+            g_on = on;
+            g_timing = ps2_diag::kTimers && t.frameTiming();
+            {
+                static const bool diagTimers = [] { const char *e = ps2_diag::env("SOTC_DIAG_TIMERS"); return e && std::atoi(e) != 0; }();
+                g_timingLag = g_timing && (t.frameLogAll || diagTimers);
+            }
+            mdslane::frameStart(on);
+        }
+    }
+
+    // A frame of the game ends when the display list goes to the VIF1.
+    void newDrawOrder();
+    void syncFrame(uint8_t *rdram)
+    {
+        if (g_ram != rdram) // (read by the model jobs: written once)
+            g_ram = rdram;
+
+        const uint64_t frame = ps2_stats::vif1Chains.load(std::memory_order_relaxed);
+        if (frame != g_frame)
+        {
+            const ps2_load::GameZone zone134(0x2020u); // round 134: the frame's change (prof129), whichever hook meets it
+            const bool timed = native_renderer::tuning().frameTiming();
+            uint64_t mark = timed ? native_renderer::nowUs() : 0u;
+            uint64_t sync[kSyncParts] = {};
+            const auto lap = [&](SyncPart part)
+            {
+                if (!timed)
+                    return;
+                const uint64_t now = native_renderer::nowUs();
+                sync[part] += now - mark;
+                mark = now;
+            };
+            struct SyncDone // the parts kept at every way out
+            {
+                uint64_t *parts;
+                const decltype(lap) &last;
+                ~SyncDone()
+                {
+                    last(kSyncRest);
+                    std::memcpy(g_syncUs, parts, sizeof(g_syncUs));
+                }
+            } syncDone{sync, lap};
+            hookJoin(hookjobs::k_frame); // the frame's model jobs (round 23)
+            lap(kSyncJoin);
+            hookjobs::frameEnd();
+            if (g_staleCheck)
+            {
+                staleCompare("next frame");
+                g_stalePrevious.swap(g_staleRegions);
+                g_staleRegions.clear();
+            }
+            endFrame();
+            g_skinRecords.clear();
+            g_skinDrawList.clear();
+            g_kickOwns.clear();
+            g_kickMustJoin = false;
+            lap(kSyncEnd);
+            frameLog();
+            lap(kSyncLog);
+            // The debug menu's "Sound log" (round 20): audio_stats' level
+            // follows it at each frame's end.
+            {
+                const int level = static_cast<int>(native_renderer::tuning().audioLog + 0.5f);
+                if (level != ps2x::iop::audio_stats::level())
+                    ps2x::iop::audio_stats::setLevel(level);
+            }
+            audioLog();
+            lap(kSyncAudio);
+            // The idle thread's turn once a frame (round 25, sotc_overrides.cpp).
+            if (g_runtimeForLog)
+                sotc_decomp::idleTurn(rdram, g_runtimeForLog);
+            lap(kSyncIdle);
+            // SOTC_FRAME_STALL_MS=<ms> (measuring, round 10): the game thread
+            // sleeps that long at each frame's end from frame
+            // SOTC_FRAME_STALL_FROM (default 0) on, so the Mac runs frames as
+            // slow as the Vita's (the host clock's catch-up, the game's step).
+            static const uint64_t stallMs = std::getenv("SOTC_FRAME_STALL_MS") ? std::strtoull(std::getenv("SOTC_FRAME_STALL_MS"), nullptr, 10) : 0u;
+            static const uint64_t stallFrom = std::getenv("SOTC_FRAME_STALL_FROM") ? std::strtoull(std::getenv("SOTC_FRAME_STALL_FROM"), nullptr, 10) : 0u;
+            if (stallMs && frame >= stallFrom)
+                std::this_thread::sleep_for(std::chrono::milliseconds(stallMs));
+            // SOTC_POS_LOG=<n> (measuring, round 10): every n game frames the
+            // guest VBlank, the game step and where the player and the camera
+            // are ([pos]): runs at other frame rates compared by game time.
+            static const uint64_t posEvery = ps2_diag::env("SOTC_POS_LOG") ? std::strtoull(ps2_diag::env("SOTC_POS_LOG"), nullptr, 10) : 0u;
+            if (posEvery && frame % posEvery == 0u)
+            {
+                auto w = [rdram](uint32_t a) { uint32_t v; std::memcpy(&v, rdram + (a & 0x1FFFFFCu), 4); return v; };
+                auto f = [rdram](uint32_t a) { float v; std::memcpy(&v, rdram + (a & 0x1FFFFFCu), 4); return v; };
+                float eye[3] = {0, 0, 0}, player[3] = {0, 0, 0};
+                if (g_cameraContext)
+                {
+                    const uint32_t m = g_cameraContext + 0x5A0u;
+                    for (int j = 0; j < 3; ++j)
+                        eye[j] = -(f(m + 48u) * f(m + j * 16u) + f(m + 52u) * f(m + j * 16u + 4u) + f(m + 56u) * f(m + j * 16u + 8u));
+                }
+                const uint32_t index = w(0x01465900u) & 0xFFFFu;
+                const uint32_t object = index ? w(0x0021B900u + index * 24u) : 0u;
+                if (object && object < 0x2000000u) // the player character (type 9): its position at +0x170
+                    for (int j = 0; j < 3; ++j)
+                        player[j] = f(object + 0x170u + j * 4u);
+                float dt;
+                std::memcpy(&dt, rdram + 0x014657D0u, 4);
+                std::fprintf(stderr, "[pos] frame %llu vb %llu dt %.1f player %.2f %.2f %.2f eye %.2f %.2f %.2f\n", (unsigned long long)frame,
+                             (unsigned long long)ps2_stats::vblanks.load(std::memory_order_relaxed), dt * 1000.0f, player[0], player[1], player[2],
+                             eye[0], eye[1], eye[2]);
+            }
+            sotc_prof::frameTick(frame);
+            sotc_worker::frameTick(frame); // round 91: the guest worker joined at the frame's end, its statistics
+            char104::frameTick(frame);     // round 104
+            sotc_decomp::g_gameFrame = frame;
+            sotc_decomp::fastStatsTick(frame);
+            ps2_lean::frameTick(frame);
+            sotc_decomp::abTick(frame);
+            native_renderer::beginFrame();
+            // SOTC_DRAW_DUMP_FRAMES=f,f,... (debugging): those frames' draws to
+            // SOTC_DRAW_DUMP_DIR (default shots)/draws_<frame>.txt.
+            static const std::vector<uint64_t> dumpFrames = []
+            {
+                std::vector<uint64_t> out;
+                if (const char *env = std::getenv("SOTC_DRAW_DUMP_FRAMES"))
+                    for (const char *p = env; *p;)
+                    {
+                        out.push_back(std::strtoull(p, const_cast<char **>(&p), 10));
+                        if (*p)
+                            ++p;
+                    }
+                return out;
+            }();
+            if (std::find(dumpFrames.begin(), dumpFrames.end(), frame) != dumpFrames.end())
+            {
+                const char *dir = ps2_diag::env("SOTC_DRAW_DUMP_DIR");
+                native_renderer::requestDrawDump(std::string(dir ? dir : "shots") + "/draws_" + std::to_string(frame) + ".txt");
+            }
+            if (HookStats &hs = hookStats(); hs.on && frame % 120u == 0u)
+            {
+                std::fprintf(stderr,
+                             "[hookstats] frame %llu /120: instances %llu headers %zu packets %llu lod %llu draws %llu tex %llu (distinct %zu) decoded %llu "
+                             "id same %llu prev %llu quick %llu sampled %llu hashed %llu nodes %llu surfaces %llu (distinct %zu)\n",
+                             (unsigned long long)frame, (unsigned long long)hs.instances, hs.headers.size(), (unsigned long long)hs.packets,
+                             (unsigned long long)hs.lodPackets, (unsigned long long)hs.draws, (unsigned long long)hs.textures, hs.textureSet.size(),
+                             (unsigned long long)hs.decoded, (unsigned long long)hs.idSame, (unsigned long long)hs.idPrev, (unsigned long long)hs.idQuick,
+                             (unsigned long long)hs.idSampled, (unsigned long long)hs.idHashed, (unsigned long long)hs.nodes, (unsigned long long)hs.surfaces,
+                             hs.surfaceSet.size());
+                const bool on = hs.on;
+                hs = HookStats();
+                hs.on = on;
+            }
+            if (HookStats &hs = hookStats(); hs.on)
+                hs.headers.clear(), hs.surfaceSet.clear(), hs.textureSet.clear(); // distinct per frame: summed below as sizes
+            g_frame = frame;
+            newDrawOrder();
+            {
+                const auto envOn = [](const char *name)
+                {
+                    const char *v = std::getenv(name);
+                    return !v || std::atoi(v) != 0;
+                };
+                static const bool r2 = envOn("SOTC_NATIVE_R2"), quickTextures = envOn("SOTC_TEX_QUICK"), surfaceMemo = envOn("SOTC_SURFACE_MEMO"),
+                                  prefetch = envOn("SOTC_HOOK_PREFETCH"), plans = envOn("SOTC_PLAN"), planRuns = envOn("SOTC_PLAN_RUNS");
+                static const uint32_t verify = ps2_diag::env("SOTC_PLAN_VERIFY") ? static_cast<uint32_t>(std::atoi(ps2_diag::env("SOTC_PLAN_VERIFY"))) : 0u;
+                g_planOn = plans;
+                static const int32_t budget = std::getenv("SOTC_PLAN_BUDGET") ? std::atoi(std::getenv("SOTC_PLAN_BUDGET")) : 3000;
+                g_planBudget = budget;
+                g_planRuns = planRuns;
+                static const bool planStats = ps2_diag::env("SOTC_PLAN_STATS") != nullptr;
+                g_planStatsOn = planStats;
+                g_planVerify = verify;
+                g_r2 = r2;
+                g_quickTextures = g_r2 && quickTextures;
+                g_surfaceMemo = g_r2 && surfaceMemo;
+                g_prefetch = g_r2 && prefetch;
+            }
+            hookjobs::frameStart();
+            gcovDump(frame);
+            g_frameDraws = 0;
+            g_skinnedDraws = 0;
+            // A packet's id hashes its content: another area loaded in its
+            // place makes new ids, the old ones never come back (the title's
+            // demo filled the Vita's heap). Gone after ~30 s undrawn.
+            static const bool cacheLog = ps2_diag::env("SOTC_GL_CACHE_LOG") != nullptr;
+            if (cacheLog && frame % 600u == 0u)
+            {
+                size_t strips = 0;
+                for (const auto &p : g_skinnedPackets)
+                    strips += p.second.strips.size();
+                std::fprintf(stderr, "[skinned:cache] frame %llu packets %zu strips %zu lit %zu\n", (unsigned long long)frame,
+                             g_skinnedPackets.size(), strips, g_litPackets.size());
+            }
+            if (frame % 256u == 0u)
+                for (auto it = g_skinnedPackets.begin(); it != g_skinnedPackets.end();)
+                    if (it->second.used + 1800u < frame)
+                    {
+                        g_litPackets.erase(it->first);
+                        g_skinnedIds.erase(it->first);
+                        ++g_skinnedEpoch; // the draw plans find their skinned packets again
+                        g_skinnedPacketBytes -= it->second.bytes;
+                        it = g_skinnedPackets.erase(it);
+                    }
+                    else
+                        ++it;
+            native_renderer::noteFrontendMemory(g_skinnedPacketBytes);
+            if (frame % 256u == 0u)
+                sweepPlans();
+            // SOTC_PLAN_STATS=1 / SOTC_PLAN_VERIFY: the draw plans, every 600 frames.
+            static const bool planStats = ps2_diag::env("SOTC_PLAN_STATS") != nullptr;
+            if ((planStats || g_planVerify) && frame % 600u == 0u)
+            {
+                const PlanStats &ps = g_planStats;
+                std::fprintf(stderr, "[plan] frame %llu: packets drawn %llu (stats on), %llu runs drawn as one: %llu draws fewer\n", (unsigned long long)frame,
+                             (unsigned long long)ps.drawn, (unsigned long long)ps.ranges, (unsigned long long)ps.merged);
+                std::fprintf(stderr, "[plan] frame %llu: jobs' walk: %llu packets looked at, %llu left out by the part test, %llu by the surface test; "
+                             "%llu part runs, %llu of them left out\n", (unsigned long long)frame, (unsigned long long)ps.visited,
+                             (unsigned long long)ps.partSkipped, (unsigned long long)ps.surfaceSkipped, (unsigned long long)ps.partRuns, (unsigned long long)ps.partRunsSkipped);
+                std::fprintf(stderr, "[plan] frame %llu: plans %zu built %llu rebuilt %llu deferred %llu uses %llu ids asked %llu kept %llu; verify %llu checks %llu draws, %llu differ (%llu counts)\n",
+                             (unsigned long long)frame, g_plans.size(), (unsigned long long)ps.builds, (unsigned long long)ps.rebuilds, (unsigned long long)ps.deferred,
+                             (unsigned long long)ps.uses, (unsigned long long)ps.asked, (unsigned long long)ps.trusted, (unsigned long long)ps.checks,
+                             (unsigned long long)ps.draws, (unsigned long long)ps.differ, (unsigned long long)ps.countDiffer);
+            }
+        }
+    }
+
+    // ---- 2D ---------------------------------------------------------------
+    //
+    // SotC's 2D functions write GS registers with gsReg(reg, value)
+    // (0x1c5b00): PRIM, RGBAQ, UV or ST, then XYZ2 / XYZF2 per vertex, plus
+    // ALPHA. They are read as they are written and assembled into
+    // primitives here. The writes are told apart by gsReg's return address
+    // (the recompiled functions run in pieces the dispatcher continues after
+    // a call returns: a hook around a call sees none of its writes). The
+    // texture is the last texTransRequest(resource) (the 2D functions ask for
+    // theirs just before drawing; the resource's +0x20 is the NTO2 header),
+    // the layer the current iosDlPushLayer. Screen effects (bloom, blur,
+    // reflection, fog, boss death) draw into other buffers and are not
+    // listed. Positions are 12.4 on a 512 x 448 screen centred on 2048;
+    // ALPHA with C = FIX (fades) blends by FIX.
+    constexpr uint32_t kGsReg = 0x001C5B00u, kTexTransRequest = 0x010AAD48u;
+    constexpr uint32_t kPushLayer = 0x001C0210u, kPopLayer = 0x001BF8C0u;
+    PS2Runtime::RecompiledFunction g_gsReg = nullptr, g_texTransRequest = nullptr, g_pushLayer = nullptr, g_popLayer = nullptr;
+
+    struct Range
+    {
+        uint32_t start, end;
+    };
+    constexpr Range k2D[] = {
+        {0x010A24C0u, 0x010A5270u}, // spriteDrawSpriteTexNoSet .. spriteDrawSpriteST2 (menus, title, map)
+        {0x0108A288u, 0x0108A758u}, // drawFrontFog, fadeScreen, drawDemoBar (cinema bars)
+        {0x0134B490u, 0x0134B6F8u}, // subtitles (pre-rendered lines, a textured sprite)
+        {0x013F6B20u, 0x013F78A8u}, // HUD gauges (fans and strips)
+        {0x014033F0u, 0x01403558u}, // title menu backdrop
+        {0x001C2DD0u, 0x001C30D0u}, // loading indicator (lines)
+        {0x0114FD00u, 0x01150278u}, // spriteDraw*, windowPrintf (windows)
+        {0x01155B98u, 0x01155ED8u}, // windowSpriteNoTex, windowSprite
+    };
+
+    std::vector<uint32_t> g_layers; // iosDlPushLayer stack
+    constexpr uint32_t kScreenCopy = 1u; // a 2D "header" for 0x10f37c8's screen copy
+    constexpr uint32_t kPreviousFrame = 2u; // and for feedbackBlur's display buffer (the last frame shown)
+    uint32_t g_requested = 0;       // NTO2 header of the last texTransRequest
+
+    struct Assembler
+    {
+        uint64_t prim = 0, rgbaq = 0, alpha = 0x44;
+        float s = 0.0f, t = 0.0f;
+        uint32_t u = 0, v = 0;
+        uint32_t header = 0, layer = 0;
+        std::vector<native_renderer::Vertex> strip; // this primitive's vertices
+        std::vector<native_renderer::Vertex> batch; // triangles under one state
+        uint64_t batchKey = ~0ull;
+        uint64_t batchPrim = 0, batchAlpha = 0;      // that state
+        uint32_t batchHeader = 0, batchLayer = 0;
+    } g_2d;
+
+    // glEnd's pairs being fed (round 28; SOTC_GLEND_ASYNC=0: off, glEnd waits for the jobs first as before).
+    bool g_2dDefer = false;
+    // Round 32: textured 2D batches go to the worker too (flush2D);
+    // SOTC_2D_TEX_ASYNC=0: they wait for the jobs, as before (read at the
+    // first flush).
+    inline bool texAsync2D()
+    {
+        static const bool on = !std::getenv("SOTC_2D_TEX_ASYNC") || std::atoi(std::getenv("SOTC_2D_TEX_ASYNC")) != 0;
+        return on;
+    }
+    // SOTC_HOOK_ASYNC_VERIFY: a texture's bytes (its format, the first
+    // level's pixels, the palette) as a hash, at the hook and in the job.
+    uint64_t textureBytesHash(uint32_t header)
+    {
+        if (!header || word(header) != 0x324F544Eu)
+            return 0x9E3779B97F4A7C15ull ^ header;
+        const uint32_t format = word(header + 0x1Cu), psm = format & 0x3Fu;
+        const uint32_t width = 1u << ((format >> 16) & 0xFu), height = 1u << ((format >> 20) & 0xFu);
+        const uint32_t pixelBytes = std::min<uint32_t>(psm == 0x14u ? width * height / 2u : width * height, 1u << 20);
+        uint64_t h = 0xcbf29ce484222325ull ^ format;
+        const auto run = [&h](uint32_t at, uint32_t bytes)
+        {
+            for (uint32_t a = at; a < at + bytes; a += 4u)
+                h = (h ^ word(a)) * 0x100000001b3ull;
+        };
+        run(header, 0x40u);
+        run(header + word(header + 0x14u), pixelBytes);
+        run(header + word(header + 0x18u), psm == 0x14u ? 64u : 1024u);
+        return h;
+    }
+
+    void flush2D()
+    {
+        Assembler &a = g_2d;
+        if (a.batch.empty())
+            return;
+        static const bool idColours = std::getenv("SOTC_NATIVE_IDCOLOR") != nullptr; // only the models then
+        // Blending with A = B and D = Cd leaves the frame as it was ((Cs - Cs) x C + Cd).
+        const uint64_t blendBits = a.batchAlpha & 0xFFu;
+        const bool unchanged = (a.batchPrim & 0x40u) && (blendBits & 3u) == ((blendBits >> 2) & 3u) && ((blendBits >> 6) & 3u) == 1u;
+        if (idColours || unchanged)
+        {
+            a.batch.clear();
+            a.batchKey = ~0ull;
+            return;
+        }
+        native_renderer::DrawState state;
+        state.screen = true;
+        state.screenCopy = a.batchHeader == kScreenCopy && (a.batchPrim & 0x10u);
+        state.previousFrame = a.batchHeader == kPreviousFrame && (a.batchPrim & 0x10u);
+        const bool textured = (a.batchPrim & 0x10u) && !state.screenCopy && !state.previousFrame;
+        // Round 28: glEnd's batches (g_2dDefer) with model jobs still on the
+        // worker go there as a job of their own, after them, instead of the
+        // game thread waiting for them (the fight's heat haze: ~7 ms of
+        // joins a frame, round 27's recording); a textured one (texture()
+        // decodes on the game thread, as the jobs' own textures) waits for
+        // them first, as glEnd did. Either way the renderer gets the draws in
+        // the order it got them before.
+        // Round 32: a textured one too (SOTC_2D_TEX_ASYNC=0: it waits, as
+        // before): the job looks its texture up (texture() is the worker's
+        // while jobs are pending: the cloth's and particles' jobs call it
+        // there), so the lookups keep their order. What it reads of guest
+        // memory, the texture's bytes, the PS2 reads at the kick too.
+        const bool deferred = g_2dDefer && (!textured || texAsync2D()) && hookjobs::g_on && hookjobs::pending();
+        if (!deferred && g_2dDefer)
+            hookJoin(hookjobs::k_glend);
+        state.texture = textured && !deferred ? texture(a.batchHeader) : 0;
+        const uint32_t mode = static_cast<uint32_t>(a.batchAlpha & 0xFFu);
+        // SOTC_LOG_2D_ALPHA=1: the distinct ALPHA / PRIM pairs of the 2D draws.
+        static const bool logAlpha = std::getenv("SOTC_LOG_2D_ALPHA") != nullptr;
+        if (logAlpha)
+        {
+            static std::set<std::tuple<uint64_t, uint64_t, uint32_t>> seen;
+            if (seen.insert({a.batchAlpha, a.batchPrim & 0x7F7u, a.batchLayer}).second && seen.size() < 200)
+                std::fprintf(stderr, "[2d-alpha] alpha %016llx prim %03llx layer %u header %08x verts %zu rgba %02x%02x%02x%02x\n",
+                             static_cast<unsigned long long>(a.batchAlpha), static_cast<unsigned long long>(a.batchPrim & 0x7F7u), a.batchLayer, a.batchHeader,
+                             a.batch.size(), a.batch[0].r, a.batch[0].g, a.batch[0].b, a.batch[0].a);
+        }
+        state.blend = !(a.batchPrim & 0x40u) ? native_renderer::Blend::Opaque
+                      : (mode == 0x48u ? native_renderer::Blend::Additive : native_renderer::Blend::Normal);
+        state.order = a.batchLayer;
+        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        // (x w, y w, w) -> clip (x w, y w, -, w): the backends take depth from w.
+        static const float fromDepth[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+        state.screenDepthTest = state.screenCopy;
+        if (deferred)
+        {
+            HookJob &job = hookjobs::next();
+            job.kind = kJob2D;
+            job.draw2d.batch.swap(a.batch);
+            job.draw2d.state = state;
+            job.draw2d.textured = textured;
+            job.draw2d.textureHeader = a.batchHeader;
+            job.draw2d.textureBytes = textured && hookjobs::g_verify ? textureBytesHash(a.batchHeader) : 0u;
+            hookjobs::push();
+            a.batch.clear();
+            a.batchKey = ~0ull;
+            return;
+        }
+        const uint64_t mesh = (1ull << 62) | g_skinnedDraws++;
+        native_renderer::uploadMesh(mesh, a.batch.data(), static_cast<uint32_t>(a.batch.size()), true);
+        native_renderer::draw(mesh, state.screenDepthTest ? fromDepth : identity, state);
+        ++g_frameDraws;
+        a.batch.clear();
+        a.batchKey = ~0ull;
+    }
+
+    // The worker's half of a deferred 2D batch: what flush2D does with it.
+    void draw2DRun(Draw2DJob &job)
+    {
+        SOTC_READ_SITE(9);
+        if (job.textured)
+        {
+            if (hookjobs::g_verify)
+            {
+                ++hookjobs::g_tex2dChecked;
+                hookjobs::g_tex2dChanged += textureBytesHash(job.textureHeader) != job.textureBytes ? 1u : 0u;
+            }
+            job.state.texture = texture(job.textureHeader);
+        }
+        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        static const float fromDepth[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+        const uint64_t mesh = (1ull << 62) | g_skinnedDraws++;
+        native_renderer::uploadMesh(mesh, job.batch.data(), static_cast<uint32_t>(job.batch.size()), true);
+        native_renderer::draw(mesh, job.state.screenDepthTest ? fromDepth : identity, job.state);
+        ++g_frameDraws;
+        job.batch.clear();
+    }
+
+    void emit2D(const native_renderer::Vertex &v0, const native_renderer::Vertex &v1, const native_renderer::Vertex &v2)
+    {
+        Assembler &a = g_2d;
+        const uint64_t key = (a.prim & 0x150u) ^ ((a.alpha & 0xFFu) << 12) ^ (static_cast<uint64_t>(a.header) << 20) ^ (static_cast<uint64_t>(a.layer) << 56);
+        if (key != a.batchKey)
+        {
+            flush2D();
+            a.batchKey = key;
+            a.batchPrim = a.prim;
+            a.batchAlpha = a.alpha;
+            a.batchHeader = a.header;
+            a.batchLayer = a.layer;
+        }
+        a.batch.push_back(v0);
+        a.batch.push_back(v1);
+        a.batch.push_back(v2);
+    }
+
+    // The view depth of a GS Z (the camera's zA + zB / w, as the bloom's
+    // threshold), for 2D draws tested against the picture's depth.
+    float viewDepth(uint32_t z)
+    {
+        if (!g_cameraContext)
+            return 1.0f;
+        const float zA = real(g_cameraContext + 0x4A0u + 10u * 4u), zB = real(g_cameraContext + 0x4A0u + 14u * 4u);
+        const float d = static_cast<float>(z) - zA;
+        const float w = d > 0.0f ? zB / d : 1e6f;
+        return std::isfinite(w) ? std::clamp(w, 0.11f, 1e6f) : 1e6f;
+    }
+
+    // z: the GS Z of XYZ2 / XYZ3 (32 bits) or XYZF2 / XYZF3 (24).
+    void vertex2D(uint64_t xyz, bool kick, uint32_t z)
+    {
+        Assembler &a = g_2d;
+        native_renderer::Vertex o{};
+        o.x = ((static_cast<float>(xyz & 0xFFFFu) / 16.0f) - 2048.0f) / 256.0f;
+        o.y = -((static_cast<float>((xyz >> 16) & 0xFFFFu) / 16.0f) - 2048.0f) / 224.0f;
+        o.nz = 1.0f;
+        if (a.header == kScreenCopy)
+        {
+            // The heat haze is depth tested (TEST ZTE, GEQUAL): (x w, y w, w).
+            const float w = viewDepth(z);
+            o.x *= w;
+            o.y *= w;
+            o.z = w;
+        }
+        o.r = static_cast<uint8_t>(a.rgbaq);
+        o.g = static_cast<uint8_t>(a.rgbaq >> 8);
+        o.b = static_cast<uint8_t>(a.rgbaq >> 16);
+        o.a = static_cast<uint8_t>(a.rgbaq >> 24);
+        if (((a.alpha >> 4) & 3u) == 2u) // C = FIX
+            o.a = static_cast<uint8_t>(std::min<uint64_t>((a.alpha >> 32) & 0xFFu, 0x80u));
+        // kScreenCopy: 0x10f37c8's 256 x 256 copy of the screen.
+        const uint32_t format = a.header == kScreenCopy ? 0x00880000u : (a.header ? word(a.header + 0x1Cu) : 0u);
+        if ((a.prim & 0x100u) && a.header == kPreviousFrame) // the display buffer, 512 x 448
+        {
+            o.u = (static_cast<float>(a.u) / 16.0f) / 512.0f;
+            o.v = (static_cast<float>(a.v) / 16.0f) / 448.0f;
+        }
+        else if (a.prim & 0x100u) // FST: UV in texels, 12.4
+        {
+            o.u = (static_cast<float>(a.u) / 16.0f) / static_cast<float>(1u << ((format >> 16) & 0xFu));
+            o.v = (static_cast<float>(a.v) / 16.0f) / static_cast<float>(1u << ((format >> 20) & 0xFu));
+        }
+        else
+        {
+            // ST / Q (RGBAQ's high word; the sprites give 1).
+            float q;
+            const uint32_t qBits = static_cast<uint32_t>(a.rgbaq >> 32);
+            std::memcpy(&q, &qBits, 4);
+            const float k = (q != 0.0f && std::isfinite(q)) ? 1.0f / q : 1.0f;
+            o.u = a.s * k;
+            o.v = a.t * k;
+        }
+        std::vector<native_renderer::Vertex> &v = a.strip;
+        v.push_back(o);
+        if (!kick)
+            return;
+        const size_t n = v.size();
+        switch (a.prim & 7u)
+        {
+        case 1: case 2: // line, line strip: one pixel wide
+            if (n >= 2)
+            {
+                native_renderer::Vertex p0 = v[n - 2], p1 = v[n - 1];
+                float dx = (p1.x - p0.x) * 256.0f, dy = (p1.y - p0.y) * 224.0f;
+                const float len = std::sqrt(dx * dx + dy * dy);
+                if (len > 0.0f)
+                {
+                    const float nx = -dy / len * 0.5f / 256.0f, ny = dx / len * 0.5f / 224.0f;
+                    native_renderer::Vertex q[4] = {p0, p0, p1, p1};
+                    q[0].x += nx; q[0].y += ny; q[1].x -= nx; q[1].y -= ny;
+                    q[2].x += nx; q[2].y += ny; q[3].x -= nx; q[3].y -= ny;
+                    emit2D(q[0], q[1], q[2]);
+                    emit2D(q[1], q[3], q[2]);
+                }
+                if ((a.prim & 7u) == 1u)
+                    v.clear();
+            }
+            break;
+        case 3: // triangles
+            if (n == 3)
+            {
+                emit2D(v[0], v[1], v[2]);
+                v.clear();
+            }
+            break;
+        case 4: // triangle strip
+            if (n >= 3)
+                emit2D(v[n - 3], v[n - 2], v[n - 1]);
+            break;
+        case 5: // triangle fan
+            if (n >= 3)
+                emit2D(v[0], v[n - 2], v[n - 1]);
+            break;
+        case 6: // sprite: two opposite corners
+            if (n == 2)
+            {
+                native_renderer::Vertex q[4] = {v[0], v[1], v[1], v[1]};
+                q[1].y = v[0].y; q[1].v = v[0].v; // (x1, y0)
+                q[2].x = v[0].x; q[2].u = v[0].u; // (x0, y1)
+                emit2D(q[0], q[1], q[2]);
+                emit2D(q[1], q[3], q[2]);
+                v.clear();
+            }
+            break;
+        default:
+            v.clear();
+        }
+    }
+
+    // SOTC_GSREG_CENSUS=1: gsReg calls by return address, every 120 frames
+    // (resolve with recomp/game/symbols.txt): who draws 2D through gsReg.
+    void gsRegCensus(uint32_t ra)
+    {
+        static const bool on = ps2_diag::env("SOTC_GSREG_CENSUS") != nullptr;
+        if (!on)
+            return;
+        static std::unordered_map<uint32_t, uint32_t> calls;
+        static uint64_t since = 0;
+        ++calls[ra];
+        if (g_frame < since + 120u)
+            return;
+        std::vector<std::pair<uint32_t, uint32_t>> top(calls.begin(), calls.end());
+        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        std::string line = "[gsreg] frame=" + std::to_string(g_frame);
+        char item[32];
+        for (size_t i = 0; i < top.size() && i < 200u; ++i)
+        {
+            std::snprintf(item, sizeof(item), " %08x:%u", top[i].first, top[i].second);
+            line += item;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        calls.clear();
+        since = g_frame;
+    }
+
+    // One GS register write of a 2D draw, as gsReg or an A+D packet gives it.
+    void feed2D(uint32_t reg, uint64_t value)
+    {
+        Assembler &a = g_2d;
+        a.layer = g_layers.empty() ? 25u : g_layers.back();
+        a.header = g_requested;
+        switch (reg)
+        {
+        case 0x00u: a.prim = value; a.strip.clear(); break;
+        case 0x01u: a.rgbaq = value; break;
+        case 0x02u:
+            std::memcpy(&a.s, &value, 4);
+            std::memcpy(&a.t, reinterpret_cast<const uint8_t *>(&value) + 4, 4);
+            break;
+        case 0x03u: a.u = value & 0x3FFFu; a.v = (value >> 16) & 0x3FFFu; break;
+        case 0x04u: vertex2D(value, true, static_cast<uint32_t>(value >> 32) & 0xFFFFFFu); break; // XYZF2
+        case 0x05u: vertex2D(value, true, static_cast<uint32_t>(value >> 32)); break;             // XYZ2
+        case 0x0Cu: vertex2D(value, false, static_cast<uint32_t>(value >> 32) & 0xFFFFFFu); break; // XYZF3: no drawing kick
+        case 0x0Du: vertex2D(value, false, static_cast<uint32_t>(value >> 32)); break;             // XYZ3
+        case 0x42u: a.alpha = value; break;
+        }
+    }
+
+    // ---- bossDeathEffectBegin's mask (round 27) ---------------------------
+    //
+    // While getNowBossEffect (0x1186290) has bit 0, bossDeathEffectBegin
+    // (0x1085640) draws, in layer 8, into a 256 x 256 CT32 buffer (FRAME FBP
+    // getFrameBufferSizeFBP() + (W x H) >> 11, FBW 4, XYOFFSET 1920, SCISSOR
+    // 0..255): the buffer cleared to 0 (spriteNoTexFast, colour 0), then a
+    // 16-segment fan of glColor (0, 0, 0, 1.0) = RGBA (0, 0, 0, 0x80), its
+    // centre (real 0x1214740, real 0x1214744) x 256 - 128 and its rim at
+    // 256 x real(0x1186298) around it (glVertex2f; TEST ATST NEVER, AFAIL
+    // FB_ONLY: every pixel written, ALPHA 0x44 FIX 0x80: Cs). modelDisp then
+    // gives the surfaces with flag bit 17 setBossEffectTexture (0x1085400)
+    // instead of their own texture: TEX0 that buffer (TBP
+    // getFrameBufferSizeTBP() + (W x H) >> 6, TBW 4, CT32, 256 x 256, TCC 1,
+    // TFX MODULATE), TEX1 0x60 (linear, no mips), ALPHA 0x44 FIX 0x80
+    // (normal blending), TEST 0x51003 (no alpha cut, Z GEQUAL), the same for
+    // context 2. So those surfaces are black, their alpha the vertex alpha
+    // inside the growing disc and 0 outside it. bossDeathEffectEnd's copies
+    // reuse the buffer after the models (round 16's note that the fan has no
+    // effect looked at a scene with no bit-17 surface).
+    // Here the fan's GIF packet (glEnd from inside bossDeathEffectBegin,
+    // XYZ2 in screen space) is rasterised into a host RGBA texture as the GS
+    // would fill the buffer, uploaded when it changes, under one of four
+    // ids in turn (bounded memory; the frame still in flight keeps its own).
+    struct BossMask
+    {
+        std::atomic<uint64_t> id{0};      // the texture the bit-17 surfaces use (0: none)
+        std::atomic<uint64_t> frame{~0ull}; // the game frame it was made in
+        uint64_t hash = 0;
+        uint32_t slot = 0;
+        std::vector<uint8_t> rgba;
+    };
+    BossMask g_bossMask;
+    constexpr uint64_t kBossMaskId = 0x0200B05500000000ull; // bit 57: apart from the texture keys (bit 58) and the meshes (59-63)
+    // SOTC_BOSSMASK=0: the bit-17 surfaces keep their own texture (round 26's picture).
+    bool bossMaskOn()
+    {
+        static const bool on = !std::getenv("SOTC_BOSSMASK") || std::atoi(std::getenv("SOTC_BOSSMASK")) != 0;
+        return on;
+    }
+
+    // The packet's (value, register) qwords from `start` + 0x20 to `end`, as
+    // the GS would draw them into the 256 x 256 buffer (XYOFFSET 1920,
+    // scissor 0..255, every pixel written): triangles, strips and fans, the
+    // kick vertex's colour (flat; the fan's are all one), sampled at the
+    // pixels' centres (x + 0.5, y + 0.5): the emulated GS's coverage (round
+    // 27, PS2X_GS_FAN_DUMP: 18 057 texels, ~20 differ on the rim).
+    void rasteriseBossFan(uint32_t start, uint32_t end, std::vector<uint8_t> &rgba)
+    {
+        constexpr int kSize = 256;
+        rgba.assign(static_cast<size_t>(kSize) * kSize * 4u, 0u);
+        struct V
+        {
+            float x, y;
+            uint32_t rgba;
+        };
+        V ring[3];
+        uint32_t n = 0, prim = 0, colour = 0;
+        const auto triangle = [&rgba](const V &a, const V &b, const V &c, uint32_t col)
+        {
+            // Edge functions, made counter-clockwise; top-left rule for ties.
+            float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if (area == 0.0f)
+                return;
+            const V *p0 = &a, *p1 = &b, *p2 = &c;
+            if (area < 0.0f)
+                std::swap(p1, p2), area = -area;
+            const int x0 = std::max(0, static_cast<int>(std::floor(std::min({a.x, b.x, c.x}))));
+            const int x1 = std::min(kSize - 1, static_cast<int>(std::ceil(std::max({a.x, b.x, c.x}))));
+            const int y0 = std::max(0, static_cast<int>(std::floor(std::min({a.y, b.y, c.y}))));
+            const int y1 = std::min(kSize - 1, static_cast<int>(std::ceil(std::max({a.y, b.y, c.y}))));
+            const V *e[3][2] = {{p0, p1}, {p1, p2}, {p2, p0}};
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x)
+                {
+                    bool inside = true;
+                    for (int k = 0; k < 3 && inside; ++k)
+                    {
+                        const V &s = *e[k][0], &t = *e[k][1];
+                        const float w = (t.x - s.x) * (static_cast<float>(y) + 0.5f - s.y) - (t.y - s.y) * (static_cast<float>(x) + 0.5f - s.x);
+                        // A pixel on an edge belongs to one of the two triangles sharing it.
+                        const bool owns = (t.y > s.y) || (t.y == s.y && t.x < s.x);
+                        inside = w > 0.0f || (w == 0.0f && owns);
+                    }
+                    if (inside)
+                        std::memcpy(&rgba[(static_cast<size_t>(y) * kSize + x) * 4u], &col, 4);
+                }
+        };
+        for (uint32_t q = start + 0x20u; q + 16u <= end; q += 16u)
+        {
+            uint64_t value;
+            std::memcpy(&value, g_ram + (q & 0x1FFFFF0u), 8);
+            const uint32_t reg = word(q + 8u) & 0xFFu;
+            if (reg == 0x00u)
+            {
+                prim = static_cast<uint32_t>(value) & 7u;
+                n = 0;
+            }
+            else if (reg == 0x01u)
+            {
+                const uint32_t r = static_cast<uint32_t>(value) & 0xFFu, g = (static_cast<uint32_t>(value) >> 8) & 0xFFu, b = (static_cast<uint32_t>(value) >> 16) & 0xFFu,
+                               a = (static_cast<uint32_t>(value) >> 24) & 0xFFu;
+                colour = r | (g << 8) | (b << 16) | (a << 24);
+            }
+            else if (reg == 0x04u || reg == 0x05u || reg == 0x0Cu || reg == 0x0Du)
+            {
+                const bool kick = reg == 0x04u || reg == 0x05u;
+                V v{static_cast<float>(value & 0xFFFFu) / 16.0f - 1920.0f, static_cast<float>((value >> 16) & 0xFFFFu) / 16.0f - 1920.0f, colour};
+                if (prim == 5u) // fan: ring[0] the centre
+                {
+                    if (n < 2u)
+                        ring[n] = v;
+                    else
+                    {
+                        ring[2] = v;
+                        if (kick)
+                            triangle(ring[0], ring[1], ring[2], colour);
+                        ring[1] = v;
+                    }
+                }
+                else if (prim == 4u) // strip
+                {
+                    if (n < 2u)
+                        ring[n] = v;
+                    else
+                    {
+                        ring[2] = v;
+                        if (kick)
+                            triangle(ring[0], ring[1], ring[2], colour);
+                        ring[0] = ring[1];
+                        ring[1] = ring[2];
+                    }
+                }
+                else if (prim == 3u) // list
+                {
+                    ring[n % 3u] = v;
+                    if (n % 3u == 2u && kick)
+                        triangle(ring[0], ring[1], ring[2], colour);
+                }
+                ++n;
+            }
+        }
+    }
+
+    // glEnd called by bossDeathEffectBegin: the fan's mask for this frame.
+    void captureBossFan(uint32_t start, uint32_t end)
+    {
+        if (!bossMaskOn() || !start || end <= start + 0x20u || end - start >= 0x10000u)
+            return;
+        BossMask &m = g_bossMask;
+        // The packet's words are what the mask depends on (vertices, colours).
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t q = start + 0x20u; q + 4u <= end; q += 4u)
+            h = (h ^ word(q)) * 0x100000001b3ull;
+        if (h != m.hash || !m.id.load(std::memory_order_relaxed) || !native_renderer::hasTexture(m.id.load(std::memory_order_relaxed)))
+        {
+            rasteriseBossFan(start, end, m.rgba);
+            m.hash = h;
+            m.slot = (m.slot + 1u) & 3u;
+            const uint64_t id = kBossMaskId | m.slot;
+            native_renderer::uploadTexture(id, 256u, 256u, m.rgba.data(), 1u);
+            m.id.store(id, std::memory_order_relaxed);
+            static const bool log = ps2_diag::env("SOTC_BOSSMASK_LOG") != nullptr;
+            if (log)
+            {
+                uint32_t covered = 0;
+                for (size_t i = 3; i < m.rgba.size(); i += 4u)
+                    covered += m.rgba[i] != 0u;
+                std::fprintf(stderr, "[bossmask] frame %llu id %016llx radius %g centre %g %g texels %u (%u qwords)\n", (unsigned long long)g_frame,
+                             (unsigned long long)id, real(0x01186298u), real(0x01214740u), real(0x01214744u), covered, (end - start) / 16u - 2u);
+                // SOTC_BOSSMASK_DUMP=<dir>: each new mask as a PPM of its alpha.
+                if (const char *dir = ps2_diag::env("SOTC_BOSSMASK_DUMP"))
+                {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/bossmask_%06llu.pgm", dir, (unsigned long long)g_frame);
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fprintf(f, "P5 256 256 255\n");
+                        for (size_t i = 3; i < m.rgba.size(); i += 4u)
+                            std::fputc(m.rgba[i] ? 255 : 0, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
+        m.frame.store(g_frame, std::memory_order_relaxed);
+    }
+    // The mask for this frame's bit-17 surfaces: made this frame or the last
+    // (0: none; the draw is left out, as an empty mask would show nothing).
+    uint64_t bossMaskTexture()
+    {
+        const uint64_t frame = g_bossMask.frame.load(std::memory_order_relaxed);
+        if (frame == ~0ull || frame + 1u < g_frame)
+            return 0;
+        return g_bossMask.id.load(std::memory_order_relaxed);
+    }
+
+    // The gl* immediate API (glBeginWithDlLayerNo .. glEnd) builds a GIF
+    // packet on the CPU: at *0x1186398 a DMA tag, a GIF tag (+0x10, A+D),
+    // then (value, register) pairs up to *0x1186394: TEST, PRIM, and per
+    // vertex RGBAQ, ST or UV, XYZ2 already in screen space. glEnd chains it
+    // in the layer glBegin pushed; here the pairs go through the 2D path.
+    constexpr uint32_t kGlEnd = 0x0108D060u;
+    PS2Runtime::RecompiledFunction g_glEnd = nullptr;
+    std::vector<uint64_t> *g_immRec128 = nullptr; // round 128's check: record the next glEnd's feed
+
+    void glEndHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        // The 2D draws after the model jobs before them: flush2D waits for
+        // them, or queues an untextured batch behind them (round 28).
+        // (read here: the Vita's env.txt comes after static init)
+        static const bool async = !std::getenv("SOTC_GLEND_ASYNC") || std::atoi(std::getenv("SOTC_GLEND_ASYNC")) != 0;
+        if (!async)
+            hookJoin(hookjobs::k_glend);
+        static const bool off = std::getenv("SOTC_NATIVE_NOGL") != nullptr;
+        const uint32_t start = word(0x01186398u), end = word(0x01186394u);
+        // Not drawn here: bossDeathEffectBegin's fan goes to an off-screen buffer.
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const bool offScreen = ra >= 0x01085640u && ra < 0x01085E40u;
+        if (offScreen)
+            captureBossFan(start, end);
+        // 0x10f3fb0's strips (the heat haze behind the bird) sample the copy
+        // of the screen 0x10f37c8 made in their layer (UV in its 256 x 256 texels).
+        const bool haze = ra >= 0x010F3FB0u && ra < 0x010F4890u;
+        const uint32_t requested = g_requested;
+        if (haze)
+            g_requested = kScreenCopy;
+        if (!off && !offScreen && start && end > start + 0x20u && end - start < 0x100000u && word(0x0118B5B0u) == 0u)
+        {
+            static const bool log = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+            if (log)
+            {
+                static std::set<uint64_t> seen;
+                const uint32_t layer = g_layers.empty() ? 25u : g_layers.back();
+                if (seen.insert((static_cast<uint64_t>(GPR_U32(ctx, 31)) << 8) | layer).second)
+                    std::fprintf(stderr, "[gl] ra %08x layer %u qwords %u\n", GPR_U32(ctx, 31), layer, (end - start) / 16u - 2u);
+            }
+            g_2dDefer = async;
+            // Round 128 (SOTC_IMM128_CHECK): the first glEnd after imm128's check armed it, recorded.
+            std::vector<uint64_t> *rec = g_immRec128;
+            if (rec)
+            {
+                g_immRec128 = nullptr;
+                rec->push_back(g_layers.empty() ? 25u : g_layers.back());
+                rec->push_back(g_requested);
+            }
+            for (uint32_t q = start + 0x20u; q + 16u <= end; q += 16u)
+            {
+                uint64_t value;
+                std::memcpy(&value, g_ram + (q & 0x1FFFFF0u), 8);
+                if (rec)
+                {
+                    rec->push_back(value);
+                    rec->push_back(word(q + 8u) & 0xFFu);
+                }
+                feed2D(word(q + 8u) & 0xFFu, value);
+            }
+            g_2dDefer = false;
+        }
+        g_requested = requested;
+        g_glEnd(rdram, ctx, runtime);
+    }
+
+    // ---- Round 128 (SOTC_IMM128, default on; A/B `imm128`, `r128all`): an
+    // immediate-mode primitive (glBegin .. glEnd) whose GS pairs were made in
+    // host memory, fed to the 2D assembler as glEndHook feeds the packet's:
+    // the same frame sync and join, the layer glBegin would have pushed (its
+    // iosDlGetLayer), the screen copy for the haze strips, the same `not
+    // drawn` conditions. pairs: (value, register) x count, TEST and PRIM
+    // first, as the packet has them.
+    void immFeed128(uint8_t *rdram, const uint64_t *pairs, uint32_t count, uint32_t layer, bool haze)
+    {
+        const ps2_load::GameZone zone134(0x2013u); // round 134 (prof129): the 2D assembler's part of an immediate quad
+        syncFrame(rdram);
+        static const bool async = !std::getenv("SOTC_GLEND_ASYNC") || std::atoi(std::getenv("SOTC_GLEND_ASYNC")) != 0;
+        if (!async)
+            hookJoin(hookjobs::k_glend);
+        static const bool off = std::getenv("SOTC_NATIVE_NOGL") != nullptr;
+        if (off || count == 0u || word(0x0118B5B0u) != 0u)
+            return;
+        const uint32_t requested = g_requested;
+        if (haze)
+            g_requested = kScreenCopy;
+        g_layers.push_back(layer);
+        g_2dDefer = async;
+        for (uint32_t i = 0; i < count; ++i)
+            feed2D(static_cast<uint32_t>(pairs[2u * i + 1u]) & 0xFFu, pairs[2u * i]);
+        g_2dDefer = false;
+        g_layers.pop_back();
+        g_requested = requested;
+    }
+    // The check's view of the same feed: the layer, the header, the pairs.
+    void immRecord128(std::vector<uint64_t> &rec, const uint64_t *pairs, uint32_t count, uint32_t layer, bool haze)
+    {
+        rec.push_back(layer);
+        rec.push_back(haze ? kScreenCopy : g_requested);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            rec.push_back(pairs[2u * i]);
+            rec.push_back(pairs[2u * i + 1u] & 0xFFu);
+        }
+    }
+    void immArm128(std::vector<uint64_t> *rec) { g_immRec128 = rec; }
+
+    void gsRegHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        gsRegCensus(ra);
+        // SOTC_LOG_GSREG=<reg>: who writes that register, in which layer, with what (debugging).
+        static const int logReg = std::getenv("SOTC_LOG_GSREG") ? static_cast<int>(std::strtol(std::getenv("SOTC_LOG_GSREG"), nullptr, 0)) : -1;
+        if (logReg >= 0 && (GPR_U32(ctx, 4) & 0xFFu) == static_cast<uint32_t>(logReg))
+        {
+            static std::set<std::pair<uint32_t, uint64_t>> seen;
+            if (seen.insert({ra, GPR_U64(ctx, 5)}).second && seen.size() < 300)
+                std::fprintf(stderr, "[gsreg-log] ra %08x layer %u value %016llx\n", ra, g_layers.empty() ? 99u : g_layers.back(),
+                             static_cast<unsigned long long>(GPR_U64(ctx, 5)));
+        }
+        if (ra >= 0x0109E2A0u && ra < 0x0109FB08u)
+            g_bloomRan = true;
+        if (ra >= 0x01089BF8u && ra < 0x0108A0E0u)
+        {
+            // feedbackBlur / feedbackBlur2 (layer 29): the display buffer, the
+            // last frame shown, laid over the new one (FIX or vertex alpha).
+            syncFrame(rdram);
+            hookJoin(hookjobs::k_gsreg_feedback);
+            // SOTC_FEEDBACK_LOG=1 (debugging, round 12): the frames that use it.
+            static const bool feedbackLog = ps2_diag::env("SOTC_FEEDBACK_LOG") != nullptr;
+            if (feedbackLog)
+            {
+                static uint64_t lastLogged = ~0ull;
+                if (g_frame != lastLogged)
+                    std::fprintf(stderr, "[feedback] frame %llu ra %08x a0 %02x a1 %016llx\n", (unsigned long long)g_frame, ra, GPR_U32(ctx, 4) & 0xFFu,
+                                 (unsigned long long)GPR_U64(ctx, 5));
+                lastLogged = g_frame;
+            }
+            if (!native_renderer::tuning().feedback)
+            {
+                g_gsReg(rdram, ctx, runtime);
+                return;
+            }
+            const uint32_t requested = g_requested;
+            g_requested = kPreviousFrame;
+            feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
+            g_requested = requested;
+            g_gsReg(rdram, ctx, runtime);
+            return;
+        }
+        if (ra >= 0x0109C610u && ra < 0x0109CD28u)
+        {
+            // refractionEnd under water (0x109c610): a grid of strips over the
+            // screen at layer 19, its ST waving over refractionBegin's 256 x 256
+            // copy of the picture so far.
+            syncFrame(rdram);
+            hookJoin(hookjobs::k_gsreg_refraction);
+            const uint32_t requested = g_requested;
+            g_requested = kScreenCopy;
+            feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
+            g_requested = requested;
+            g_gsReg(rdram, ctx, runtime);
+            return;
+        }
+        // Round 31: the 2D functions' writes as glEnd's (round 28): an
+        // untextured batch flushed while model jobs are pending goes to the
+        // worker as a job after them, a textured one waits for them first
+        // (flush2D); the renderer gets the draws in the same order. The
+        // console's recording of round 30 had gsReg at 7.3% of the game
+        // thread (fadeScreen 51%), nearly all of it this join's wait.
+        // SOTC_GSREG_ASYNC=0: the join at every write, as before.
+        static const bool async2d = !std::getenv("SOTC_GSREG_ASYNC") || std::atoi(std::getenv("SOTC_GSREG_ASYNC")) != 0;
+        for (const Range &r : k2D)
+        {
+            if (ra < r.start || ra >= r.end)
+                continue;
+            syncFrame(rdram);
+            if (!async2d)
+                hookJoin(hookjobs::k_gsreg_2d);
+            g_2dDefer = async2d;
+            feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
+            g_2dDefer = false;
+            break;
+        }
+        g_gsReg(rdram, ctx, runtime);
+    }
+
+    void texTransRequestHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_ram != rdram)
+            g_ram = rdram;
+        const uint32_t resource = GPR_U32(ctx, 4);
+        g_requested = resource ? word(resource + 0x20u) : 0u;
+        g_texTransRequest(rdram, ctx, runtime);
+    }
+
+    void pushLayerHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // SOTC_LOG_LAYER=<n> (debugging): who pushes display list layer n (caller, count).
+        static const int logLayer = ps2_diag::env("SOTC_LOG_LAYER") ? std::atoi(ps2_diag::env("SOTC_LOG_LAYER")) : -1;
+        if (logLayer >= 0 && GPR_U32(ctx, 4) == static_cast<uint32_t>(logLayer))
+        {
+            static std::map<uint32_t, uint64_t> callers;
+            const uint64_t n = ++callers[GPR_U32(ctx, 31)];
+            if (n == 1u || n % 600u == 0u)
+                std::fprintf(stderr, "[layer %d] pushed from %08x (%llu)\n", logLayer, GPR_U32(ctx, 31), static_cast<unsigned long long>(n));
+            if (GPR_U32(ctx, 31) == 0x010860F8u && (n < 40u || n % 60u == 0u))
+                std::fprintf(stderr, "[bossfx] frame %u flags %x radius %g rounds %d tint %08x %08x %08x sharp %08x blur %08x clear %08x %08x %08x %08x fade %08x %08x %08x %08x\n", g_frame,
+                             word(0x01186290u), real(0x01186298u), static_cast<int>(word(0x011862A0u)), word(0x011862B0u), word(0x011862B4u), word(0x011862B8u), word(0x011862C4u), word(0x011862C0u),
+                             word(0x01186280u), word(0x01186284u), word(0x01186288u), word(0x0118628Cu), word(0x01186260u), word(0x01186264u), word(0x01186268u), word(0x0118626Cu));
+        }
+        // Testing: refractionEnd's underwater waves on any scene (the flag
+        // getFogUnderWater reads, set just before refractionEnd tests it).
+        static const bool underwater = std::getenv("SOTC_FORCE_UNDERWATER") != nullptr;
+        if (underwater && GPR_U32(ctx, 31) == 0x0109D018u)
+        {
+            const uint32_t one = 1u;
+            std::memcpy(rdram + 0x1186328u, &one, 4);
+        }
+        // Testing: feedbackBlur2's trail at this alpha (graphFrameFinish reads
+        // 0x118b740 after refractionEnd).
+        static const int feedback = std::getenv("SOTC_FORCE_FEEDBACK") ? std::atoi(std::getenv("SOTC_FORCE_FEEDBACK")) : 0;
+        if (feedback && GPR_U32(ctx, 31) == 0x0109D018u)
+            std::memcpy(rdram + 0x118B740u, &feedback, 4);
+        // feedbackBlur2 sets no ALPHA: its sprite blends by the layer's root
+        // context, ALPHA 0x60 ((Cs - Cs) x FIX + Cd: no change), as the GS shows.
+        if (GPR_U32(ctx, 31) >= 0x01089E50u && GPR_U32(ctx, 31) < 0x0108A0E0u)
+            g_2d.alpha = 0x60u;
+        // Testing: bossDeathEffectBegin's fan (bit 0 of 0x1186290) at this radius.
+        static const float fan = std::getenv("SOTC_FORCE_BOSSFAN") ? static_cast<float>(std::atof(std::getenv("SOTC_FORCE_BOSSFAN"))) : 0.0f;
+        if (fan > 0.0f && GPR_U32(ctx, 31) == 0x01085910u)
+        {
+            uint32_t flags;
+            std::memcpy(&flags, rdram + 0x1186290u, 4);
+            flags |= 1u;
+            std::memcpy(rdram + 0x1186290u, &flags, 4);
+            std::memcpy(rdram + 0x1186298u, &fan, 4);
+            const float none = 0.0f;
+            std::memcpy(rdram + 0x118629Cu, &none, 4);
+            // SOTC_FORCE_BOSSFAN_CENTRE=u,v (testing, round 27): the fan's centre too.
+            if (const char *centre = std::getenv("SOTC_FORCE_BOSSFAN_CENTRE"))
+            {
+                float uv[2] = {0.0f, 0.0f};
+                if (std::sscanf(centre, "%f,%f", &uv[0], &uv[1]) == 2)
+                    std::memcpy(rdram + 0x1214740u, uv, 8);
+            }
+        }
+        g_layers.push_back(GPR_U32(ctx, 4));
+        g_pushLayer(rdram, ctx, runtime);
+    }
+
+    // shadowDisp's two iosDlPopLayer calls return to these: the skinned path's, the rigid one's.
+    constexpr uint32_t kShadowPopSkinned = 0x0109E1C4u, kShadowPopRigid = 0x0109E274u;
+    void shadowCapture(uint32_t chain, uint32_t model, bool skinnedShadow);
+
+    void popLayerHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!g_layers.empty())
+            g_layers.pop_back();
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const bool shadow = ra == kShadowPopSkinned || ra == kShadowPopRigid;
+        const uint32_t shadowModel = GPR_U32(ctx, 17), shadowChain = GPR_U32(ctx, 18);
+        g_popLayer(rdram, ctx, runtime);
+        if (runtime->transferPending())
+            return; // a thread switch below (round 52): nothing more here
+        if (shadow && (ra == kShadowPopRigid || native_renderer::tuning().bodyShadows))
+        {
+            syncFrame(rdram);
+            shadowCapture(shadowChain, shadowModel, ra == kShadowPopSkinned);
+        }
+    }
+
+    // ---- Cloth and hair: meshDisp -------------------------------------------
+    //
+    // meshCreate builds a grid of rows x columns simulated on the CPU (two
+    // buffers, the current one at +0x10 of the "#" object's +0x20 block:
+    // [0]/[1] buffers, [2] rows, [3] columns, [4] current). A buffer holds
+    // the view matrix (qwords 4-7), then per row an UNPACK and `columns`
+    // vertices of 4 qwords: world position, normal, ST(Q), colour (floats,
+    // 0x80 = 1); triangle strips join each row to the next. meshDisp (0x109ab80)
+    // chains the current buffer; the caller has asked for the texture.
+    // Lights in camera space: those of the last skinned part drawn (the
+    // character the cloth hangs from).
+    float g_viewLights[32];
+    bool g_haveViewLights = false;
+    constexpr uint32_t kMeshDisp = 0x0109AB80u;
+    PS2Runtime::RecompiledFunction g_meshDisp = nullptr;
+
+    void meshDispHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        const lines67::Scope l67(lines67::kHook, true);
+        const uint32_t object = GPR_U32(ctx, 4);
+        const uint32_t header = g_requested;
+        const uint32_t layer = g_layers.empty() ? 2u : g_layers.back();
+        g_meshDisp(rdram, ctx, runtime);
+        if (runtime->transferPending())
+            return; // a thread switch below (round 52): nothing more here
+        HookTimer hookTimer;
+        if (!g_cameraContext || g_ram[(object + 8u) & 0x1FFFFFFu] != '#')
+            return;
+        // The rest on the worker after the model jobs (g_viewLights: the
+        // last skinned part's), or here.
+        MeshDispJob local;
+        MeshDispJob &job = hookjobs::g_on ? hookjobs::next().mesh : local;
+        job.object = object;
+        job.header = header;
+        job.layer = layer;
+        for (int i = 0; i < 16; ++i)
+        {
+            job.camera[i] = real(g_cameraContext + 0x5A0u + i * 4u);
+            job.projection[i] = real(g_cameraContext + 0x40u + i * 4u);
+        }
+        {
+            // The grid as it is now: the current buffer's view matrix and
+            // vertices (the game simulates the cloth into the other buffer
+            // and turns them; read later, it drifted off the body).
+            const uint32_t base = object + 0x20u;
+            job.rows = word(base + 8u);
+            job.columns = word(base + 12u);
+            job.buffer = word(base + (word(base + 16u) & 1u) * 4u);
+            if (job.rows < 2u || job.rows > 64u || job.columns < 2u || job.columns > 64u || !job.buffer)
+                return;
+            const uint32_t bytes = 0xB0u + job.rows * (job.columns * 0x40u + 0x10u);
+            job.grid.resize(bytes);
+            // Round 67 (SOTC_WALK67): a 4-byte-aligned grid inside main RAM
+            // copied in one block with its lines asked for 1 KB ahead
+            // (the same words as the word-by-word loop: word() reads
+            // g_ram + (a & 0x1fffffc), which for such a range is the block).
+            const uint32_t at = job.buffer & 0x1FFFFFFu;
+            if (sotc_decomp::walk67On() && (job.buffer & 3u) == 0u && at + bytes <= 0x2000000u)
+            {
+                for (uint32_t i = 0; i < 1024u && i < bytes; i += 32u)
+                    prefetchGuest(job.buffer + i);
+                for (uint32_t i = 0; i < bytes; i += 256u)
+                {
+                    const uint32_t n = std::min<uint32_t>(256u, bytes - i);
+                    for (uint32_t k = 1024u; k < 1280u && i + k < bytes; k += 32u)
+                        prefetchGuest(job.buffer + i + k);
+                    for (uint32_t k = 0; k < n; k += 64u)
+                        lines67::touch(job.buffer + i + k);
+                    lines67::touch(job.buffer + i + n - 1u);
+                    std::memcpy(job.grid.data() + i, g_ram + at + i, n);
+                }
+            }
+            else
+                for (uint32_t i = 0; i < bytes; i += 4u)
+                {
+                    const uint32_t w = word(job.buffer + i);
+                    std::memcpy(job.grid.data() + i, &w, 4);
+                }
+        }
+        if (!hookjobs::g_on)
+        {
+            meshDispDraw(job);
+            return;
+        }
+        hookjobs::g_ring[hookjobs::g_head.load(std::memory_order_relaxed) % hookjobs::kRing].kind = kJobMesh;
+        hookjobs::push();
+    }
+
+    void meshDispDraw(const MeshDispJob &job)
+    {
+        SOTC_READ_SITE(9);
+        const uint32_t object = job.object, header = job.header, layer = job.layer;
+        const uint32_t base = object + 0x20u;
+        const uint32_t rows = job.rows, columns = job.columns, buffer = job.buffer;
+        if (hookjobs::g_verify)
+        {
+            // What reading the buffer now (as round 23's first jobs did) would
+            // have given: the cloth drawn apart from the body when it differs.
+            static uint64_t grids = 0, moved = 0;
+            ++grids;
+            const uint32_t nowBuffer = word(base + (word(base + 16u) & 1u) * 4u);
+            bool same = nowBuffer == buffer;
+            for (uint32_t i = 0; same && i < job.grid.size(); i += 4u)
+            {
+                uint32_t w;
+                std::memcpy(&w, job.grid.data() + i, 4);
+                same = word(buffer + i) == w;
+            }
+            moved += same ? 0u : 1u;
+            if (grids % 2000u == 0u)
+                std::fprintf(stderr, "[hookjob] cloth grids %llu: %llu changed between the hook and the job (taken at the hook)\n", (unsigned long long)grids,
+                             (unsigned long long)moved);
+        }
+        // The buffer's words as taken at the hook (offsets from buffer).
+        const auto real = [&job, buffer](uint32_t a)
+        {
+            float v;
+            std::memcpy(&v, job.grid.data() + (a - buffer), 4);
+            return v;
+        };
+        if (g_staleCheck)
+        {
+            const uint32_t bytes = 0xB0u + rows * (columns * 0x40u + 0x10u);
+            staleRecord(buffer, bytes, object, 2);
+            if (const uint32_t other = word(base + ((word(base + 16u) & 1u) ^ 1u) * 4u))
+                staleRecord(other, bytes, object, 3);
+        }
+        float view[16]; // the buffer's view matrix: normals to camera space
+        for (int i = 0; i < 16; ++i)
+            view[i] = real(buffer + 0x40u + i * 4u);
+        auto vertexAt = [&](uint32_t r, uint32_t c)
+        {
+            const uint32_t q = buffer + 0xB0u + r * (columns * 0x40u + 0x10u) + c * 0x40u;
+            native_renderer::Vertex v{};
+            v.x = real(q);
+            v.y = real(q + 4u);
+            v.z = real(q + 8u);
+            const float nx = real(q + 16u), ny = real(q + 20u), nz = real(q + 24u);
+            v.nx = view[0] * nx + view[4] * ny + view[8] * nz;
+            v.ny = view[1] * nx + view[5] * ny + view[9] * nz;
+            v.nz = view[2] * nx + view[6] * ny + view[10] * nz;
+            v.u = real(q + 32u);
+            v.v = real(q + 36u);
+            v.r = static_cast<uint8_t>(std::clamp(real(q + 48u), 0.0f, 255.0f));
+            v.g = static_cast<uint8_t>(std::clamp(real(q + 52u), 0.0f, 255.0f));
+            v.b = static_cast<uint8_t>(std::clamp(real(q + 56u), 0.0f, 255.0f));
+            v.a = static_cast<uint8_t>(std::clamp(real(q + 60u), 0.0f, 255.0f));
+            return v;
+        };
+        static std::vector<native_renderer::Vertex> tris;
+        const uint64_t mesh = (1ull << 60) | g_skinnedDraws++;
+        if (native_renderer::tuning().fastHooks)
+        {
+            // Each grid vertex read once, the triangles written in place.
+            static std::vector<native_renderer::Vertex> grid;
+            grid.resize(rows * columns);
+            for (uint32_t r = 0; r < rows; ++r)
+                for (uint32_t c = 0; c < columns; ++c)
+                    grid[r * columns + c] = vertexAt(r, c);
+            const uint32_t total = (rows - 1u) * (columns - 1u) * 6u;
+            if (native_renderer::Vertex *out = native_renderer::frameMesh(total))
+            {
+                for (uint32_t r = 0; r + 1u < rows; ++r)
+                    for (uint32_t c = 0; c + 1u < columns; ++c)
+                    {
+                        const native_renderer::Vertex &a = grid[r * columns + c], &b = grid[r * columns + c + 1u], &d = grid[(r + 1u) * columns + c],
+                                                      &e = grid[(r + 1u) * columns + c + 1u];
+                        *out++ = a, *out++ = b, *out++ = d, *out++ = b, *out++ = e, *out++ = d;
+                    }
+                native_renderer::commitFrameMesh(mesh, total);
+            }
+        }
+        else
+        {
+            tris.clear();
+            for (uint32_t r = 0; r + 1u < rows; ++r)
+                for (uint32_t c = 0; c + 1u < columns; ++c)
+                {
+                    const native_renderer::Vertex a = vertexAt(r, c), b = vertexAt(r, c + 1u), d = vertexAt(r + 1u, c), e = vertexAt(r + 1u, c + 1u);
+                    tris.insert(tris.end(), {a, b, d, b, e, d});
+                }
+            native_renderer::uploadMesh(mesh, tris.data(), static_cast<uint32_t>(tris.size()), true);
+        }
+        // The VU1 takes the grid by the projection (camera +0x40) x the
+        // buffer's own matrix. For a cape that is the world-to-camera
+        // matrix, and the product is the camera's world-to-clip (+0x5A0)
+        // up to rounding: then +0x5A0 as before (the same bits as the body's
+        // draws). The death's tendrils (layer 18) hold camera-space vertices
+        // under another matrix: +0x5A0 put every vertex behind the eye.
+        // SOTC_MESHDISP_VIEW=0: +0x5A0 always (round 26).
+        static const bool ownView = !std::getenv("SOTC_MESHDISP_VIEW") || std::atoi(std::getenv("SOTC_MESHDISP_VIEW")) != 0;
+        const float *camera = job.camera;
+        float product[16];
+        if (ownView)
+        {
+            float diff = 0.0f, scale = 1e-6f;
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r)
+                {
+                    float sum = 0.0f;
+                    for (int k = 0; k < 4; ++k)
+                        sum += job.projection[k * 4 + r] * view[c * 4 + k];
+                    product[c * 4 + r] = sum;
+                    diff = std::max(diff, std::fabs(sum - job.camera[c * 4 + r]));
+                    scale = std::max(scale, std::fabs(sum));
+                }
+            if (diff > scale * 1e-3f)
+                camera = product;
+            static const bool log = ps2_diag::env("SOTC_MESHDISP_LOG") != nullptr;
+            if (log)
+            {
+                static uint64_t grids = 0, own = 0;
+                ++grids;
+                own += camera == product;
+                if (camera == product && own < 20u)
+                    std::fprintf(stderr, "[meshdisp] frame %llu layer %u object %08x rows %u columns %u: own view (diff %g of %g)\n", (unsigned long long)g_frame, layer, object,
+                                 rows, columns, diff, scale);
+                if (grids % 2000u == 0u)
+                    std::fprintf(stderr, "[meshdisp] %llu grids, %llu by their own view\n", (unsigned long long)grids, (unsigned long long)own);
+            }
+        }
+        static const bool viewChecks = ps2_diag::env("SOTC_VIEW_CHECK") != nullptr;
+        if (viewChecks)
+            viewCheck(1, job.camera, view);
+        native_renderer::DrawState state;
+        state.texture = texture(header);
+        state.order = layer;
+        state.fogged = layer == 2u || layer == 3u;
+        if (g_haveViewLights)
+        {
+            state.lit = true;
+            std::memcpy(state.light, g_viewLights, sizeof(state.light));
+        }
+        native_renderer::draw(mesh, camera, state);
+        ++g_frameDraws;
+    }
+
+    // ---- Shadows: shadowDisp -------------------------------------------------
+    constexpr uint32_t kShadowDisp = 0x0109E0E8u;
+    PS2Runtime::RecompiledFunction g_shadowDisp = nullptr;
+
+    // shadowDisp(instance chain, shadow model) (0x109e0e8): microcode 8 takes
+    // the shadow model's triangles (V3-32 strips, the REF at model + 0x1c)
+    // to camera space by the instance's matrix (its chain's RET packet),
+    // extrudes each vertex by the vector in the w of the instance's light
+    // rows (VU 984-986), and draws each triangle's prism, its faces counted
+    // up or down by their facing on a buffer the game then darkens
+    // (shadowDraw; ALPHA 0x64 FIX 0x40: half). Skinned shadow models
+    // (shadowDisp's t2 set: microcode 5 loads the instance's bone palette,
+    // microcode 9 draws) carry a second qword per vertex: x/y/z = bone index
+    // + weight (the fraction), w = n; the vertex is the sum over the first
+    // n + 1 components of weight x (palette matrix index, camera space).
+    std::vector<native_renderer::Vertex> g_volume;
+    constexpr float kShadowNear = 0.1f;
+
+    // Round 37: the shadow is taken at shadowDisp's last call, its
+    // iosDlPopLayer (popLayerHook, by the return address), with the model in
+    // s1 and the chain in s2 there: the skinned characters' display
+    // (010F3CF0, Wander's and Agro's body shadows) ends in a jump to
+    // shadowDisp that the recompiled code makes as a direct C++ call, so a
+    // hook on shadowDisp itself never saw them (only the sword's rigid
+    // shadow, a guest call from 010F3A08, was drawn).
+    void shadowDispHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        g_shadowDisp(rdram, ctx, runtime);
+    }
+
+    void shadowCapture(uint32_t chain, uint32_t model, bool skinnedShadow)
+    {
+        HookTimer hookTimer;
+        const bool shadows = native_renderer::tuning().shadows;
+        static const bool idColours = std::getenv("SOTC_NATIVE_IDCOLOR") != nullptr;
+        static const bool shadowLog = ps2_diag::env("SOTC_SHADOW_LOG") != nullptr; // debugging: each call
+        if (shadowLog && g_frame % 60u == 0u)
+            std::fprintf(stderr, "[shadow] frame %llu chain %08x model %08x skinned %d tag %08x ret %08x retq %08x\n", (unsigned long long)g_frame, chain, model,
+                         skinnedShadow ? 1 : 0, chain ? word(chain) : 0u, chain ? word(chain + 4u) : 0u, chain ? word(word(chain + 4u)) : 0u);
+        if (!shadows || idColours || !model || !g_cameraContext || ((word(chain) >> 28) & 7u) != 2u)
+            return;
+        ShadowDispJob local;
+        ShadowDispJob &job = hookjobs::g_on ? hookjobs::next().shadow : local;
+        job.chain = chain;
+        job.model = model;
+        job.skinned = skinnedShadow;
+        for (int i = 0; i < 16; ++i)
+            job.projection[i] = real(g_cameraContext + 0x40u + i * 4u);
+        {
+            // The instance's matrix / palette and light rows as they are now.
+            const uint32_t ret = word(chain + 4u);
+            if (skinnedShadow)
+            {
+                static VuPalette now;
+                if (!readChainPalette(chain, now))
+                    return;
+                job.paletteLo = now.lo;
+                job.paletteHi = now.hi;
+                job.palette.assign(now.data() + now.lo * 4u, now.data() + std::max(now.lo, now.hi) * 4u);
+            }
+            else
+            {
+                if ((word(ret) & 0xFFFFu) != 5u) // one matrix: rigid
+                    return;
+                for (int i = 0; i < 16; ++i)
+                    job.rigid[i] = real(ret + 16u + i * 4u);
+            }
+            for (int i = 0; i < 3; ++i)
+                job.extrude[i] = real(chain + 16u * (i + 1) + 12u);
+        }
+        if (!hookjobs::g_on)
+        {
+            shadowDispDraw(job);
+            return;
+        }
+        hookjobs::g_ring[hookjobs::g_head.load(std::memory_order_relaxed) % hookjobs::kRing].kind = kJobShadow;
+        hookjobs::push();
+    }
+
+    void shadowDispDraw(const ShadowDispJob &job)
+    {
+        SOTC_READ_SITE(9);
+        if (g_worker105Check && g_worker105Stats.uses.fetch_add(1, std::memory_order_relaxed) % 2000u == 1999u)
+        {
+            Worker105Stats &s = g_worker105Stats;
+            std::fprintf(stderr, "[worker105c] %llu shadow draws: model bytes compared %llu (%llu answers differ), skinned vertices %llu (%llu differ), corner probes %llu (%llu differ)\n",
+                         (unsigned long long)s.uses.load(), (unsigned long long)s.bytes.load(), (unsigned long long)s.bytesDiffer.load(),
+                         (unsigned long long)s.verts.load(), (unsigned long long)s.vertsDiffer.load(), (unsigned long long)s.probes.load(),
+                         (unsigned long long)s.probesDiffer.load());
+        }
+        const uint32_t chain = job.chain, model = job.model;
+        const bool skinnedShadow = job.skinned;
+        const uint32_t ret = word(chain + 4u);
+        (void)ret;
+        static VuPalette palette;
+        float m[16];
+        if (skinnedShadow)
+        {
+            if (palette.hi > palette.lo)
+                std::fill(palette.vu.begin() + palette.lo * 4u, palette.vu.begin() + palette.hi * 4u, 0.0f);
+            std::copy(job.palette.begin(), job.palette.end(), palette.vu.begin() + job.paletteLo * 4u);
+            palette.lo = job.paletteLo;
+            palette.hi = job.paletteHi;
+        }
+        else
+            std::memcpy(m, job.rigid, sizeof(m));
+        static const float flip = std::getenv("SOTC_SHADOW_FLIP") ? -1.0f : 1.0f; // debugging
+        const float d[3] = {job.extrude[0] * flip, job.extrude[1] * flip, job.extrude[2] * flip};
+        static const bool volLog = ps2_diag::env("SOTC_SHADOW_LOG") != nullptr;
+        if (volLog && g_frame % 60u == 0u)
+            std::fprintf(stderr, "[shadowvol] frame %llu skinned %d model %08x extrude %g %g %g\n", (unsigned long long)g_frame, skinnedShadow ? 1 : 0, model, d[0], d[1], d[2]);
+        const uint32_t tag = word(model + 0x1Cu);
+        // Round 44 (the console's r42 log: the worker 8 -> 40 ms a frame with
+        // the body shadows, half of it this function): the shadow model's
+        // strips are parsed once and kept while the guest bytes the parse
+        // read are the same (compared at each use, so a model unloaded and
+        // another loaded at its address is parsed again); each strip vertex
+        // goes to camera space once (it was once per triangle using it: three
+        // times); the inner sides are matched in a flat table (an
+        // unordered_map of vectors was ~45% of the worker's instructions in
+        // Vita3K: the bucket modulo and an allocation per edge). The
+        // volume's vertices are the same values as before.
+        struct ParsedModel
+        {
+            uint32_t addr = 0, size = 0, lo = 0, hi = 0;
+            std::vector<uint8_t> bytes; // guest [lo, hi) as the parse read it
+            std::vector<Strip> strips;
+        };
+        struct SpanMem
+        {
+            mutable uint32_t lo = ~0u, hi = 0u;
+            uint32_t word(uint32_t a) const
+            {
+                lo = std::min(lo, a & ~3u);
+                hi = std::max(hi, (a & ~3u) + 4u);
+                return sotc_native::word(a);
+            }
+            float real(uint32_t a) const
+            {
+                const uint32_t v = word(a);
+                float f;
+                std::memcpy(&f, &v, 4);
+                return f;
+            }
+        };
+        static ParsedModel parsed[8];
+        static uint32_t parsedNext = 0;
+        const uint32_t batchAddr = word(tag + 4u), batchSize = (word(tag) & 0xFFFFu) * 16u;
+        auto sameBytes = [](const ParsedModel &c)
+        {
+            const uint32_t at = c.lo & 0x1FFFFFCu;
+            if (c.hi <= c.lo || at + (c.hi - c.lo) > 0x2000000u || (c.lo & ~0x1FFFFFCu) != ((c.hi - 4u) & ~0x1FFFFFCu))
+                return false; // wraps or empty: parse again
+            noteRead(c.lo, c.hi - c.lo);
+            if (!g_worker105)
+                return std::memcmp(c.bytes.data(), g_ram + at, c.hi - c.lo) == 0;
+            const bool same = sameBytes105(c.bytes.data(), g_ram + at, c.hi - c.lo);
+            if (g_worker105Check)
+            {
+                g_worker105Stats.bytes.fetch_add(c.hi - c.lo, std::memory_order_relaxed);
+                if (same != (std::memcmp(c.bytes.data(), g_ram + at, c.hi - c.lo) == 0))
+                    g_worker105Stats.bytesDiffer.fetch_add(1, std::memory_order_relaxed);
+            }
+            return same;
+        };
+        const ParsedModel *pm = nullptr;
+        for (const ParsedModel &c : parsed)
+            if (c.addr == batchAddr && c.size == batchSize && !c.bytes.empty() && sameBytes(c))
+            {
+                pm = &c;
+                break;
+            }
+        static std::vector<Strip> uncached;
+        if (!pm)
+        {
+            ParsedModel &c = parsed[parsedNext++ % 8u];
+            c.strips.clear();
+            const SpanMem span;
+            readBatchesFrom(span, batchAddr, batchSize, c.strips);
+            c.addr = batchAddr;
+            c.size = batchSize;
+            c.lo = span.lo;
+            c.hi = span.hi;
+            c.bytes.clear();
+            if (span.hi > span.lo && (span.lo & 0x1FFFFFCu) + (span.hi - span.lo) <= 0x2000000u)
+                c.bytes.assign(g_ram + (span.lo & 0x1FFFFFCu), g_ram + (span.lo & 0x1FFFFFCu) + (span.hi - span.lo));
+            pm = &c;
+        }
+        const std::vector<Strip> &strips = pm->strips;
+        // Round 105: the skinned vertex as below, the index without truncf and
+        // the sums in registers (the same operations in the same order).
+        auto toCamera105 = [&](const BatchVertex &v, float out[3])
+        {
+            const float x = v.x, y = v.y, z = v.z;
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f;
+            const uint32_t n = std::min(v.skin[3] & 0xFFFFu, 3u);
+            const float *pal = palette.data();
+            for (uint32_t k = 0; k <= n; ++k)
+            {
+                float packed;
+                std::memcpy(&packed, &v.skin[k], 4);
+                float index;
+                int32_t whole;
+                if (std::fabs(packed) < 8388608.0f)
+                {
+                    whole = static_cast<int32_t>(packed); // toward zero, as trunc
+                    index = static_cast<float>(whole);
+                }
+                else
+                {
+                    index = std::trunc(packed);
+                    whole = static_cast<int32_t>(index);
+                }
+                const float *b = pal + (static_cast<uint32_t>(whole) * 4u % 1024u) * 4u;
+                const float w = packed - index;
+                o0 += w * (b[0] * x + b[4] * y + b[8] * z + b[12]);
+                o1 += w * (b[1] * x + b[5] * y + b[9] * z + b[13]);
+                o2 += w * (b[2] * x + b[6] * y + b[10] * z + b[14]);
+            }
+            out[0] = o0;
+            out[1] = o1;
+            out[2] = o2;
+        };
+        auto toCamera = [&](const BatchVertex &v, float out[3])
+        {
+            if (!skinnedShadow)
+            {
+                for (int r = 0; r < 3; ++r)
+                    out[r] = m[r] * v.x + m[4 + r] * v.y + m[8 + r] * v.z + m[12 + r];
+                return;
+            }
+            if (g_worker105)
+            {
+                toCamera105(v, out);
+                if (!g_worker105Check)
+                    return;
+                float mine[3] = {out[0], out[1], out[2]};
+                out[0] = out[1] = out[2] = 0.0f;
+                const uint32_t n = std::min(v.skin[3] & 0xFFFFu, 3u);
+                for (uint32_t k = 0; k <= n; ++k)
+                {
+                    float packed;
+                    std::memcpy(&packed, &v.skin[k], 4);
+                    const float index = std::trunc(packed);
+                    const float *b = &palette[(static_cast<uint32_t>(static_cast<int32_t>(index)) * 4u % 1024u) * 4u];
+                    const float w = packed - index;
+                    for (int r = 0; r < 3; ++r)
+                        out[r] += w * (b[r] * v.x + b[4 + r] * v.y + b[8 + r] * v.z + b[12 + r]);
+                }
+                g_worker105Stats.verts.fetch_add(1, std::memory_order_relaxed);
+                if (std::memcmp(mine, out, sizeof(mine)) != 0)
+                    g_worker105Stats.vertsDiffer.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            out[0] = out[1] = out[2] = 0.0f;
+            const uint32_t n = std::min(v.skin[3] & 0xFFFFu, 3u);
+            for (uint32_t k = 0; k <= n; ++k)
+            {
+                float packed;
+                std::memcpy(&packed, &v.skin[k], 4);
+                const float index = std::trunc(packed);
+                const float *b = &palette[(static_cast<uint32_t>(static_cast<int32_t>(index)) * 4u % 1024u) * 4u];
+                const float w = packed - index;
+                for (int r = 0; r < 3; ++r)
+                    out[r] += w * (b[r] * v.x + b[4 + r] * v.y + b[8 + r] * v.z + b[12 + r]);
+            }
+        };
+        auto put = [&](const float *p)
+        {
+            native_renderer::Vertex v{};
+            v.x = p[0];
+            v.y = p[1];
+            v.z = p[2];
+            v.r = v.g = v.b = v.a = 0x80; // the shared fragment stage drops alpha 0
+            g_volume.push_back(v);
+        };
+        g_volume.clear();
+        // Round 38: the side quads that two prisms share in opposite
+        // directions (an inner edge of the mesh) count +1 and -1 on the same
+        // pixels: both dropped. What is left draws the same stencil count
+        // (bit for bit: only quads with all four corners equal cancel) with
+        // far fewer vertices and much less fill (SOTC_SHADOW_ALLSIDES=1 / A/B name allsides: all).
+        struct SideQuad
+        {
+            float p[4][3]; // near k, far k, far l, near l
+            uint64_t key;  // its directed edge
+            int32_t next;  // the next quad in its table chain
+            bool live;
+        };
+        static std::vector<SideQuad> sides;
+        sides.clear();
+        const bool allSides = native_renderer::tuning().shadowAllSides;
+        auto edgeKey = [](const float *a, const float *b, const float *fa, const float *fb)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (const float *p : {a, b, fa, fb})
+                for (int r = 0; r < 3; ++r)
+                {
+                    uint32_t bits;
+                    std::memcpy(&bits, &p[r], 4);
+                    h = (h ^ bits) * 0x100000001b3ull;
+                }
+            return h;
+        };
+        auto sameCorners = [](const SideQuad &q, const float *a, const float *b, const float *fa, const float *fb)
+        {
+            // the reverse of q: a = q's near l, b = q's near k, fa = q's far l, fb = q's far k
+            return !std::memcmp(q.p[3], a, 12) && !std::memcmp(q.p[0], b, 12) && !std::memcmp(q.p[2], fa, 12) && !std::memcmp(q.p[1], fb, 12);
+        };
+        // Each strip vertex in camera space once.
+        static std::vector<float> cam;
+        size_t vertices = 0, triangles = 0;
+        for (const Strip &strip : strips)
+        {
+            vertices += strip.size();
+            triangles += strip.size() > 2 ? strip.size() - 2 : 0;
+        }
+        cam.resize(vertices * 3u);
+        {
+            size_t at = 0;
+            for (const Strip &strip : strips)
+                for (const BatchVertex &v : strip)
+                {
+                    toCamera(v, &cam[at]);
+                    at += 3u;
+                }
+        }
+        // Round 45 (Tuning shadowIndexed; the console's A/B: the body shadows
+        // +4.4 ms of the worker, +4.5 ms of the render thread a frame): the
+        // volume as an indexed mesh. A strip vertex's two corners (near, far:
+        // cut at z = 0.1 as below, which depends on that vertex alone, the
+        // same arithmetic) are worked out once; vertices whose two corners are
+        // the same bits share one entry, so a side's four corners match its
+        // reverse's exactly when their two entries do (round 38's rule, by
+        // integers instead of a hash of twelve floats per side). The same
+        // triangles (SOTC_SHADOW_CHECK compares them), each corner once in the
+        // upload instead of in every triangle using it.
+        const bool indexedVolume = native_renderer::tuning().shadowIndexed && !allSides;
+        native_renderer::Vertex *volumeRoom = nullptr;
+        uint32_t *volumeIndices = nullptr;
+        uint32_t volumeBase = 0, volumeEntries = 0, volumeIndexCount = 0;
+        if (indexedVolume)
+        {
+            static std::vector<uint32_t> entryOf;  // strip vertex -> entry
+            static std::vector<float> corners;     // entry: near xyz, far xyz
+            static std::vector<uint8_t> behindOf;  // entry: both corners behind z = 0.1
+            static std::vector<uint32_t> probe;    // open addressing: entry + 1 (0: empty)
+            entryOf.resize(vertices);
+            corners.clear();
+            behindOf.clear();
+            uint32_t probeSize = 64u;
+            while (probeSize < vertices * 2u)
+                probeSize <<= 1;
+            probe.assign(probeSize, 0u);
+            for (size_t i = 0; i < vertices; ++i)
+            {
+                float nearP[3], farP[3];
+                std::memcpy(nearP, &cam[i * 3u], 12);
+                for (int r = 0; r < 3; ++r)
+                    farP[r] = nearP[r] + d[r];
+                bool behind = false;
+                const float zn = nearP[2], zf = farP[2];
+                if (zn <= kShadowNear && zf <= kShadowNear)
+                    behind = true;
+                else if (zf < kShadowNear || zn < kShadowNear)
+                {
+                    float *out = zf < kShadowNear ? farP : nearP;
+                    const float *in = zf < kShadowNear ? nearP : farP;
+                    const float t = (in[2] - kShadowNear) / (in[2] - out[2]);
+                    for (int r = 0; r < 3; ++r)
+                        out[r] = in[r] + (out[r] - in[r]) * t;
+                }
+                uint32_t bits[6];
+                std::memcpy(bits, nearP, 12);
+                std::memcpy(bits + 3, farP, 12);
+                uint32_t h = behind ? 0x9E3779B9u : 0x7F4A7C15u;
+                for (uint32_t b : bits)
+                    h = (h ^ b) * 0x01000193u;
+                h ^= h >> 15;
+                uint32_t at = h & (probeSize - 1u);
+                for (;;)
+                {
+                    const uint32_t e = probe[at];
+                    if (!e)
+                    {
+                        const uint32_t made = static_cast<uint32_t>(behindOf.size());
+                        probe[at] = made + 1u;
+                        corners.insert(corners.end(), nearP, nearP + 3);
+                        corners.insert(corners.end(), farP, farP + 3);
+                        behindOf.push_back(behind ? 1u : 0u);
+                        entryOf[i] = made;
+                        break;
+                    }
+                    bool sameCorner;
+                    if (g_worker105)
+                    {
+                        uint32_t have[6];
+                        std::memcpy(have, &corners[(e - 1u) * 6u], 24);
+                        sameCorner = ((have[0] ^ bits[0]) | (have[1] ^ bits[1]) | (have[2] ^ bits[2]) | (have[3] ^ bits[3]) | (have[4] ^ bits[4]) |
+                                      (have[5] ^ bits[5])) == 0u;
+                        if (g_worker105Check)
+                        {
+                            g_worker105Stats.probes.fetch_add(1, std::memory_order_relaxed);
+                            if (sameCorner != !std::memcmp(&corners[(e - 1u) * 6u], bits, 24))
+                                g_worker105Stats.probesDiffer.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    else
+                        sameCorner = !std::memcmp(&corners[(e - 1u) * 6u], bits, 24);
+                    if (behindOf[e - 1u] == (behind ? 1u : 0u) && sameCorner)
+                    {
+                        entryOf[i] = e - 1u;
+                        break;
+                    }
+                    at = (at + 1u) & (probeSize - 1u);
+                }
+            }
+            volumeEntries = static_cast<uint32_t>(behindOf.size());
+            volumeRoom = volumeEntries ? native_renderer::frameMesh(volumeEntries * 2u) : nullptr;
+            if (volumeRoom)
+                volumeIndices = native_renderer::frameMeshIndices(static_cast<uint32_t>(triangles * 24u), volumeBase);
+            if (volumeRoom && !volumeIndices)
+                native_renderer::cancelFrameMesh();
+            if (volumeIndices)
+            {
+                for (uint32_t e = 0; e < volumeEntries; ++e)
+                    for (int k = 0; k < 2; ++k)
+                    {
+                        native_renderer::Vertex v{};
+                        v.x = corners[e * 6u + k * 3u];
+                        v.y = corners[e * 6u + k * 3u + 1u];
+                        v.z = corners[e * 6u + k * 3u + 2u];
+                        v.r = v.g = v.b = v.a = 0x80; // the shared fragment stage drops alpha 0
+                        volumeRoom[e * 2u + k] = v;
+                    }
+                // The open sides by directed edge (entry k, entry l): chains
+                // through a power-of-two table, as below.
+                struct EdgeSide
+                {
+                    uint32_t k, l;
+                    int32_t next;
+                    bool live;
+                };
+                static std::vector<EdgeSide> edges;
+                static std::vector<int32_t> edgeHeads;
+                edges.clear();
+                edges.reserve(triangles * 3u);
+                uint32_t edgeSize = 64u;
+                while (edgeSize < triangles * 6u)
+                    edgeSize <<= 1;
+                edgeHeads.assign(edgeSize, -1);
+                auto edgeHash = [edgeSize](uint32_t k, uint32_t l) { return ((k * 0x9E3779B1u) ^ (l * 0x85EBCA77u) ^ (k >> 7)) & (edgeSize - 1u); };
+                uint32_t *ix = volumeIndices;
+                const uint32_t base = volumeBase;
+                size_t firstVertex = 0;
+                for (const Strip &strip : strips)
+                {
+                    const float *sv = cam.data() + firstVertex * 3u;
+                    const uint32_t *ev = entryOf.data() + firstVertex;
+                    firstVertex += strip.size();
+                    for (size_t i = 2; i < strip.size(); ++i)
+                    {
+                        const float *a = sv + (i - 2) * 3u, *b = sv + (i - 1) * 3u, *c = sv + i * 3u;
+                        const float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, w[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                        const float n[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+                        const float facing = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+                        if (facing == 0.0f)
+                            continue; // degenerate (strip joins) or edge-on
+                        uint32_t e[3] = {ev[i - 2], ev[i - 1], ev[i]};
+                        if (facing > 0.0f)
+                            std::swap(e[1], e[2]); // the near face looks away from the extrusion
+                        if (behindOf[e[0]] || behindOf[e[1]] || behindOf[e[2]])
+                            continue;
+                        // Closed prism, faces outwards: near (a, b, c), far reversed, sides.
+                        *ix++ = base + e[0] * 2u, *ix++ = base + e[1] * 2u, *ix++ = base + e[2] * 2u;
+                        *ix++ = base + e[0] * 2u + 1u, *ix++ = base + e[2] * 2u + 1u, *ix++ = base + e[1] * 2u + 1u;
+                        for (int k = 0; k < 3; ++k)
+                        {
+                            const uint32_t ek = e[k], el = e[(k + 1) % 3];
+                            bool cancelled = false;
+                            for (int32_t j = edgeHeads[edgeHash(el, ek)]; j >= 0; j = edges[j].next)
+                            {
+                                EdgeSide &q = edges[j];
+                                if (q.live && q.k == el && q.l == ek)
+                                {
+                                    q.live = false;
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
+                            if (cancelled)
+                                continue;
+                            int32_t &head = edgeHeads[edgeHash(ek, el)];
+                            edges.push_back({ek, el, head, true});
+                            head = static_cast<int32_t>(edges.size() - 1u);
+                        }
+                    }
+                }
+                for (const EdgeSide &q : edges)
+                    if (q.live)
+                    {
+                        // near k, far k, far l / near k, far l, near l
+                        *ix++ = base + q.k * 2u, *ix++ = base + q.k * 2u + 1u, *ix++ = base + q.l * 2u + 1u;
+                        *ix++ = base + q.k * 2u, *ix++ = base + q.l * 2u + 1u, *ix++ = base + q.l * 2u;
+                    }
+                volumeIndexCount = static_cast<uint32_t>(ix - volumeIndices);
+            }
+        }
+        else
+        {
+        // The open sides by directed edge: a power-of-two table of chains
+        // through SideQuad::next (cancelled ones stay in the chain, not live).
+        uint32_t tableSize = 64u;
+        while (tableSize < triangles * 6u)
+            tableSize <<= 1;
+        static std::vector<int32_t> heads;
+        heads.assign(tableSize, -1);
+        sides.reserve(triangles * 3u);
+        size_t first = 0;
+        for (const Strip &strip : strips)
+        {
+            const float *sv = cam.data() + first * 3u;
+            first += strip.size();
+            for (size_t i = 2; i < strip.size(); ++i)
+            {
+                float a[3], b[3], c[3];
+                std::memcpy(a, sv + (i - 2) * 3u, 12);
+                std::memcpy(b, sv + (i - 1) * 3u, 12);
+                std::memcpy(c, sv + i * 3u, 12);
+                const float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, w[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const float n[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+                const float facing = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+                if (facing == 0.0f)
+                    continue; // degenerate (strip joins) or edge-on
+                if (facing > 0.0f)
+                    std::swap(b, c); // the near face looks away from the extrusion
+                // Each extrusion edge cut at z = 0.1 as microcode 8 does, so
+                // the far cap stays in front of the camera; a triangle with
+                // an edge wholly behind it is dropped.
+                float *near[3] = {a, b, c};
+                float far[3][3];
+                bool behind = false;
+                for (int k = 0; k < 3; ++k)
+                {
+                    for (int r = 0; r < 3; ++r)
+                        far[k][r] = near[k][r] + d[r];
+                    const float zn = near[k][2], zf = far[k][2];
+                    if (zn <= kShadowNear && zf <= kShadowNear)
+                        behind = true;
+                    else if (zf < kShadowNear || zn < kShadowNear)
+                    {
+                        float *out = zf < kShadowNear ? far[k] : near[k];
+                        const float *in = zf < kShadowNear ? near[k] : far[k];
+                        const float t = (in[2] - kShadowNear) / (in[2] - out[2]);
+                        for (int r = 0; r < 3; ++r)
+                            out[r] = in[r] + (out[r] - in[r]) * t;
+                    }
+                }
+                if (behind)
+                    continue;
+                // Closed prism, faces outwards: near (a, b, c), far reversed, sides.
+                put(a), put(b), put(c);
+                put(far[0]), put(far[2]), put(far[1]);
+                for (int k = 0; k < 3; ++k)
+                {
+                    const int l = (k + 1) % 3;
+                    if (allSides)
+                    {
+                        put(near[k]), put(far[k]), put(far[l]);
+                        put(near[k]), put(far[l]), put(near[l]);
+                        continue;
+                    }
+                    // Its reverse waiting: both go.
+                    const uint64_t reverse = edgeKey(near[l], near[k], far[l], far[k]);
+                    bool cancelled = false;
+                    for (int32_t j = heads[static_cast<uint32_t>(reverse ^ (reverse >> 32)) & (tableSize - 1u)]; j >= 0; j = sides[j].next)
+                    {
+                        SideQuad &q = sides[j];
+                        if (q.live && q.key == reverse && sameCorners(q, near[k], near[l], far[k], far[l]))
+                        {
+                            q.live = false;
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                    if (cancelled)
+                        continue;
+                    SideQuad q;
+                    std::memcpy(q.p[0], near[k], 12);
+                    std::memcpy(q.p[1], far[k], 12);
+                    std::memcpy(q.p[2], far[l], 12);
+                    std::memcpy(q.p[3], near[l], 12);
+                    q.live = true;
+                    q.key = edgeKey(near[k], near[l], far[k], far[l]);
+                    int32_t &head = heads[static_cast<uint32_t>(q.key ^ (q.key >> 32)) & (tableSize - 1u)];
+                    q.next = head;
+                    head = static_cast<int32_t>(sides.size());
+                    sides.push_back(q);
+                }
+            }
+        }
+        for (const SideQuad &q : sides)
+            if (q.live)
+            {
+                put(q.p[0]), put(q.p[1]), put(q.p[2]);
+                put(q.p[0]), put(q.p[2]), put(q.p[3]);
+            }
+        }
+        // SOTC_SHADOW_CHECK=1 (round 44, testing): round 38's builder run too
+        // and the two volumes compared as sets of triangles (round 45: the
+        // indexed volume's triangles as the indices pick them out).
+        static const bool shadowCheck = ps2_diag::env("SOTC_SHADOW_CHECK") != nullptr;
+        if (shadowCheck && indexedVolume)
+            for (uint32_t i = 0; i < volumeIndexCount; ++i)
+                g_volume.push_back(volumeRoom[volumeIndices[i] - volumeBase]);
+        if (shadowCheck)
+        {
+            static std::vector<native_renderer::Vertex> ref;
+            auto rput = [&](const float *p)
+            {
+                native_renderer::Vertex v{};
+                v.x = p[0];
+                v.y = p[1];
+                v.z = p[2];
+                v.r = v.g = v.b = v.a = 0x80;
+                ref.push_back(v);
+            };
+            const uint32_t tag = word(model + 0x1Cu);
+        static std::vector<Strip> rstrips;
+        rstrips.clear();
+        readBatches(word(tag + 4u), (word(tag) & 0xFFFFu) * 16u, rstrips);
+        ref.clear();
+        // Round 38: the side quads that two prisms share in opposite
+        // directions (an inner edge of the mesh) count +1 and -1 on the same
+        // pixels: both dropped. What is left draws the same stencil count
+        // (bit for bit: only quads with all four corners equal cancel) with
+        // far fewer vertices and much less fill (SOTC_SHADOW_ALLSIDES=1 / A/B name allsides: all).
+        struct RSideQuad
+        {
+            float p[4][3]; // near k, far k, far l, near l
+            bool live;
+        };
+        static std::vector<RSideQuad> rsides;
+        static std::unordered_map<uint64_t, std::vector<uint32_t>> open; // directed edge key -> quads waiting for their reverse
+        rsides.clear();
+        open.clear();
+        const bool rallSides = native_renderer::tuning().shadowAllSides;
+        auto redgeKey = [](const float *a, const float *b, const float *fa, const float *fb)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (const float *p : {a, b, fa, fb})
+                for (int r = 0; r < 3; ++r)
+                {
+                    uint32_t bits;
+                    std::memcpy(&bits, &p[r], 4);
+                    h = (h ^ bits) * 0x100000001b3ull;
+                }
+            return h;
+        };
+        auto rsameCorners = [](const RSideQuad &q, const float *a, const float *b, const float *fa, const float *fb)
+        {
+            // the reverse of q: a = q's near l, b = q's near k, fa = q's far l, fb = q's far k
+            return !std::memcmp(q.p[3], a, 12) && !std::memcmp(q.p[0], b, 12) && !std::memcmp(q.p[2], fa, 12) && !std::memcmp(q.p[1], fb, 12);
+        };
+        for (const Strip &strip : rstrips)
+            for (size_t i = 2; i < strip.size(); ++i)
+            {
+                float a[3], b[3], c[3];
+                toCamera(strip[i - 2], a);
+                toCamera(strip[i - 1], b);
+                toCamera(strip[i], c);
+                const float u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, w[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+                const float n[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+                const float facing = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+                if (facing == 0.0f)
+                    continue; // degenerate (strip joins) or edge-on
+                if (facing > 0.0f)
+                    std::swap(b, c); // the near face looks away from the extrusion
+                // Each extrusion edge cut at z = 0.1 as microcode 8 does, so
+                // the far cap stays in front of the camera; a triangle with
+                // an edge wholly behind it is dropped.
+                float *near[3] = {a, b, c};
+                float far[3][3];
+                bool behind = false;
+                for (int k = 0; k < 3; ++k)
+                {
+                    for (int r = 0; r < 3; ++r)
+                        far[k][r] = near[k][r] + d[r];
+                    const float zn = near[k][2], zf = far[k][2];
+                    if (zn <= kShadowNear && zf <= kShadowNear)
+                        behind = true;
+                    else if (zf < kShadowNear || zn < kShadowNear)
+                    {
+                        float *out = zf < kShadowNear ? far[k] : near[k];
+                        const float *in = zf < kShadowNear ? near[k] : far[k];
+                        const float t = (in[2] - kShadowNear) / (in[2] - out[2]);
+                        for (int r = 0; r < 3; ++r)
+                            out[r] = in[r] + (out[r] - in[r]) * t;
+                    }
+                }
+                if (behind)
+                    continue;
+                // Closed prism, faces outwards: near (a, b, c), far reversed, rsides.
+                rput(a), rput(b), rput(c);
+                rput(far[0]), rput(far[2]), rput(far[1]);
+                for (int k = 0; k < 3; ++k)
+                {
+                    const int l = (k + 1) % 3;
+                    if (rallSides)
+                    {
+                        rput(near[k]), rput(far[k]), rput(far[l]);
+                        rput(near[k]), rput(far[l]), rput(near[l]);
+                        continue;
+                    }
+                    // Its reverse waiting: both go.
+                    auto it = open.find(redgeKey(near[l], near[k], far[l], far[k]));
+                    bool cancelled = false;
+                    if (it != open.end())
+                        for (size_t j = 0; j < it->second.size(); ++j)
+                        {
+                            RSideQuad &q = rsides[it->second[j]];
+                            if (q.live && rsameCorners(q, near[k], near[l], far[k], far[l]))
+                            {
+                                q.live = false;
+                                it->second[j] = it->second.back();
+                                it->second.pop_back();
+                                cancelled = true;
+                                break;
+                            }
+                        }
+                    if (cancelled)
+                        continue;
+                    RSideQuad q;
+                    std::memcpy(q.p[0], near[k], 12);
+                    std::memcpy(q.p[1], far[k], 12);
+                    std::memcpy(q.p[2], far[l], 12);
+                    std::memcpy(q.p[3], near[l], 12);
+                    q.live = true;
+                    open[redgeKey(near[k], near[l], far[k], far[l])].push_back(static_cast<uint32_t>(rsides.size()));
+                    rsides.push_back(q);
+                }
+            }
+        for (const RSideQuad &q : rsides)
+            if (q.live)
+            {
+                rput(q.p[0]), rput(q.p[1]), rput(q.p[2]);
+                rput(q.p[0]), rput(q.p[2]), rput(q.p[3]);
+            }
+            auto tris = [](const std::vector<native_renderer::Vertex> &v)
+            {
+                std::vector<std::array<uint32_t, 9>> t(v.size() / 3u);
+                for (size_t i = 0; i < t.size(); ++i)
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        std::memcpy(&t[i][k * 3], &v[i * 3 + k].x, 4);
+                        std::memcpy(&t[i][k * 3 + 1], &v[i * 3 + k].y, 4);
+                        std::memcpy(&t[i][k * 3 + 2], &v[i * 3 + k].z, 4);
+                    }
+                std::sort(t.begin(), t.end());
+                return t;
+            };
+            static uint64_t checks = 0, bad = 0;
+            ++checks;
+            if (tris(ref) != tris(g_volume))
+                ++bad, std::fprintf(stderr, "[shadowcheck] frame %llu model %08x: %zu vertices against round 38's %zu, triangles differ\n", (unsigned long long)g_frame, model,
+                                    g_volume.size(), ref.size());
+            if (checks % 500u == 0u)
+                std::fprintf(stderr, "[shadowcheck] %llu volumes compared, %llu differ\n", (unsigned long long)checks, (unsigned long long)bad);
+        }
+        if (volLog && g_frame % 60u == 0u)
+            std::fprintf(stderr, "[shadowvol] frame %llu model %08x volume vertices %zu (indexed: %u corners, %u indices)\n", (unsigned long long)g_frame, model,
+                         g_volume.size(), volumeEntries * 2u, volumeIndexCount);
+        const float *projection = job.projection;
+        uint64_t mesh = 0;
+        if (indexedVolume)
+        {
+            if (!volumeIndices)
+                return;
+            if (!volumeIndexCount)
+            {
+                native_renderer::cancelFrameMesh();
+                return;
+            }
+            mesh = (1ull << 59) | g_skinnedDraws++;
+            native_renderer::commitFrameMesh(mesh, volumeEntries * 2u, volumeIndexCount);
+        }
+        else
+        {
+            if (g_volume.empty())
+                return;
+            mesh = (1ull << 59) | g_skinnedDraws++;
+            native_renderer::uploadMesh(mesh, g_volume.data(), static_cast<uint32_t>(g_volume.size()), true);
+        }
+        native_renderer::DrawState state;
+        static const bool showVolumes = std::getenv("SOTC_SHADOW_SHOW") != nullptr; // debugging: the volumes in red
+        if (showVolumes)
+        {
+            state.debugColour = 0x0000FFu;
+            state.order = 15;
+            native_renderer::draw(mesh, projection, state);
+            return;
+        }
+        state.shadowVolume = true;
+        static const float amount = std::getenv("SOTC_SHADOW_AMOUNT") ? std::strtof(std::getenv("SOTC_SHADOW_AMOUNT"), nullptr) : 0.5f;
+        state.shadow = amount;
+        state.order = 7; // after the opaque world, before the transparent layers
+        native_renderer::draw(mesh, projection, state);
+    }
+
+    // ---- Particles (ptclman*) ------------------------------------------------
+    constexpr uint32_t kPtclEnv = 0x0109A280u, kPtclMat = 0x01099E00u, kPtclVtx = 0x01099F38u;
+    PS2Runtime::RecompiledFunction g_ptclEnv = nullptr, g_ptclMat = nullptr, g_ptclVtx = nullptr;
+
+    // The particle microcode (VU1 microcode 7) expands each particle (48
+    // bytes: position + size, colour 0..1, sin/cos of its rotation) into a
+    // rotated square: s = size x 0.7071, A = (k.x sin, k.y cos) s,
+    // B = (-cos, k.y sin) s with k = VU23 (0x118bfe0); type 1 orients A/B by
+    // the billboard axes (VU 0..2 from *0x118bff4, transposed, x k), types
+    // 2/4/5 by the environment matrix (ptclmanBuildEnvPacket's); corners
+    // p+B, p+A, p-A, p-B with ST (0,0) (vec.x,0) (0,vec.y) (vec.x,vec.y),
+    // vec = the env packet's (VU24). Type 4 is a fan around p (a lit puff).
+    // Colour x255, alpha x128 (0x80 = 1). The blend is the material
+    // packet's: 1 adds, 2 subtracts, else blends.
+    struct ParticleEnv
+    {
+        uint32_t type = 0;
+        float m[16];
+        float vec[2] = {1, 1};
+        float k[3] = {1, 1, 1};
+        float axes[3][3];
+        float fade = 1.0f;
+        float light[4] = {0, 0, 0, 0}, shade[4] = {0.75f, 0, 0, 0}; // VU 26 / 27 (type 4's lighting)
+    } g_ptclEnvState;
+    uint32_t g_ptclBlend = 0;
+
+    void ptclMatHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_ptclBlend = GPR_U32(ctx, 4);
+        g_ptclMat(rdram, ctx, runtime);
+    }
+
+    // ptclmanBuildEnvPacket's inputs into g_ptclEnvState (the matrix from
+    // the guest at `mat`, or from `host` when given: round 103's direct path).
+    void ptclEnvTake(uint32_t vec, uint32_t type, uint32_t mat, const float *host, uint32_t lightAt, uint32_t shadeAt, float fade)
+    {
+        ParticleEnv &e = g_ptclEnvState;
+        e.type = type;
+        e.fade = fade;
+        if (host)
+            std::memcpy(e.m, host, sizeof(e.m));
+        else
+            for (int i = 0; i < 16; ++i)
+                e.m[i] = real(mat + i * 4u);
+        e.vec[0] = real(vec);
+        e.vec[1] = real(vec + 4u);
+        for (int i = 0; i < 4; ++i)
+        {
+            if (lightAt)
+                e.light[i] = real(lightAt + i * 4u);
+            if (shadeAt)
+                e.shade[i] = real(shadeAt + i * 4u);
+        }
+        for (int i = 0; i < 3; ++i)
+            e.k[i] = real(0x118BFE0u + i * 4u);
+        const uint32_t consts = word(0x118BFF4u);
+        // vf9..11: row i of the constants' first three qwords, transposed, times k.
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                e.axes[c][r] = consts ? e.k[c] * real(consts + r * 16u + c * 4u) : 0.0f;
+    }
+
+    void ptclEnvHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        ptclEnvTake(GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), nullptr, GPR_U32(ctx, 7), GPR_U32(ctx, 8), ctx->f[12]);
+        g_ptclEnv(rdram, ctx, runtime);
+    }
+
+    void ptclVtxTake(uint32_t a, uint32_t count, uint32_t header, uint32_t layer);
+    // Round 103's check (SOTC_PTCL103_CHECK): the direct path's job, compared
+    // with the hooks' at the next ptclVtxTake.
+    struct Ptcl103Check
+    {
+        bool pending = false;
+        uint32_t count = 0, header = 0, layer = 0, blend = 0;
+        ParticleEnv env;
+        std::vector<float> data;
+        uint64_t checks = 0, differ = 0, missed = 0;
+    } g_ptcl103Check;
+
+    void ptclVtxHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        const uint32_t a = GPR_U32(ctx, 4), count = GPR_U32(ctx, 5);
+        const uint32_t header = g_requested, layer = g_layers.empty() ? 18u : g_layers.back();
+        g_ptclVtx(rdram, ctx, runtime);
+        if (runtime->transferPending())
+            return; // a thread switch below (round 52): nothing more here
+        ptclVtxTake(a, count, header, layer);
+    }
+
+    // ptclVtxHook's job: the particles at `a` (12 words each) with the
+    // environment, blend, texture and layer taken so far.
+    void ptclVtxTake(const uint32_t a, const uint32_t count, const uint32_t header, const uint32_t layer)
+    {
+        HookTimer hookTimer;
+        if (Ptcl103Check &c = g_ptcl103Check; c.pending)
+        {
+            c.pending = false;
+            ++c.checks;
+            std::vector<float> now(count * 12u);
+            guestBlock(a, count * 48u, now.data());
+            const bool same = c.count == count && c.header == header && c.layer == layer && c.blend == g_ptclBlend &&
+                              std::memcmp(&c.env, &g_ptclEnvState, sizeof(ParticleEnv)) == 0 && c.data.size() == now.size() &&
+                              std::memcmp(c.data.data(), now.data(), now.size() * sizeof(float)) == 0;
+            if (!same && c.differ++ < 20u)
+                std::fprintf(stderr, "[ptcl103c] DIFFERS: count %u/%u header %08x/%08x layer %u/%u blend %u/%u env %d data %d\n", c.count, count, c.header, header, c.layer,
+                             layer, c.blend, g_ptclBlend, std::memcmp(&c.env, &g_ptclEnvState, sizeof(ParticleEnv)) == 0 ? 1 : 0,
+                             c.data.size() == now.size() && std::memcmp(c.data.data(), now.data(), now.size() * sizeof(float)) == 0 ? 1 : 0);
+            if (c.checks % 2000u == 0u)
+                std::fprintf(stderr, "[ptcl103c] %llu particle draws checked, %llu differ\n", (unsigned long long)c.checks, (unsigned long long)c.differ);
+        }
+        const bool off = !native_renderer::tuning().particles;
+        const ParticleEnv &env = g_ptclEnvState;
+        if (off || !g_cameraContext || count == 0u || count > 4096u || (!(env.type >= 1u && env.type <= 5u) && env.type != 7u))
+            return;
+        // The particles, the environment, the camera as they are now (the
+        // particles' buffer is the game's to fill again).
+        static PtclVtxJob local;
+        PtclVtxJob &job = hookjobs::g_on ? hookjobs::next().ptcl : local;
+        job.count = count;
+        job.header = header;
+        job.layer = layer;
+        job.blend = g_ptclBlend;
+        for (int i = 0; i < 16; ++i)
+            job.camera[i] = real(g_cameraContext + 0x5A0u + i * 4u);
+        const uint32_t consts = word(0x118BFF4u) & 0x0FFFFFFFu;
+        for (int i = 0; i < 3; ++i)
+            job.eye[i] = consts ? real(consts + 0x100u + i * 4u) : 0.0f;
+        job.env.resize(sizeof(ParticleEnv));
+        std::memcpy(job.env.data(), &env, sizeof(ParticleEnv));
+        job.data.resize(count * 12u);
+        guestBlock(a, count * 48u, job.data.data()); // (the same words as real() one by one)
+        if (!hookjobs::g_on)
+        {
+            ptclVtxDraw(job, env);
+            return;
+        }
+        hookjobs::g_ring[hookjobs::g_head.load(std::memory_order_relaxed) % hookjobs::kRing].kind = kJobPtcl;
+        hookjobs::push();
+    }
+
+    // Round 103 (ptcl103, decomp_ptcldraw.cpp): particleDraw's packets
+    // (ptclmanBuildMatPacket / BuildEnvPacket / BuildVtxPacket) made for the
+    // PS2's VU1 only; the job the three hooks would make from their inputs,
+    // made here from the same inputs, without the guest's packets. False
+    // (nothing done) when the hooks are not the drawing path.
+    bool ptclDirect103(uint32_t data, uint32_t count, uint32_t blend, uint32_t vec, uint32_t type, const float mat[16], uint32_t lightAt, uint32_t shadeAt,
+                       float fade)
+    {
+        if (!g_ptclVtx || !g_ptclEnv || !g_ptclMat || !g_ram || native_renderer::tuning().ps2Lists || !GS::skipRaster())
+            return false;
+        syncFrame(const_cast<uint8_t *>(g_ram));
+        // SOTC_PTCL103_CHECK=1: the job this path would make kept, the
+        // original packets built and hooked as before, and the hooks' job
+        // compared with it at ptclVtxTake ([ptcl103c] every 2000 checks).
+        static const bool check = ps2_diag::env("SOTC_PTCL103_CHECK") && std::atoi(ps2_diag::env("SOTC_PTCL103_CHECK")) != 0;
+        if (check)
+        {
+            const ParticleEnv savedEnv = g_ptclEnvState;
+            const uint32_t savedBlend = g_ptclBlend;
+            ptclEnvTake(vec, type, 0u, mat, lightAt, shadeAt, fade);
+            Ptcl103Check &c = g_ptcl103Check;
+            c.pending = true;
+            c.count = count;
+            c.header = g_requested;
+            c.layer = g_layers.empty() ? 18u : g_layers.back();
+            c.blend = blend;
+            std::memcpy(&c.env, &g_ptclEnvState, sizeof(ParticleEnv));
+            c.data.resize(count * 12u);
+            guestBlock(data, count * 48u, c.data.data());
+            g_ptclEnvState = savedEnv;
+            g_ptclBlend = savedBlend;
+            return false;
+        }
+        g_ptclBlend = blend; // ptclMatHook
+        ptclEnvTake(vec, type, 0u, mat, lightAt, shadeAt, fade); // ptclEnvHook
+        ptclVtxTake(data, count, g_requested, g_layers.empty() ? 18u : g_layers.back()); // ptclVtxHook
+        return true;
+    }
+
+    // Round 117 (pkt117, decomp_hot46j.cpp): the other particle drawers
+    // (0113DBF8, 0113E6C8, 0113DEA0) end with the same packets as
+    // particleDraw: ptclDisplayListPut, transMicroCode(7), ptclmanBegin,
+    // BuildMatPacket(blend), BuildEnvPacket(vec, type, the matrix at the guest
+    // address `mat`, light, shade, fade), BuildVtxPacket (not always:
+    // `vertices`), ptclmanEnd. As round 103: the hooks' state changes and job
+    // made from the same inputs in the same order, no packets. False (nothing
+    // done) when the hooks are not the drawing path, or in round 103's check
+    // mode for a draw without vertices (no hooked Vtx to compare at).
+    bool ptclDirect117(uint32_t data, uint32_t count, uint32_t blend, uint32_t vec, uint32_t type, uint32_t mat, uint32_t lightAt, uint32_t shadeAt, float fade,
+                       bool vertices)
+    {
+        if (!g_ptclVtx || !g_ptclEnv || !g_ptclMat || !g_ram || native_renderer::tuning().ps2Lists || !GS::skipRaster())
+            return false;
+        syncFrame(const_cast<uint8_t *>(g_ram));
+        static const bool check = ps2_diag::env("SOTC_PTCL103_CHECK") && std::atoi(ps2_diag::env("SOTC_PTCL103_CHECK")) != 0;
+        if (check)
+        {
+            if (!vertices)
+                return false;
+            const ParticleEnv savedEnv = g_ptclEnvState;
+            const uint32_t savedBlend = g_ptclBlend;
+            ptclEnvTake(vec, type, mat, nullptr, lightAt, shadeAt, fade);
+            Ptcl103Check &c = g_ptcl103Check;
+            c.pending = true;
+            c.count = count;
+            c.header = g_requested;
+            c.layer = g_layers.empty() ? 18u : g_layers.back();
+            c.blend = blend;
+            std::memcpy(&c.env, &g_ptclEnvState, sizeof(ParticleEnv));
+            c.data.resize(count * 12u);
+            guestBlock(data, count * 48u, c.data.data());
+            g_ptclEnvState = savedEnv;
+            g_ptclBlend = savedBlend;
+            return false;
+        }
+        g_ptclBlend = blend;                                     // ptclMatHook
+        ptclEnvTake(vec, type, mat, nullptr, lightAt, shadeAt, fade); // ptclEnvHook
+        if (vertices)
+            ptclVtxTake(data, count, g_requested, g_layers.empty() ? 18u : g_layers.back()); // ptclVtxHook
+        return true;
+    }
+
+    // Round 103: the model hook is installed and draws natively (no PS2
+    // lists built for it, the GS rasterizes nothing).
+    bool nativeDraws()
+    {
+        return g_modelDisp != nullptr && !native_renderer::tuning().ps2Lists && GS::skipRaster();
+    }
+
+    void ptclVtxDraw(const PtclVtxJob &job, const ParticleEnv &e)
+    {
+        SOTC_READ_SITE(9);
+        const uint32_t count = job.count, header = job.header, layer = job.layer;
+        const uint32_t g_ptclBlend = job.blend; // (the one at the hook)
+        // The particles' words (12 each) as captured: rd(i * 48 + offset).
+        const auto rdq = [&job](uint32_t byte) { return job.data[byte >> 2]; };
+        // Written straight into the frame's vertex buffer (at most 12 a particle).
+        native_renderer::Vertex *room = native_renderer::tuning().fastHooks ? native_renderer::frameMesh(count * 12u) : nullptr;
+        uint32_t written = 0;
+        static std::vector<native_renderer::Vertex> tris;
+        tris.clear();
+        const auto put = [&](const auto &...corners)
+        {
+            if (room)
+                ((room[written++] = corners), ...);
+            else
+                (tris.push_back(corners), ...);
+        };
+        auto mul3 = [&](const float *dir, float x, float y, float out[3])
+        {
+            for (int r = 0; r < 3; ++r)
+                out[r] = dir == nullptr ? 0.0f : 0.0f;
+            if (e.type == 1u)
+                for (int r = 0; r < 3; ++r)
+                    out[r] = e.axes[0][r] * x + e.axes[1][r] * y;
+            else
+                for (int r = 0; r < 3; ++r)
+                    out[r] = e.m[r] * x + e.m[4 + r] * y + ((e.type == 2u || e.type == 4u || e.type == 7u) ? e.m[12 + r] : 0.0f); // types 2, 4, 7 add the matrix's translation row (5 is a streak)
+        };
+        // Type 3 (streaks) side vectors: (p - eye) x (p1 - p2), half the width
+        // long; the eye is VU 16, the 17th qword of the constants at *0x118bff4.
+        const float *eye = job.eye;
+        auto side = [&](const float *p, const float *d, float half, float out[3])
+        {
+            const float r[3] = {p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]};
+            out[0] = r[1] * d[2] - r[2] * d[1];
+            out[1] = r[2] * d[0] - r[0] * d[2];
+            out[2] = r[0] * d[1] - r[1] * d[0];
+            const float len = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+            const float k = len > 0.0f ? half / len : 0.0f;
+            for (int i = 0; i < 3; ++i)
+                out[i] *= k;
+        };
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t q = i * 48u;
+            const float p[3] = {rdq(q), rdq(q + 4u), rdq(q + 8u)};
+            const float sz = rdq(q + 12u) * 0.70710677f;
+            const float sn = rdq(q + 32u), cs = rdq(q + 36u);
+            float A[3], B[3];
+            mul3(A, e.k[0] * sn * sz, e.k[1] * cs * sz, A);
+            mul3(B, -cs * sz, e.k[1] * sn * sz, B);
+            native_renderer::Vertex v{};
+            v.nz = 1.0f;
+            // (uint8_t)clamp(x, 0, 255) without float compares (each a VFP
+            // compare + flags transfer on the Vita): truncated to an int (NaN
+            // gives 0 either way), then clamped as an int; the same bytes.
+            const float cr = rdq(q + 16u) * 255.0f, cg = rdq(q + 20u) * 255.0f, cb = rdq(q + 24u) * 255.0f;
+            auto byteOf = [](float x)
+            {
+#if defined(__arm__) && defined(__ARM_NEON)
+                const int32_t i = vget_lane_s32(vcvt_s32_f32(vdup_n_f32(x)), 0); // saturating, NaN -> 0
+#else
+                const int32_t i = std::isnan(x) ? 0 : (x >= 2147483520.0f ? 255 : (x <= -2147483520.0f ? 0 : static_cast<int32_t>(x)));
+#endif
+                return static_cast<uint8_t>(i < 0 ? 0 : (i > 255 ? 255 : i));
+            };
+            const uint8_t ca = byteOf(rdq(q + 28u) * 128.0f);
+            auto col = [&](native_renderer::Vertex &o, float scale)
+            {
+                o.r = byteOf(cr * scale);
+                o.g = byteOf(cg * scale);
+                o.b = byteOf(cb * scale);
+                o.a = ca;
+            };
+            col(v, 1.0f); // every corner's colour (the lit ones set their own)
+            auto at = [&](const float *o, float sign, float u, float vv)
+            {
+                native_renderer::Vertex c = v;
+                c.x = p[0] + sign * o[0];
+                c.y = p[1] + sign * o[1];
+                c.z = p[2] + sign * o[2];
+                c.u = u;
+                c.v = vv;
+                                return c;
+            };
+            if (e.type == 3u || e.type == 5u)
+            {
+                // A streak from p (q0, width in w) to p2 (q2): corners p +- a, p2 +- b.
+                // Type 5 (microcode 7 at 0xba8) is the same streak drawn as type
+                // 4's lit fan (routine 0xe48) around the corners' mean.
+                const float p2[3] = {rdq(q + 32u), rdq(q + 36u), rdq(q + 40u)};
+                const float d[3] = {p[0] - p2[0], p[1] - p2[1], p[2] - p2[2]};
+                const float half = rdq(q + 12u) * 0.5f;
+                float sa[3], sb[3];
+                side(p, d, half, sa);
+                side(p2, d, half, sb);
+                auto corner = [&](const float *base, const float *o, float sign, float u, float vv)
+                {
+                    native_renderer::Vertex c = v;
+                    c.x = base[0] + sign * o[0];
+                    c.y = base[1] + sign * o[1];
+                    c.z = base[2] + sign * o[2];
+                    c.u = u;
+                    c.v = vv;
+                                        return c;
+                };
+                native_renderer::Vertex c16 = corner(p, sa, 1, 0, 0), c17 = corner(p, sa, -1, e.vec[0], 0), c18 = corner(p2, sb, 1, 0, e.vec[1]),
+                                        c19 = corner(p2, sb, -1, e.vec[0], e.vec[1]);
+                if (e.type == 3u)
+                {
+                    put(c16, c17, c18, c17, c19, c18);
+                    continue;
+                }
+                native_renderer::Vertex c = v;
+                c.x = (c16.x + c17.x + c18.x + c19.x) * 0.25f;
+                c.y = (c16.y + c17.y + c18.y + c19.y) * 0.25f;
+                c.z = (c16.z + c17.z + c18.z + c19.z) * 0.25f;
+                c.u = e.vec[0] * 0.5f;
+                c.v = e.vec[1] * 0.5f;
+                auto shade = [&](native_renderer::Vertex &o, const float *n)
+                {
+                    const float dd = n[0] * e.light[0] + n[1] * e.light[1] + e.shade[3] * n[2] * e.light[2] + e.shade[3];
+                    float t = std::min(dd * 0.5f, 1.0f);
+                    t *= t;
+                    col(o, t * e.shade[1] + e.shade[0]);
+                };
+                shade(c, e.axes[2]);
+                for (native_renderer::Vertex *o : {&c16, &c17, &c18, &c19})
+                {
+                    float n[3] = {c.x - o->x, c.y - o->y, c.z - o->z};
+                    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    for (int k = 0; k < 3; ++k)
+                        n[k] = len > 0.0f ? n[k] / len : 0.0f;
+                    shade(*o, n);
+                }
+                put(c, c16, c17, c, c17, c19, c, c19, c18, c, c18, c16);
+                continue;
+            }
+            // Type 7: each particle's own texture cell offset (q2 z / w).
+            const float u0 = e.type == 7u ? rdq(q + 40u) : 0.0f, v0 = e.type == 7u ? rdq(q + 44u) : 0.0f;
+            const native_renderer::Vertex v16 = at(B, 1, u0, v0), v17 = at(A, 1, u0 + e.vec[0], v0), v18 = at(A, -1, u0, v0 + e.vec[1]),
+                                          v19 = at(B, -1, u0 + e.vec[0], v0 + e.vec[1]);
+            if (e.type == 4u)
+            {
+                // A lit fan (routine 0xe48): the centre's normal is the camera's
+                // third axis, a corner's the way to the centre; with L = VU 26
+                // and k = VU 27: s = min((n.x L.x + n.y L.y + k.w n.z L.z + k.w) / 2,
+                // 1)^2, the colour times s k.y + k.x.
+                auto lit = [&](native_renderer::Vertex &o, const float *n)
+                {
+                    const float d = n[0] * e.light[0] + n[1] * e.light[1] + e.shade[3] * n[2] * e.light[2] + e.shade[3];
+                    float t = std::min(d * 0.5f, 1.0f);
+                    t *= t;
+                    col(o, t * e.shade[1] + e.shade[0]);
+                };
+                auto towardCentre = [&](const native_renderer::Vertex &o, float n[3])
+                {
+                    n[0] = p[0] - o.x;
+                    n[1] = p[1] - o.y;
+                    n[2] = p[2] - o.z;
+                    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    for (int k = 0; k < 3; ++k)
+                        n[k] = len > 0.0f ? n[k] / len : 0.0f;
+                };
+                native_renderer::Vertex c = v, f16 = v16, f17 = v17, f18 = v18, f19 = v19;
+                c.x = p[0];
+                c.y = p[1];
+                c.z = p[2];
+                c.u = e.vec[0] * 0.5f;
+                c.v = e.vec[1] * 0.5f;
+                lit(c, e.axes[2]);
+                float n[3];
+                for (native_renderer::Vertex *o : {&f16, &f17, &f18, &f19})
+                {
+                    towardCentre(*o, n);
+                    lit(*o, n);
+                }
+                put(c, f16, f17, c, f17, f19, c, f19, f18, c, f18, f16);
+            }
+            else
+                put(v16, v17, v18, v17, v19, v18);
+        }
+        if (room ? written == 0u : tris.empty())
+        {
+            if (room)
+                native_renderer::cancelFrameMesh();
+            return;
+        }
+        const float *camera = job.camera;
+        const uint64_t mesh = (1ull << 58) | g_skinnedDraws++;
+        if (room)
+            native_renderer::commitFrameMesh(mesh, written);
+        else
+            native_renderer::uploadMesh(mesh, tris.data(), static_cast<uint32_t>(tris.size()), true);
+        native_renderer::DrawState state;
+        state.texture = texture(header);
+        // SOTC_PTCL_DRAWLOG=1 (debugging, round 11's dust report): each type 7
+        // draw's header, texture, blend and its particles' colour / size / cell
+        // ranges; =2 every type.
+        static const bool drawLog = std::getenv("SOTC_PTCL_DRAWLOG") != nullptr;
+        if (drawLog && (e.type == 7u || std::getenv("SOTC_PTCL_DRAWLOG")[0] == '2'))
+        {
+            float lo[7], hi[7];
+            for (int k = 0; k < 7; ++k)
+                lo[k] = 1e30f, hi[k] = -1e30f;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t q = i * 48u;
+                const float vals[7] = {rdq(q + 16u), rdq(q + 20u), rdq(q + 24u), rdq(q + 28u), rdq(q + 12u), rdq(q + 40u), rdq(q + 44u)};
+                for (int k = 0; k < 7; ++k)
+                    lo[k] = std::min(lo[k], vals[k]), hi[k] = std::max(hi[k], vals[k]);
+            }
+            std::fprintf(stderr, "[ptcldraw] f %llu type %u n %u blend %u hdr %08x layer %u tex %016llx vec %g %g r %g..%g g %g..%g b %g..%g a %g..%g sz %g..%g u %g..%g v %g..%g"
+                                 " light %g %g %g %g shade %g %g %g %g fade %g format %08x\n",
+                         (unsigned long long)g_frame, e.type, count, g_ptclBlend, header, layer, (unsigned long long)state.texture, e.vec[0], e.vec[1], lo[0], hi[0],
+                         lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], lo[4], hi[4], lo[5], hi[5], lo[6], hi[6], e.light[0], e.light[1], e.light[2], e.light[3], e.shade[0],
+                         e.shade[1], e.shade[2], e.shade[3], e.fade, header ? word(header + 0x1Cu) : 0u);
+        }
+        state.blend = g_ptclBlend == 1u ? native_renderer::Blend::Additive : (g_ptclBlend == 2u ? native_renderer::Blend::Subtract : native_renderer::Blend::Normal);
+        state.order = layer;
+        state.fogged = false;
+        // Round 65e: the particles' TEST is ATST NEVER, AFAIL FB_ONLY (logged on
+        // the GS: no pixel passes, every one written to the frame only): they
+        // never write Z. Written natively, the clouds of mist over the bridge
+        // hid the sky from the bloom's mask (Z <= threshold + 1): 42% of the
+        // picture masked where the GS masks 95%, the sky grey instead of the
+        // GS's bright haze. SOTC_PTCL_DEPTH=1: they write depth, as before.
+        static const bool ptclDepth = std::getenv("SOTC_PTCL_DEPTH") && std::atoi(std::getenv("SOTC_PTCL_DEPTH")) != 0;
+        state.noDepthWrite = !ptclDepth;
+        native_renderer::draw(mesh, camera, state);
+        ++g_frameDraws;
+    }
+
+    // ---- screenBlur (0x108a780) -------------------------------------------
+    constexpr uint32_t kScreenBlur = 0x0108A780u;
+    PS2Runtime::RecompiledFunction g_screenBlur = nullptr;
+    // Round 59 (SOTC_SBLUR_JOIN=0 / A/B name `sblurlazy`; off by default): the
+    // model jobs are joined only when a blur is recorded. cameraBlur calls
+    // screenBlur near the frame's end whenever the camera moved, and nearly
+    // every call is the identity (round 51), which records nothing: its join
+    // only held the game thread until the worker had drawn the frame's
+    // models (Vita3K 222 MHz: 777 of 7 476 frames, 4.3 ms each), work the
+    // frame change's join (or the next frame's logic) covers as in any frame
+    // without a blur. The guest screenBlur's own GS writes go through gsReg's
+    // hooks, which keep the jobs' order themselves; a recorded blur still
+    // joins first, as before.
+    void screenBlurHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        syncFrame(rdram);
+        // Default: the join at every call, as before (the lazy join measured
+        // no gain and the title screen's world a little worse, round 59).
+        static const bool envLazy = std::getenv("SOTC_SBLUR_JOIN") && std::atoi(std::getenv("SOTC_SBLUR_JOIN")) == 0;
+        const bool lazy = g_sblurLazyJoin || envLazy || (sblur100Start() && g_sblur100); // round 100: the default
+        if (!lazy)
+            hookJoin(hookjobs::k_screenblur);
+        static int n = 0;
+        // SOTC_SBLUR_LOG=1 (debugging, round 51): every call, not the first 30.
+        static const bool everyBlur = ps2_diag::env("SOTC_SBLUR_LOG") != nullptr;
+        if ((ps2_diag::env("SOTC_NATIVE_LOG") && n++ < 30) || everyBlur)
+            std::fprintf(stderr, "[sblur] frame %llu angle %g scale %g layer %u w %d a1 %d steps %d a3 %d t0 %d\n", (unsigned long long)g_frame, ctx->f[12], ctx->f[13],
+                         GPR_U32(ctx, 4), static_cast<int32_t>(GPR_U32(ctx, 5)), static_cast<int32_t>(GPR_U32(ctx, 6)), static_cast<int32_t>(GPR_U32(ctx, 7)),
+                         static_cast<int32_t>(GPR_U32(ctx, 8)), static_cast<int32_t>(GPR_U32(ctx, 9)));
+        native_renderer::ScreenBlur b;
+        b.angle = ctx->f[12];
+        b.scale = ctx->f[13];
+        b.order = GPR_U32(ctx, 4);
+        b.steps = static_cast<int32_t>(GPR_U32(ctx, 7));
+        b.dx = static_cast<float>(static_cast<int32_t>(GPR_U32(ctx, 8)));
+        b.dy = static_cast<float>(static_cast<int32_t>(GPR_U32(ctx, 9)));
+        // Round 51: cameraBlur (graphFrameFinish) calls this whenever the
+        // camera moved more than its threshold since the last frame, which at
+        // the Vita's 16-20 fps is nearly every moving frame (170 calls in 90 s
+        // of the attract demo in Vita3K against 62 in 6 000 frames on the
+        // Mac), and 98% of them are the identity: scale 1 +- 1e-5, an angle
+        // under the 0.0157 the copies ignore, no shift. Each copy then lands
+        // on the picture's own pixels (at most 1/16 of a PS2 pixel off at the
+        // corners): what the copies blend is the picture itself, the GS's
+        // result too. Drawn, it cost the picture so far copied mid-frame (the
+        // console) or the scene drawn a second time (Vita3K), and that path
+        // smeared the Vita's picture while the camera moved (fine as soon as
+        // it stopped: no more calls). Left out; real zoom / shift blurs are
+        // drawn as before. SOTC_SBLUR_IDENTITY=1: drawn anyway (debugging).
+        static const bool drawIdentity = std::getenv("SOTC_SBLUR_IDENTITY") && std::atoi(std::getenv("SOTC_SBLUR_IDENTITY")) != 0;
+        const float corner = 340.2f; // PS2 pixels from the centre to a corner (256, 224)
+        const float moved = std::fabs(b.scale - 1.0f) * corner + (std::fabs(b.angle) >= 0.01570796f ? std::fabs(b.angle) * corner : 0.0f) + std::fabs(b.dx) + std::fabs(b.dy);
+        const bool identity = !(moved >= 1.0f / 16.0f); // (NaN: left out too)
+        if (native_renderer::tuning().screenBlur && b.steps > 0 && b.steps < 64 && (!identity || drawIdentity))
+        {
+            if (lazy)
+                hookJoin(hookjobs::k_screenblur);
+            native_renderer::addScreenBlur(b);
+        }
+        g_screenBlur(rdram, ctx, runtime);
+    }
+
+    // A 4 x 4 inverse (column-major); false when singular.
+    bool invert4(const float *m, float *out)
+    {
+        float inv[16];
+        inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+        inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+        inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+        inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+        inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+        inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+        inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+        inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+        inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+        inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+        inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+        inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+        inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+        inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+        inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+        inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+        const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+        if (det == 0.0f || !std::isfinite(det))
+            return false;
+        for (int i = 0; i < 16; ++i)
+            out[i] = inv[i] / det;
+        return true;
+    }
+
+    // modelDisp (0x1097118) without its display list: what it leaves in RAM
+    // for the rest of the game, the VIF packets it links for VU1 (CALL tags
+    // into each layer's chain: the instance's header, the microcode, every
+    // packet of the LOD, the texture requests) left out. Nothing reads those
+    // any more with the native renderer drawing, and walking them was most of
+    // the VIF1 chain (Vif1Walker) besides modelDisp's own time. Kept:
+    //   the parts' camera test results (LOD table node +0x2c),
+    //   the instance packet's opacity (+0xdc) and +0xd0,
+    //   setShadowEffect (0x1186294) for a drawn part with bit 24,
+    //   the last surface per layer (*0x118bfc8, modelSetSurface reads it too).
+    // Left out with the lists: texTransRequest (VRAM uploads for the GS that
+    // draws nothing; native textures come from RAM) and iosDlLockObj (holds a
+    // deletion until the frame's DMA is done; no DMA reads the model now).
+    // SOTC_PS2_LISTS=1 / Debug "PS2 model lists": the recompiled modelDisp.
+    // VU0 macro arithmetic as the recompiled code does it (PS2_VMUL /
+    // PS2_VADD: operands and result with denormals flushed and infinities
+    // clamped, a multiply and an add rounded apart) and its CLIP judgement.
+    float vuNorm(float v)
+    {
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        const uint32_t e = b & 0x7F800000u;
+        if (e == 0u)
+            b &= 0x80000000u;
+        else if (e == 0x7F800000u)
+            b = (b & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&v, &b, 4);
+        return v;
+    }
+    // vmulax / vmadday / vmaddaz / vmaddw: m (4 columns) x (x, y, z, w),
+    // every operand already through vuNorm (each product and sum is again).
+    void vuTransform(const float m[16], float x, float y, float z, float w, float out[4])
+    {
+        for (int r = 0; r < 4; ++r)
+        {
+            const float a = vuNorm(vuNorm(m[r] * x) + vuNorm(m[4 + r] * y));
+            const float b = vuNorm(a + vuNorm(m[8 + r] * z));
+            out[r] = vuNorm(b + vuNorm(m[12 + r] * w));
+        }
+    }
+    // ps2VuClipFlags(v, v): +x 0, -x 1, +y 2, -y 3, +z 4, -z 5 against |w|.
+    uint32_t vuClipFlags(const float v[4])
+    {
+        uint32_t wBits;
+        std::memcpy(&wBits, &v[3], 4);
+        const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+        uint32_t flags = 0u;
+        for (int c = 0; c < 3; ++c)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &v[c], 4);
+            if (static_cast<int32_t>(bits) > limit)
+                flags |= 1u << (2 * c);
+            if (static_cast<int32_t>(bits ^ 0x80000000u) > limit)
+                flags |= 2u << (2 * c);
+        }
+        return flags;
+    }
+
+    // vuClipFlags (bits as ordered integers against |w|) for four vectors at
+    // once, one per lane of the result: no move to the ARM registers per vector.
+    inline __m128i vuClipFlags4x(__m128 a, __m128 b, __m128 c, __m128 d)
+    {
+        _MM_TRANSPOSE4_PS(a, b, c, d); // a: the x of each, b: y, c: z, d: w
+        const __m128i w = _mm_castps_si128(d);
+        const __m128i expZero = _mm_cmpeq_epi32(_mm_and_si128(w, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+        const __m128i lim = _mm_or_si128(_mm_andnot_si128(expZero, _mm_and_si128(w, _mm_set1_epi32(0x7FFFFFFF))),
+                                         _mm_and_si128(expZero, _mm_set1_epi32(0x007FFFFF)));
+        const __m128i sign = _mm_set1_epi32(static_cast<int>(0x80000000u));
+        const auto lanes = [&](__m128 v, int plusBit)
+        {
+            const __m128i bits = _mm_castps_si128(v);
+            return _mm_or_si128(_mm_and_si128(_mm_cmpgt_epi32(bits, lim), _mm_set1_epi32(1 << plusBit)),
+                                _mm_and_si128(_mm_cmpgt_epi32(_mm_xor_si128(bits, sign), lim), _mm_set1_epi32(2 << plusBit)));
+        };
+        return _mm_or_si128(_mm_or_si128(lanes(a, 0), lanes(b, 2)), lanes(c, 4));
+    }
+
+    // ---- Prefetching the guest lines a model's draw reads (g_prefetch) ----
+    //
+    // The Vita's Cortex-A9 has no useful hardware prefetch and a DRAM miss
+    // costs ~250 ns; a model's draw walks its instance, its header, its
+    // packet list (32 bytes a packet, every LOD), its part tree (0x30 a
+    // node, linked) and its surfaces, each line the first time a frame: one
+    // miss after the other (modelDispState ~35 us an instance). What a model
+    // looked like the last time (ModelShape, by header) and the order of the
+    // last frame's draws (g_calls) say what the next draw will read: asked
+    // for while this one runs (a few lines per packet), so the misses overlap.
+    struct ModelShape
+    {
+        uint32_t header = 0, packets = 0, packetCount = 0, table = 0, nodes = 0;
+        uint32_t surfaces[8] = {}; // the first distinct surfaces drawn (their flags' line)
+        uint32_t surfaceCount = 0;
+    };
+    ModelShape g_shapes[512];
+    inline ModelShape &modelShape(uint32_t header) { return g_shapes[((header >> 4) * 0x9E3779B1u) >> 23]; }
+    struct CallRecord
+    {
+        uint32_t instance, object, header, own;
+        // Round 32 (g_hookLean): the matrix, the palette's packet (0: none)
+        // and its bytes, the plan's packets (a host address: only asked for,
+        // never read, so a plan gone since is harmless).
+        uint32_t matrix = 0, palette = 0, paletteBytes = 0, planBytes = 0;
+        const void *plan = nullptr;
+    };
+    std::vector<CallRecord> g_calls, g_lastCalls; // this frame's modelDisp calls, the last frame's
+    size_t g_callCursor = 0;                      // where this frame is in g_lastCalls
+    // A queue of lines to ask for, a few at a time (a PLD past the A9's
+    // line fill buffers waits for one: not all at once).
+    struct PrefetchQueue
+    {
+        uint32_t lines[192];
+        uint32_t head = 0, tail = 0;
+        void push(uint32_t addr)
+        {
+            if (tail < 192u)
+                lines[tail++] = addr;
+        }
+        void pushRange(uint32_t addr, uint32_t bytes, uint32_t maxLines)
+        {
+            for (uint32_t a = addr & ~31u, n = 0; a < addr + bytes && n < maxLines; a += 32u, ++n)
+                push(a);
+        }
+        void pump(uint32_t n)
+        {
+            if (leanStatsOn())
+                g_leanStats.queuePumped += std::min(n, tail - head);
+            for (; n && head < tail; --n)
+                prefetchGuest(lines[head++]);
+        }
+        // One line (round 32: the draw's own loops, a line per packet / node).
+        inline void pumpOne()
+        {
+            if (head < tail)
+            {
+                if (leanStatsOn())
+                    ++g_leanStats.queuePumped;
+                prefetchGuest(lines[head++]);
+            }
+        }
+        void clear()
+        {
+            if (leanStatsOn())
+                g_leanStats.queueDropped += tail - head;
+            head = tail = 0;
+        }
+    } g_prefetchQueue;
+    void newDrawOrder()
+    {
+        g_lastCalls.swap(g_calls);
+        g_calls.clear();
+        g_callCursor = 0;
+        g_prefetchQueue.clear();
+    }
+    // The next draw's lines (from the last frame's order), queued.
+    void queueNextDraw(uint32_t instance)
+    {
+        PrefetchQueue &q = g_prefetchQueue;
+        q.pump(8u); // the last one's: a few more now, the rest dropped
+        q.clear();
+        size_t at = g_callCursor;
+        if (at >= g_lastCalls.size() || g_lastCalls[at].instance != instance)
+        {
+            // Out of step: looked for a little ahead.
+            at = ~size_t(0);
+            for (size_t i = g_callCursor, end = std::min(g_lastCalls.size(), g_callCursor + 8u); i < end; ++i)
+                if (g_lastCalls[i].instance == instance)
+                {
+                    at = i;
+                    break;
+                }
+            if (at == ~size_t(0))
+                return;
+        }
+        g_callCursor = at + 1u;
+        if (g_callCursor >= g_lastCalls.size())
+            return;
+        const CallRecord &next = g_lastCalls[g_callCursor];
+        // First what the next draw reads first (a chain: instance, object, header).
+        prefetchGuest(next.instance);
+        prefetchGuest(next.instance + 0x240u);
+        prefetchGuest(next.instance + 0x260u);
+        prefetchGuest(next.object + 0x20u);
+        q.pushRange(next.header, 0x80u, 4u);
+        q.push(next.own + 0x10u);
+        q.push(next.own + 0x30u);
+        q.push(next.own + 0x50u);
+        q.push(next.own + 0x70u);
+        q.push(next.own + 0xD0u);
+        if (g_hookLean)
+        {
+            // The matrix the hook reads first, the plan's packets (host), the
+            // palette (a skinned model's: up to ~4 KB) behind the rest.
+            if (next.matrix)
+            {
+                prefetchGuest(next.matrix);
+                prefetchGuest(next.matrix + 32u);
+            }
+            if (next.plan)
+                for (uint32_t b = 0; b < next.planBytes && b < 256u; b += 64u)
+                    __builtin_prefetch(static_cast<const uint8_t *>(next.plan) + b);
+            if (next.palette)
+                q.pushRange(next.palette, next.paletteBytes, 48u);
+        }
+        const ModelShape &shape = modelShape(next.header);
+        if (shape.header != next.header)
+            return;
+        if (!g_planOn) // with the draw plans the packet list is not read
+            q.pushRange(shape.packets, shape.packetCount * 32u, 64u);
+        if (shape.table)
+            q.pushRange(shape.table, shape.nodes * 0x30u, 64u);
+        for (uint32_t i = 0; i < shape.surfaceCount; ++i)
+            q.push(shape.surfaces[i] + 0x18u);
+    }
+
+    // Round 49 (SOTC_FASTNATIVE, modelDispState's fast path): the part
+    // test's CLIP judgements with the same integer compares as vuClipFlags4x,
+    // the six flag bits put together by shift-inserts (no constants per bit),
+    // |w|'s limit as max(|w| bits, 0x7fffff) (the same value: a zero exponent
+    // leaves |w| bits <= 0x7fffff, any other exponent >= 0x800000).
+    inline uint32x4_t mdsClipFlags4(__m128 a, __m128 b, __m128 c, __m128 d)
+    {
+        _MM_TRANSPOSE4_PS(a, b, c, d); // a: the x of each, b: y, c: z, d: w
+        const int32x4_t lim = vmaxq_s32(vreinterpretq_s32_u32(vandq_u32(vreinterpretq_u32_f32(d), vdupq_n_u32(0x7FFFFFFFu))), vdupq_n_s32(0x007FFFFF));
+        const uint32x4_t sign = vdupq_n_u32(0x80000000u);
+        const auto gt = [&](__m128 v) { return vcgtq_s32(vreinterpretq_s32_f32(v), lim); };
+        const auto lt = [&](__m128 v) { return vcgtq_s32(vreinterpretq_s32_u32(veorq_u32(vreinterpretq_u32_f32(v), sign)), lim); };
+        uint32x4_t r = gt(a);
+        r = vsliq_n_u32(r, lt(a), 1);
+        r = vsliq_n_u32(r, gt(b), 2);
+        r = vsliq_n_u32(r, lt(b), 3);
+        r = vsliq_n_u32(r, gt(c), 4);
+        r = vsliq_n_u32(r, lt(c), 5);
+        return vandq_u32(r, vdupq_n_u32(0x3Fu));
+    }
+    // The part test (modelDispState's `test`): the same products, sums and
+    // clamps, the judgements' reductions on the NEON side (three moves to
+    // the ARM registers instead of a store of eleven words and their loads).
+    struct MdsPartClip
+    {
+        __m128 col0, col1, col2, byW;
+        uint32_t clip; // the CLIP register (24 bits)
+        inline uint32_t test(const uint8_t *ram, uint32_t node)
+        {
+            static constexpr uint8_t kCorners[8] = {0, 6, 5, 3, 4, 2, 1, 7}; // bit 0 x, 1 y, 2 z: max
+            const __m128 lo = ps2VuOperand(_mm_loadu_ps(reinterpret_cast<const float *>(ram + (node & 0x1FFFFFCu)))),
+                         hi = ps2VuOperand(_mm_loadu_ps(reinterpret_cast<const float *>(ram + ((node + 0x10u) & 0x1FFFFFCu))));
+            const __m128 byX[2] = {ps2VuResult(_mm_mul_ps(col0, _mm_shuffle_ps(lo, lo, 0x00))), ps2VuResult(_mm_mul_ps(col0, _mm_shuffle_ps(hi, hi, 0x00)))};
+            const __m128 byY[2] = {ps2VuResult(_mm_mul_ps(col1, _mm_shuffle_ps(lo, lo, 0x55))), ps2VuResult(_mm_mul_ps(col1, _mm_shuffle_ps(hi, hi, 0x55)))};
+            const __m128 byZ[2] = {ps2VuResult(_mm_mul_ps(col2, _mm_shuffle_ps(lo, lo, 0xAA))), ps2VuResult(_mm_mul_ps(col2, _mm_shuffle_ps(hi, hi, 0xAA)))};
+            __m128 v[8];
+            for (int k = 0; k < 8; ++k)
+            {
+                const uint8_t corner = kCorners[k];
+                v[k] = ps2VuResult(_mm_add_ps(byX[corner & 1], byY[(corner >> 1) & 1]));
+                v[k] = ps2VuResult(_mm_add_ps(v[k], byZ[(corner >> 2) & 1]));
+                v[k] = ps2VuResult(_mm_add_ps(v[k], byW));
+            }
+            // f[3..6] in a, f[7..10] in b (the old code's f[]): all = the AND
+            // of the eight, any = their OR and the register's last three
+            // (its low 18 bits), the register after = f7<<18 | f8<<12 | f9<<6 | f10.
+            const uint32x4_t a = mdsClipFlags4(v[0], v[1], v[2], v[3]), b = mdsClipFlags4(v[4], v[5], v[6], v[7]);
+            static const int32_t kShifts[4] = {18, 12, 6, 0};
+            const uint32x4_t andv = vandq_u32(a, b), orv = vorrq_u32(a, b), placed = vshlq_u32(b, vld1q_s32(kShifts));
+            // reduced on the NEON side to three lanes: three moves to the ARM side
+            uint32x2_t and2 = vand_u32(vget_low_u32(andv), vget_high_u32(andv));
+            uint32x2_t or2 = vorr_u32(vget_low_u32(orv), vget_high_u32(orv));
+            uint32x2_t reg2 = vorr_u32(vget_low_u32(placed), vget_high_u32(placed));
+            and2 = vand_u32(and2, vrev64_u32(and2));
+            or2 = vorr_u32(or2, vrev64_u32(or2));
+            reg2 = vorr_u32(reg2, vrev64_u32(reg2));
+            const uint32x2_t allAny = vext_u32(and2, or2, 1); // {all, any of the eight}
+            const uint32_t all = vget_lane_u32(allAny, 0);
+            const uint32_t any = vget_lane_u32(allAny, 1) | (clip & 0x3FFFFu);
+            clip = vget_lane_u32(reg2, 0);
+            return all ? 1u : (any ? 0u : 2u);
+        }
+    };
+
+    // modelDispState's part walk below the root (round 49): the recursive
+    // visit's order exactly (pre-order; a node's +0x24 link read after its
+    // +0x20 subtree is done; the same depth and budget limits; the queue
+    // asked for one line a node), without recursion and with the walk's
+    // state in registers: `pending` holds the nodes whose +0x24 link is still
+    // to be read (the path's nodes entered by their +0x20 child), a node
+    // entered by its +0x24 child is done (its depth goes with its child).
+    // The results go to partOut as the old walk's record() puts them (while
+    // `once`: each index once, below 4096; the vector grown the same way),
+    // the vector's data and size kept in registers between its resizes.
+    template <bool prefetchOn>
+    __attribute__((noinline)) void mdsPartWalk(MdsPartClip &pc, uint32_t table, uint32_t root, uint32_t &budgetRef, uint32_t &maxNodeRef, bool pumpQueue,
+                                               std::vector<uint8_t> *partOut, bool &onceRef, uint32_t *seen, uint32_t stamp)
+    {
+        uint8_t *const ram = const_cast<uint8_t *>(g_ram);
+        bool once = onceRef;
+        uint8_t *pvData = partOut ? partOut->data() : nullptr;
+        size_t pvSize = partOut ? partOut->size() : 0u;
+        PrefetchQueue &q = g_prefetchQueue;
+        // (round 61: on the lane the queue, the game thread's, is not touched)
+        const uint32_t qFirst = pumpQueue ? q.head : 0u, qEnd = pumpQueue ? std::max(q.tail, q.head) : 0u;
+        uint32_t qAt = qFirst, budget = budgetRef, maxNode = maxNodeRef;
+        struct Pending
+        {
+            uint32_t node, state, depth;
+        } pending[66];
+        uint32_t count = 0;
+        uint32_t node = table, state = root, depth = 0, second = 0; // second: +0x24 next
+        for (;;)
+        {
+            const uint32_t at = node + (second ? 0x24u : 0x20u);
+            noteRead(at, 4u);
+            uint32_t index;
+            std::memcpy(&index, ram + (at & 0x1FFFFFCu), 4);
+            if (index != 0xFFFFFFFFu && depth < 64u && budget != 0u)
+            {
+                if (!second)
+                    pending[count++] = {node, state, depth};
+                // visit(index, table + index * 0x30, state, depth + 1)
+                --budget;
+                if (qAt < qEnd)
+                    lines67::pref(q.lines[qAt]), __builtin_prefetch(ram + (q.lines[qAt++] & 0x1FFFFE0u)); // the next draw's lines (queueNextDraw)
+                node = table + index * 0x30u;
+                if (prefetchOn)
+                    lines67::pref(node + 0x60u), __builtin_prefetch(ram + ((node + 0x60u) & 0x1FFFFE0u)); // two nodes on (a table is mostly in walk order)
+                maxNode = std::max(maxNode, node);
+                if (!state)
+                    state = pc.test(ram, node);
+                std::memcpy(ram + ((node + 0x2Cu) & 0x1FFFFFCu), &state, 4);
+                if (once)
+                {
+                    if (index >= 4096u || seen[index] == stamp)
+                        once = false;
+                    else
+                    {
+                        seen[index] = stamp;
+                        if (pvSize <= index)
+                        {
+                            partOut->resize(index + 1u, 0u);
+                            pvData = partOut->data();
+                            pvSize = partOut->size();
+                        }
+                        pvData[index] = static_cast<uint8_t>(state);
+                    }
+                }
+                ++depth;
+                second = 0;
+                continue;
+            }
+            if (!second)
+            {
+                second = 1;
+                continue;
+            }
+            if (count == 0u)
+                break;
+            const Pending &p = pending[--count];
+            node = p.node;
+            state = p.state;
+            depth = p.depth;
+        }
+        if (pumpQueue)
+        {
+            if (leanStatsOn())
+                g_leanStats.queuePumped += qAt - qFirst;
+            q.head = qAt;
+        }
+        budgetRef = budget;
+        maxNodeRef = maxNode;
+        onceRef = once;
+    }
+    // modelDispState's loop over the plan's packets (round 49): the same
+    // tests in the same order, the frame, the guest base, the queue and the
+    // tests' constants in registers.
+    // (Round 61: fog is *0x1186328 as the hook read it, ~0u: read it here;
+    // on the lane the queue is not touched.)
+    template <bool partCulled>
+    __attribute__((noinline)) void mdsPlanPackets(const ModelPlan *plan, SurfaceInfo *memoArr, uint32_t header, uint32_t table, bool fading, uint32_t boss,
+                                                  uint32_t cache, uint32_t fogIn = ~0u, bool onLane = false)
+    {
+        uint8_t *const ram = const_cast<uint8_t *>(g_ram);
+        const uint64_t frame = g_frame;
+        const bool pumpQueue = g_hookLean && g_prefetch && !onLane;
+        PrefetchQueue &q = g_prefetchQueue;
+        const uint32_t qFirst = pumpQueue ? q.head : 0u, qEnd = pumpQueue ? q.tail : 0u;
+        uint32_t qAt = qFirst;
+        const uint32_t layerAt = fading ? 1u : 0u;
+        const PlanPacket *e = plan->pk.data();
+        const PlanPacket *const end = e + plan->pk.size();
+        SurfaceInfo *nextInfo = e != end ? &memoArr[e->slot] : nullptr; // (each slot's address made once)
+        for (; e != end; ++e)
+        {
+            const uint32_t s = e->s;
+            SurfaceInfo &info = *nextInfo;
+            if (e + 1 != end)
+                nextInfo = &memoArr[e[1].slot];
+            if (pumpQueue)
+            {
+                if (qAt < qEnd)
+                    lines67::pref(q.lines[qAt]), __builtin_prefetch(ram + (q.lines[qAt++] & 0x1FFFFE0u)); // the next draw's lines (queueNextDraw)
+                if (e + 1 != end)
+                    __builtin_prefetch(nextInfo);
+            }
+            if (__builtin_expect(!(info.s == s && info.header == header && info.frame == frame), 0))
+                surfaceInfo(header, s, memoArr);
+            const uint32_t flags = static_cast<uint32_t>(info.flags); // bits 17, 24, 26, 29 only
+            if ((flags >> 29) & 1u)
+                continue;
+            if (partCulled && e->part != 0xFFFFFFFFu) // (a constant)
+            {
+                const uint32_t at = table + e->part * 0x30u + 0x2Cu;
+                noteRead(at, 4u);
+                uint32_t state;
+                std::memcpy(&state, ram + (at & 0x1FFFFFCu), 4);
+                if ((state & ~2u) != 0u) // not 0 or 2
+                    continue;
+            }
+            if ((flags >> 17) & 1u)
+                continue;
+            if (__builtin_expect((flags >> 24) & 1u, 0))
+            {
+                const uint32_t one = 1u;
+                std::memcpy(ram + 0x1186294u, &one, 4); // setShadowEffect
+                if (!(boss & 2u))
+                    continue;
+            }
+            if ((flags >> 26) & 1u)
+            {
+                uint32_t fog = fogIn;
+                if (fogIn == ~0u)
+                {
+                    noteRead(0x1186328u, 4u);
+                    std::memcpy(&fog, ram + 0x1186328u, 4);
+                }
+                if (fog != 0u)
+                    continue;
+            }
+            const uint32_t to = cache + info.layer[layerAt] * 4u;
+            std::memcpy(ram + (to & 0x1FFFFFCu), &s, 4);
+        }
+        if (pumpQueue)
+        {
+            if (leanStatsOn())
+                g_leanStats.queuePumped += qAt - qFirst;
+            q.head = qAt;
+        }
+    }
+
+    // Round 61 (SOTC_MDS_LANE): modelDispState's inputs as the hook took
+    // them, for its run on the lane (mdslane, below): what the game can
+    // change after the hook (the instance's LOD word, its fade, the camera
+    // context's matrix, the globals the packet loop reads) and the CLIP
+    // register in / out. On the lane the prefetch queue, the model shapes
+    // and the instance packet's opacity (done by the hook) are left alone.
+    struct MdsIn
+    {
+        bool lane = false;
+        uint32_t header = 0;
+        uint64_t lodWord = 0;
+        float camera[16] = {};
+        bool fading = false;
+        uint32_t boss = 0, cache = 0, fog = 0;
+        uint32_t clipIn = 0, clipOut = 0;
+    };
+    // modelDisp's instance packet opacity (+0xdc) and +0xd0: on the game
+    // thread (the hook) either way.
+    void mdsOpacity(uint32_t instance, uint32_t header)
+    {
+        const auto put = [](uint32_t addr, uint32_t value) { std::memcpy(const_cast<uint8_t *>(g_ram) + (addr & 0x1FFFFFCu), &value, 4); };
+        const uint32_t flags18 = word(header + 0x18u) & 1u;
+        uint64_t drawFlags;
+        std::memcpy(&drawFlags, g_ram + ((instance + 0x260u) & 0x1FFFFF8u), 8);
+        if ((drawFlags & 4u) == 0u)
+        {
+            float opacity = 1.0f - real(instance + 0x244u);
+            if (word(header + 0xCu) != 0u)
+                opacity *= 1.0f - real(instance + 0x248u);
+            const uint32_t packet = word(instance + 0xCu);
+            uint32_t bits;
+            std::memcpy(&bits, &opacity, 4);
+            if (flags18 == 0u)
+            {
+                if (!(1.0f <= opacity))
+                    put(packet + 0xDCu, bits);
+            }
+            else
+            {
+                if (real(packet + 0xD0u) != real(instance + 0x24Cu))
+                    put(packet + 0xD0u, word(instance + 0x24Cu));
+                if (opacity < 1.0f)
+                    put(packet + 0xDCu, bits);
+            }
+        }
+    }
+
+    // partOut (round 32, g_hookLean): the parts' results as modelDispHook's
+    // second walk would make them from what this walk leaves at +0x2c (the
+    // same order, the same resizes); *partOk only when they are that walk's
+    // for sure: every node reached once, every index below 4096 (a table
+    // with shared or looping links, or a model still loading, is walked
+    // again by the hook as before).
+    void modelDispState(R5900Context *ctx, uint32_t instance, const float model[16], const ModelPlan *plan = nullptr, std::vector<uint8_t> *partOut = nullptr,
+                        bool *partOk = nullptr, uint32_t *partTable = nullptr, MdsIn *in = nullptr)
+    {
+        static sotc_decomp::NativeCount count("modelDispState");
+        if (!in)
+            count.hit();
+        // Round 61: on the lane (in->lane) its inputs are the hook's (MdsIn).
+        const bool lane = in && in->lane;
+        const bool prefetchOk = g_prefetch && !lane;
+        // Round 49: the part walk and the plan's packet loop in locals (SOTC_FASTNATIVE=0: round 48's).
+        const bool fast = sotc_decomp::fastNativeOn();
+        if (partOk)
+            *partOk = false;
+        const uint32_t header = in ? in->header : word(word(instance) + 0x20u);
+        uint64_t lodWord;
+        if (in)
+            lodWord = in->lodWord;
+        else
+            std::memcpy(&lodWord, g_ram + ((instance + 0x250u) & 0x1FFFFF8u), 8);
+        // dsll 21, dsra32 29: bits 40-42, signed.
+        uint32_t lod = static_cast<uint32_t>(static_cast<int64_t>(lodWord << 21) >> 61);
+        const uint32_t flags18 = word(header + 0x18u) & 1u;
+        const bool partCulled = flags18 == 0u && word(header + 0x54u) != 1u;
+        if (word(header + 0x1Cu) <= lod && flags18 != 0u)
+            lod = word(header + 0x1Cu) - 1u;
+        const uint32_t table = word(header + 0x30u + lod * 4u);
+        uint32_t maxNode = table; // the last node the walk reached (ModelShape)
+        struct ShapeNodes // kept whichever way the function returns
+        {
+            uint32_t header, table, &maxNode;
+            ~ShapeNodes()
+            {
+                if (!g_prefetch || !table) // (0 on the lane)
+                    return;
+                ModelShape &shape = modelShape(header);
+                if (shape.header != header)
+                {
+                    shape = ModelShape();
+                    shape.header = header;
+                }
+                if (shape.table != table)
+                {
+                    shape.table = table;
+                    shape.nodes = 0;
+                }
+                shape.nodes = std::max(shape.nodes, (maxNode - table) / 0x30u + 1u);
+            }
+        } shapeNodes{header, partCulled && !lane ? table : 0u, maxNode};
+        if (partTable)
+            *partTable = table;
+        if (partCulled)
+        {
+            if (table == 0u)
+                return;
+            // camera context +0x5a0 x the model matrix, on VU0.
+            // Round 26: as vectors, the way the recompiled code's PS2_VMUL /
+            // PS2_VADD do it (vuTransform's operations lane by lane; on the
+            // Vita in NEON like them, where the scalar version rounded in the
+            // game thread's VFP mode instead).
+            float clip[16];
+            __m128 camera[4];
+            for (int i = 0; i < 4; ++i)
+                camera[i] = ps2VuNormalize(in ? _mm_loadu_ps(in->camera + i * 4)
+                                              : _mm_loadu_ps(reinterpret_cast<const float *>(g_ram + ((g_cameraContext + 0x5A0u + i * 16u) & 0x1FFFFFCu))));
+            for (int c = 0; c < 4; ++c)
+            {
+                const __m128 m = ps2VuNormalize(_mm_loadu_ps(model + c * 4));
+                const __m128 a = ps2VuNormalize(_mm_add_ps(ps2VuNormalize(_mm_mul_ps(camera[0], _mm_shuffle_ps(m, m, 0x00))),
+                                                           ps2VuNormalize(_mm_mul_ps(camera[1], _mm_shuffle_ps(m, m, 0x55)))));
+                const __m128 b = ps2VuNormalize(_mm_add_ps(a, ps2VuNormalize(_mm_mul_ps(camera[2], _mm_shuffle_ps(m, m, 0xAA)))));
+                _mm_storeu_ps(clip + c * 4, ps2VuNormalize(_mm_add_ps(b, ps2VuNormalize(_mm_mul_ps(camera[3], _mm_shuffle_ps(m, m, 0xFF))))));
+            }
+            // modelDisp / manager_sub_01099A08: the box's eight corners in this
+            // order through vclipw, the CLIP register (24 bits, the last four
+            // judgements) read after each: all of them sharing a plane -> 1
+            // (out), the register 0 at every read (this box's corners and the
+            // three judgements before them all inside) -> 2, else 0 (partly).
+            uint32_t clipRegister = (in ? in->clipIn : ctx->vu0_clip_flags) & 0xFFFFFFu;
+            // vuTransform four rows at a time (the same products and sums,
+            // each through the same clamp: ps2VuNormalize is vuNorm by lane),
+            // the products by each corner's x, y and z made once for the box.
+            const __m128 col0 = _mm_loadu_ps(clip), col1 = _mm_loadu_ps(clip + 4), col2 = _mm_loadu_ps(clip + 8), col3 = _mm_loadu_ps(clip + 12);
+            // Round 26: an arithmetic result is normalised by ps2VuResult (on
+            // the Vita's NEON the result is never denormal: the clamp alone,
+            // the same bits as ps2VuNormalize), the node's corners read as
+            // operands only (ps2VuOperand: NEON reads a denormal as zero).
+            const __m128 byW = ps2VuResult(_mm_mul_ps(col3, _mm_set1_ps(1.0f)));
+            const auto test = [&](uint32_t node) -> uint32_t
+            {
+                static constexpr uint8_t kCorners[8] = {0, 6, 5, 3, 4, 2, 1, 7}; // bit 0 x, 1 y, 2 z: max
+                // the node's min (x, y, z at +0) and max (+0x10), clamped
+                const __m128 lo = ps2VuOperand(_mm_loadu_ps(reinterpret_cast<const float *>(g_ram + (node & 0x1FFFFFCu)))),
+                             hi = ps2VuOperand(_mm_loadu_ps(reinterpret_cast<const float *>(g_ram + ((node + 0x10u) & 0x1FFFFFCu))));
+                const __m128 byX[2] = {ps2VuResult(_mm_mul_ps(col0, _mm_shuffle_ps(lo, lo, 0x00))), ps2VuResult(_mm_mul_ps(col0, _mm_shuffle_ps(hi, hi, 0x00)))};
+                const __m128 byY[2] = {ps2VuResult(_mm_mul_ps(col1, _mm_shuffle_ps(lo, lo, 0x55))), ps2VuResult(_mm_mul_ps(col1, _mm_shuffle_ps(hi, hi, 0x55)))};
+                const __m128 byZ[2] = {ps2VuResult(_mm_mul_ps(col2, _mm_shuffle_ps(lo, lo, 0xAA))), ps2VuResult(_mm_mul_ps(col2, _mm_shuffle_ps(hi, hi, 0xAA)))};
+                __m128 v[8];
+                for (int k = 0; k < 8; ++k)
+                {
+                    const uint8_t corner = kCorners[k];
+                    v[k] = ps2VuResult(_mm_add_ps(byX[corner & 1], byY[(corner >> 1) & 1]));
+                    v[k] = ps2VuResult(_mm_add_ps(v[k], byZ[(corner >> 2) & 1]));
+                    v[k] = ps2VuResult(_mm_add_ps(v[k], byW));
+                }
+                // The corners' judgements f[3..10], after the register's last
+                // three (f[0..2]); the register after corner k holds f[k..k+3]
+                // (6 bits each, f[k+3] lowest). all = 0x3f AND the eight
+                // registers (their low 6 bits: the corners' own), any = the OR
+                // of the registers (every f).
+                alignas(16) uint32_t f[11];
+                f[0] = (clipRegister >> 12) & 0x3Fu;
+                f[1] = (clipRegister >> 6) & 0x3Fu;
+                f[2] = clipRegister & 0x3Fu;
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(f + 3), vuClipFlags4x(v[0], v[1], v[2], v[3]));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(f + 7), vuClipFlags4x(v[4], v[5], v[6], v[7]));
+                const uint32_t all = f[3] & f[4] & f[5] & f[6] & f[7] & f[8] & f[9] & f[10];
+                const uint32_t any = f[0] | f[1] | f[2] | f[3] | f[4] | f[5] | f[6] | f[7] | f[8] | f[9] | f[10];
+                clipRegister = f[10] | (f[9] << 6) | (f[8] << 12) | (f[7] << 18);
+                return all ? 1u : (any ? 0u : 2u);
+            };
+            struct ClipBack // the register as modelDisp leaves it (round 61: the lane's into in->clipOut)
+            {
+                R5900Context *ctx;
+                MdsIn *in;
+                uint32_t &value;
+                ~ClipBack()
+                {
+                    if (in)
+                        in->clipOut = value;
+                    else
+                        ctx->vu0_clip_flags = value;
+                }
+            } clipBack{ctx, in, clipRegister};
+            const auto put = [](uint32_t addr, uint32_t value) { std::memcpy(const_cast<uint8_t *>(g_ram) + (addr & 0x1FFFFFCu), &value, 4); };
+            // manager_sub_01099A08: a node takes its parent's result unless
+            // that is 0 (partly inside), then it is tested; written at +0x2c.
+            // Each node once in a real tree (at most 4096): the budget stops a
+            // table with shared or looping links from walking exponentially.
+            uint32_t budget = 4096u;
+            // Round 32: what the hook's walk needs (partOut), and whether it is
+            // that walk's: each node once (a stamp a draw), indices below 4096.
+            static uint32_t seen[4096];
+            static uint32_t stamp = 0;
+            bool once = partOut != nullptr;
+            if (once && ++stamp == 0u)
+            {
+                std::fill(seen, seen + 4096, 0u);
+                stamp = 1u;
+            }
+            const auto record = [&](uint32_t index, uint32_t state)
+            {
+                if (!once)
+                    return;
+                if (index >= 4096u || seen[index] == stamp)
+                {
+                    once = false;
+                    return;
+                }
+                seen[index] = stamp;
+                std::vector<uint8_t> &pv = *partOut;
+                if (pv.size() <= index)
+                    pv.resize(index + 1u, 0u);
+                pv[index] = static_cast<uint8_t>(state);
+            };
+            const bool pumpQueue = g_hookLean && prefetchOk;
+            const auto visit = [&](auto &&self, uint32_t index, uint32_t node, uint32_t inherited, int depth) -> void
+            {
+                if (depth > 64 || budget == 0u)
+                    return;
+                --budget;
+                if (pumpQueue)
+                    g_prefetchQueue.pumpOne(); // the next draw's lines (queueNextDraw)
+                maxNode = std::max(maxNode, node);
+                const uint32_t state = inherited ? inherited : test(node);
+                put(node + 0x2Cu, state);
+                record(index, state);
+                for (uint32_t link : {0x20u, 0x24u})
+                    if (word(node + link) != 0xFFFFFFFFu)
+                        self(self, word(node + link), table + word(node + link) * 0x30u, state, depth + 1);
+            };
+            if (fast)
+            {
+                // Round 49: the same walk (pre-order, link +0x20's subtree
+                // before +0x24 is read, the same depth and budget limits)
+                // without recursion, the guest base and the queue in locals.
+                uint8_t *const ram = const_cast<uint8_t *>(g_ram);
+                const auto st = [ram](uint32_t a, uint32_t v) { std::memcpy(ram + (a & 0x1FFFFFCu), &v, 4); };
+                MdsPartClip pc{col0, col1, col2, byW, clipRegister};
+                const bool prefetchOn = prefetchOk;
+                if (prefetchOn)
+                {
+                    const ModelShape &shape = modelShape(header);
+                    if (shape.header == header && shape.table == table)
+                    {
+                        uint32_t a = table & ~31u;
+                        const uint32_t limit = table + shape.nodes * 0x30u;
+                        for (uint32_t n = limit > a ? std::min<uint32_t>(64u, (limit - a + 31u) >> 5) : 0u; n; --n, a += 32u)
+                            lines67::pref(a), __builtin_prefetch(ram + (a & 0x1FFFFE0u));
+                    }
+                }
+                const uint32_t root = pc.test(ram, table);
+                st(table + 0x2Cu, root);
+                if (partOut)
+                {
+                    partOut->clear();
+                    if (root != 1u)
+                    {
+                        partOut->assign(1u, static_cast<uint8_t>(root));
+                        seen[0] = stamp;
+                    }
+                }
+                if (root == 1u)
+                {
+                    clipRegister = pc.clip;
+                    if (partOk)
+                        *partOk = once; // the hook returns too: nothing drawn
+                    return;
+                }
+                if (prefetchOn)
+                    mdsPartWalk<true>(pc, table, root, budget, maxNode, pumpQueue, partOut, once, seen, stamp);
+                else
+                    mdsPartWalk<false>(pc, table, root, budget, maxNode, pumpQueue, partOut, once, seen, stamp);
+                clipRegister = pc.clip;
+                if (partOk)
+                    *partOk = once;
+            }
+            else
+            {
+            if (prefetchOk)
+            {
+                // This model's part tree as it was: asked for at once (the
+                // walk below goes from node to node by their links).
+                const ModelShape &shape = modelShape(header);
+                if (shape.header == header && shape.table == table)
+                    for (uint32_t a = table & ~31u, n = 0; a < table + shape.nodes * 0x30u && n < 64u; a += 32u, ++n)
+                        prefetchGuest(a);
+            }
+            const uint32_t root = test(table);
+            put(table + 0x2Cu, root);
+            if (partOut)
+            {
+                partOut->clear();
+                if (root != 1u)
+                {
+                    partOut->assign(1u, static_cast<uint8_t>(root));
+                    seen[0] = stamp;
+                }
+            }
+            if (root == 1u)
+            {
+                if (partOk)
+                    *partOk = once; // the hook returns too: nothing drawn
+                return;
+            }
+            for (uint32_t link : {0x20u, 0x24u})
+                if (word(table + link) != 0xFFFFFFFFu)
+                    visit(visit, word(table + link), table + word(table + link) * 0x30u, root, 1);
+            if (partOk)
+                *partOk = once;
+            }
+        }
+        const auto put = [](uint32_t addr, uint32_t value) { std::memcpy(const_cast<uint8_t *>(g_ram) + (addr & 0x1FFFFFCu), &value, 4); };
+        if (!in) // (round 61: the hook makes these itself, mdsOpacity)
+            mdsOpacity(instance, header);
+        const bool fading = in ? in->fading : 0.0f < real(instance + 0x244u);
+        const uint32_t boss = in ? in->boss : word(0x1186290u), cache = in ? in->cache : word(0x118BFC8u);
+        const uint32_t fogIn = in ? in->fog : ~0u;
+        const auto fogNow = [fogIn]() { return fogIn != ~0u ? fogIn : word(0x1186328u); };
+        const uint32_t packets = word(header + 0x60u), surfaces = word(header + 0x50u);
+        ModelShape *shape = nullptr;
+        if (prefetchOk)
+        {
+            shape = &modelShape(header);
+            if (shape->header != header)
+            {
+                *shape = ModelShape();
+                shape->header = header;
+            }
+            if (shape->packets == packets)
+                for (uint32_t a = packets & ~31u, n = 0; a < packets + shape->packetCount * 32u && n < 8u; a += 32u, ++n)
+                    prefetchGuest(a); // the first lines at once, the rest as the walk goes
+            shape->packets = packets;
+            shape->surfaceCount = 0;
+        }
+        const bool memo = g_surfaceMemo && native_renderer::tuning().fastHooks;
+        SurfaceInfo *const memoArr = hookjobs::g_on ? g_surfaceInfoSync : g_surfaceInfo; // (the jobs' own: g_surfaceInfo)
+        if (plan && memo && plan->header == header && plan->lod == lod && plan->packets == packets && plan->surfaces == surfaces && fast)
+        {
+            // Round 49: the loop below in a function of its own (mdsPlanPackets).
+            if (partCulled)
+                mdsPlanPackets<true>(plan, memoArr, header, table, fading, boss, cache, fogIn, lane);
+            else
+                mdsPlanPackets<false>(plan, memoArr, header, table, fading, boss, cache, fogIn, lane);
+            return;
+        }
+        if (plan && memo && plan->header == header && plan->lod == lod && plan->packets == packets && plan->surfaces == surfaces)
+        {
+            // The plan's packets of this LOD, in the list's order: the same
+            // tests and writes as the walk below.
+            const bool pumpQueue = g_hookLean && prefetchOk;
+            for (const PlanPacket &e : plan->pk)
+            {
+                const uint32_t s = e.s;
+                if (pumpQueue)
+                {
+                    g_prefetchQueue.pumpOne(); // the next draw's lines (queueNextDraw)
+                    if (&e + 1 != plan->pk.data() + plan->pk.size())
+                        __builtin_prefetch(&memoArr[(&e)[1].slot]);
+                }
+                SurfaceInfo &info = memoArr[e.slot];
+                if (!(info.s == s && info.header == header && info.frame == g_frame))
+                    surfaceInfo(header, s, memoArr);
+                const uint64_t flags = info.flags;
+                if ((flags >> 29) & 1u)
+                    continue;
+                if (partCulled && e.part != 0xFFFFFFFFu)
+                {
+                    const uint32_t state = word(table + e.part * 0x30u + 0x2Cu);
+                    if (state != 0u && state != 2u)
+                        continue;
+                }
+                if ((flags >> 17) & 1u)
+                    continue;
+                if ((flags >> 24) & 1u)
+                {
+                    put(0x1186294u, 1u); // setShadowEffect
+                    if (!(boss & 2u))
+                        continue;
+                }
+                if (((flags >> 26) & 1u) && fogNow() != 0u)
+                    continue;
+                put(cache + info.layer[fading ? 1 : 0] * 4u, s);
+            }
+            return;
+        }
+        uint32_t walked = 0;
+        for (uint32_t pk = packets; word(pk) != 0u; pk += 32u)
+        {
+            ++walked;
+            if (shape)
+            {
+                prefetchGuest(pk + 8u * 32u);
+                g_prefetchQueue.pump(2u); // the next draw's lines (queueNextDraw)
+            }
+            if (word(pk + 4u) != lod)
+                continue;
+            const uint32_t s = word(pk + 8u) * 0x120u + surfaces;
+            if (shape && shape->surfaceCount < 8u &&
+                std::find(shape->surfaces, shape->surfaces + shape->surfaceCount, s) == shape->surfaces + shape->surfaceCount)
+                shape->surfaces[shape->surfaceCount++] = s;
+            SurfaceInfo *info = memo ? &surfaceInfo(header, s, memoArr) : nullptr;
+            uint64_t flags;
+            if (info)
+                flags = info->flags;
+            else
+                noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&flags, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+            if ((flags >> 29) & 1u)
+                continue;
+            if (partCulled && word(pk + 12u) != 0xFFFFFFFFu)
+            {
+                const uint32_t state = word(table + word(pk + 12u) * 0x30u + 0x2Cu);
+                if (state != 0u && state != 2u)
+                    continue;
+            }
+            if ((flags >> 17) & 1u)
+                continue; // the boss effect's surfaces: no cached surface
+            if ((flags >> 24) & 1u)
+            {
+                put(0x1186294u, 1u); // setShadowEffect
+                if (!(boss & 2u))
+                    continue;
+            }
+            if (((flags >> 26) & 1u) && fogNow() != 0u)
+                continue;
+            put(cache + (info ? info->layer[fading ? 1 : 0] : surfaceLayer(header, s, fading)) * 4u, s);
+        }
+        if (shape)
+            shape->packetCount = walked;
+    }
+
+    // SOTC_MODELDISP_CHECK=1 (debugging): modelDispState against the
+    // recompiled modelDisp on the same input, on what it leaves behind: the
+    // values modelDispState writes are taken, put back, then modelDisp runs
+    // to its return and its values are compared (a log line per mismatch).
+    void modelDispCheck(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t instance, const float model[16])
+    {
+        static uint64_t checks = 0, mismatches = 0;
+        std::vector<uint32_t> at;
+        const uint32_t header = word(word(instance) + 0x20u);
+        for (uint32_t i = 0; i < 32u; ++i)
+            at.push_back(word(0x118BFC8u) + i * 4u);
+        at.push_back(0x1186294u);
+        at.push_back(word(instance + 0xCu) + 0xD0u);
+        at.push_back(word(instance + 0xCu) + 0xDCu);
+        for (uint32_t lod = 0; lod < 4u; ++lod)
+        {
+            const uint32_t table = word(header + 0x30u + lod * 4u);
+            if (!table || (word(header + 0x18u) & 1u) || word(header + 0x54u) == 1u)
+                continue;
+            std::vector<uint32_t> todo{0u};
+            std::set<uint32_t> seen;
+            while (!todo.empty() && seen.size() < 4096u)
+            {
+                const uint32_t node = todo.back();
+                todo.pop_back();
+                if (!seen.insert(node).second)
+                    continue;
+                at.push_back(table + node * 0x30u + 0x2Cu);
+                for (uint32_t link : {0x20u, 0x24u})
+                    if (word(table + node * 0x30u + link) != 0xFFFFFFFFu)
+                        todo.push_back(word(table + node * 0x30u + link));
+            }
+        }
+        std::vector<uint32_t> before(at.size()), mine(at.size());
+        for (size_t i = 0; i < at.size(); ++i)
+            before[i] = word(at[i]);
+        const uint32_t clipBefore = ctx->vu0_clip_flags;
+        modelDispState(ctx, instance, model);
+        const uint32_t clipMine = ctx->vu0_clip_flags;
+        ctx->vu0_clip_flags = clipBefore;
+        for (size_t i = 0; i < at.size(); ++i)
+        {
+            mine[i] = word(at[i]);
+            std::memcpy(rdram + (at[i] & 0x1FFFFFCu), &before[i], 4);
+        }
+        // modelDisp to its return (it can leave on a continuation).
+        const uint32_t ra = GPR_U32(ctx, 31), sp = GPR_U32(ctx, 29);
+        { g_modelDisp(rdram, ctx, runtime); runtime->checkTransfer(); }
+        while (!(ctx->pc == ra && GPR_U32(ctx, 29) == sp))
+        {
+            PS2Runtime::RecompiledFunction next = runtime->hasFunction(ctx->pc) ? runtime->lookupFunction(ctx->pc) : nullptr;
+            if (!next)
+                break;
+            { next(rdram, ctx, runtime); runtime->checkTransfer(); }
+        }
+        ++checks;
+        if ((ctx->vu0_clip_flags & 0xFFFFFFu) != (clipMine & 0xFFFFFFu))
+        {
+            ++mismatches;
+            if (mismatches < 200u)
+                std::fprintf(stderr, "[modeldisp-check] header %08x CLIP recompiled %06x native %06x\n", header, ctx->vu0_clip_flags & 0xFFFFFFu, clipMine & 0xFFFFFFu);
+        }
+        for (size_t i = 0; i < at.size(); ++i)
+            if (word(at[i]) != mine[i])
+            {
+                ++mismatches;
+                if (mismatches < 200u)
+                    std::fprintf(stderr, "[modeldisp-check] header %08x at %08x (#%zu) recompiled %08x native %08x before %08x\n", header, at[i], i, word(at[i]), mine[i], before[i]);
+            }
+        if ((checks & (checks - 1u)) == 0u || checks % 10000u == 0u)
+            std::fprintf(stderr, "[modeldisp-check] %llu checks, %llu mismatched values\n", (unsigned long long)checks, (unsigned long long)mismatches);
+    }
+
+    // spriteTexFast (0x1c5548): a textured sprite of the screen effects
+    // (reflection, bloom, refraction copies...) written as GS registers
+    // straight into the gsReg packet, never through gsReg (the 2D hooks do
+    // not see it; the native renderer makes those effects itself). Nothing
+    // else is changed: left out with the PS2 lists.
+    constexpr uint32_t kSpriteTexFast = 0x001C5548u;
+    PS2Runtime::RecompiledFunction g_spriteTexFast = nullptr;
+
+    void spriteTexFastHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (native_renderer::tuning().ps2Lists || !GS::skipRaster())
+        {
+            g_spriteTexFast(rdram, ctx, runtime);
+            return;
+        }
+        ctx->pc = GPR_U32(ctx, 31); // jr ra
+    }
+
+    // The terrain's packets built where they are drawn (round 27): at most
+    // SOTC_TERRAIN_BUILD_US (2500) microseconds of it a game frame, the rest
+    // on the worker as before. 0: all on the worker (round 26).
+    struct TerrainBuilds
+    {
+        std::atomic<uint64_t> frame{~0ull};
+        std::atomic<uint64_t> spentUs{0};
+    };
+    TerrainBuilds g_terrainBuilds;
+    bool terrainBuildBudgetLeft()
+    {
+        static const uint64_t budget = std::getenv("SOTC_TERRAIN_BUILD_US") ? static_cast<uint64_t>(std::max(0, std::atoi(std::getenv("SOTC_TERRAIN_BUILD_US")))) : 2500u;
+        if (!budget)
+            return false;
+        if (g_terrainBuilds.frame.load(std::memory_order_relaxed) != g_frame)
+        {
+            g_terrainBuilds.frame.store(g_frame, std::memory_order_relaxed);
+            g_terrainBuilds.spentUs.store(0, std::memory_order_relaxed);
+        }
+        return g_terrainBuilds.spentUs.load(std::memory_order_relaxed) < budget;
+    }
+    void terrainBuildSpent(uint64_t us) { g_terrainBuilds.spentUs.fetch_add(us, std::memory_order_relaxed); }
+
+    // A model packet's mesh made on the async worker (native_renderer::buildAsync)
+    // from a copy of its bytes: read and triangulated there (a skinned one
+    // made into its bind pose), taken up at a later frame's start. False:
+    // no worker, build it here.
+    // One object a build (round 14): the packet's bytes copied without
+    // zeroing first, the ids in place; was a shared_ptr, a vector of ids and
+    // two std::functions (~26 us a build in calibrated Vita3K at an area
+    // change's ~1 200).
+    struct PacketWork final : native_renderer::AsyncWork
+    {
+        std::vector<uint8_t> bytes;
+        uint32_t base = 0, data = 0, size = 0;
+        uint64_t id = 0;
+        bool twoPasses = false, ok = false, isSkinned = false, isLit = false;
+        std::vector<native_renderer::Vertex> vertices, second;
+        SkinnedPacket packet;
+        void work() override
+        {
+            try
+            {
+                std::vector<Strip> strips;
+                readBatchesFrom(CopyMem{base, &bytes}, data, size, strips);
+                isSkinned = skinned(strips);
+                isLit = lit(strips);
+                if (isSkinned)
+                    packet = makeSkinnedPacket(std::move(strips));
+                else
+                {
+                    const auto place = [](const BatchVertex &v, native_renderer::Vertex &o)
+                    {
+                        o.x = v.x;
+                        o.y = v.y;
+                        o.z = v.z;
+                        o.nx = v.nx;
+                        o.ny = v.ny;
+                        o.nz = v.nz;
+                    };
+                    triangulate(strips, place, vertices);
+                    if (twoPasses) // two textures: the second pass's mesh, with the second coordinates
+                        triangulate(strips, place, second, true);
+                }
+                ok = true;
+            }
+            catch (const std::bad_alloc &)
+            {
+                ok = false; // asked for again at its next draw
+            }
+            std::vector<uint8_t>().swap(bytes);
+        }
+        void finish() override
+        {
+            if (!ok)
+                return;
+            if (isLit)
+                g_litPackets.insert(id);
+            if (isSkinned)
+            {
+                if (g_skinnedPackets.find(id) == g_skinnedPackets.end())
+                {
+                    g_skinnedPacketBytes += packet.bytes;
+                    g_skinnedPackets.emplace(id, std::move(packet));
+                    g_skinnedIds.insert(id);
+                }
+                return;
+            }
+            native_renderer::uploadMesh(id, vertices.data(), static_cast<uint32_t>(vertices.size()));
+            if (twoPasses)
+                native_renderer::uploadMesh(id ^ (1ull << 61), second.data(), static_cast<uint32_t>(second.size()));
+        }
+    };
+    bool buildPacketAsync(uint64_t id, uint32_t data, uint32_t size, bool twoPasses)
+    {
+        SOTC_READ_SITE(11);
+        if (!native_renderer::tuning().asyncBuilds)
+            return false;
+        PacketWork *job = new (std::nothrow) PacketWork();
+        if (!job)
+            return false;
+        job->base = data & ~3u;
+        job->data = data;
+        job->size = size;
+        job->id = id;
+        job->twoPasses = twoPasses;
+        const uint32_t bytes = (data - job->base) + size + 64u; // and a little after (read as the game's would be)
+        try
+        {
+            noteRead(job->base, bytes);
+            if ((job->base & 0x1FFFFFFu) + bytes <= 0x2000000u)
+            {
+                const uint8_t *from = g_ram + (job->base & 0x1FFFFFFu);
+                job->bytes.assign(from, from + bytes);
+            }
+            else
+            {
+                job->bytes.resize(bytes);
+                for (uint32_t i = 0; i + 4u <= bytes; i += 4u)
+                {
+                    const uint32_t v = word(job->base + i);
+                    std::memcpy(&job->bytes[i], &v, 4);
+                }
+            }
+        }
+        catch (const std::bad_alloc &)
+        {
+            delete job;
+            return false;
+        }
+        job->ids[0] = id;
+        job->idCount = 1;
+        if (twoPasses)
+            job->ids[job->idCount++] = id ^ (1ull << 61);
+        return native_renderer::buildAsync(job);
+    }
+
+    // modelDispHook's debugging switches, read once: a function-local static
+    // costs a guard check with a memory barrier (dmb) at every use on the
+    // Vita, and the packet loop used seven of them per packet.
+    struct ModelDispEnv
+    {
+        bool logPasses = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+        bool logMat = ps2_diag::env("SOTC_NATIVE_LOGMAT") != nullptr;
+        uint32_t skipLayers = [] // debugging: SOTC_NATIVE_SKIPLAYERS=12,18
+        {
+            uint32_t mask = 0;
+            if (const char *env = std::getenv("SOTC_NATIVE_SKIPLAYERS"))
+                for (const char *p = env; *p;)
+                {
+                    mask |= 1u << (std::strtoul(p, const_cast<char **>(&p), 10) & 31u);
+                    if (*p)
+                        ++p;
+                }
+            return mask;
+        }();
+        int logLayer = ps2_diag::env("SOTC_LOG_LAYER") ? std::atoi(ps2_diag::env("SOTC_LOG_LAYER")) : -1;
+        // Debugging: who drew what. SOTC_NATIVE_IDCOLOR=1 every model, =<n> > 1
+        // only surfaces in layers >= n (the rest drawn as usual).
+        int idFrom = std::getenv("SOTC_NATIVE_IDCOLOR") ? std::max(1, std::atoi(std::getenv("SOTC_NATIVE_IDCOLOR"))) : 0;
+        float tintAlpha = std::getenv("SOTC_REFLECT_ALPHA") ? static_cast<float>(std::atof(std::getenv("SOTC_REFLECT_ALPHA"))) : 1.0f;
+        float refractAlpha = std::getenv("SOTC_REFRACT_ALPHA") ? static_cast<float>(std::atof(std::getenv("SOTC_REFRACT_ALPHA"))) : 1.0f;
+        bool showRefraction = std::getenv("SOTC_REFRACT_SHOW") != nullptr; // debugging: where it lands, in red
+    };
+
+    // Round 34 (SOTC_KICK_DEFER): the plan's texture scroll rows into the job
+    // at the hook (the game thread), the row addresses worked out once a frame
+    // a surface record as the job's surface memo does (surfaceScroll).
+    struct ScrollMemo
+    {
+        uint32_t s = 0, header = 0, scroll = 0;
+        uint64_t frame = ~0ull;
+    };
+    ScrollMemo g_scrollMemo[1024];
+    // Round 67 (SOTC_WALK67): the memo misses' chains (s + 0x2c -> the
+    // header's object table -> the object's +0x20 -> its +0xc -> the row)
+    // walked level by level over up to 32 surfaces at a time, each level's
+    // lines asked for together before the next level reads them: the
+    // A9's misses then overlap instead of five in a row per surface. Only
+    // reads and PLDs (no guest code, nothing written); the loop below then
+    // does the same reads as before, from the cache.
+    void scrollChainsAhead(const ModelPlan *plan, uint32_t header)
+    {
+        const std::vector<uint32_t> &recs = plan->surfaceRecords;
+        constexpr size_t kBatch = 32u;
+        uint32_t at[kBatch];
+        const uint32_t tableCount = word(header + 0x44u), table = word(header + 0x40u);
+        for (size_t base = 0; base < recs.size(); base += kBatch)
+        {
+            size_t n = 0;
+            for (size_t i = base, end = std::min(recs.size(), base + kBatch); i < end; ++i)
+            {
+                const uint32_t s = recs[i];
+                const ScrollMemo &m = g_scrollMemo[surfaceSlot(s)];
+                if (m.frame == g_frame && m.s == s && m.header == header)
+                    continue;
+                at[n++] = s + 0x2Cu;
+                prefetchGuest(s + 0x2Cu);
+            }
+            // The levels: the index -> the table entry's +0x10, the object's
+            // +0x20, nto2's +0xc, the row's two words.
+            for (int level = 0; level < 4 && n; ++level)
+            {
+                size_t kept = 0;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const uint32_t v = word(at[i]);
+                    uint32_t next = 0u;
+                    if (level == 0)
+                        next = v < tableCount ? table + v * 0x20u + 0x10u : 0u;
+                    else if (level == 1)
+                        next = v ? v + 0x20u : 0u;
+                    else if (level == 2)
+                        next = v ? v + 0xCu : 0u;
+                    else
+                        next = v;
+                    if (!next)
+                        continue;
+                    prefetchGuest(next);
+                    at[kept++] = next;
+                }
+                n = kept;
+            }
+        }
+    }
+    // The plan's rows' addresses as the memo above gives them (round 34's loop).
+    void hookScrollRows(const ModelPlan *plan, uint32_t header, std::vector<ScrollRow> &out)
+    {
+        if (sotc_decomp::walk67On() && plan->surfaceRecords.size() > 1u)
+            scrollChainsAhead(plan, header);
+        for (const uint32_t s : plan->surfaceRecords)
+        {
+            ScrollMemo &m = g_scrollMemo[surfaceSlot(s)];
+            if (m.frame != g_frame || m.s != s || m.header != header)
+            {
+                m.s = s;
+                m.header = header;
+                m.frame = g_frame;
+                m.scroll = surfaceScroll(header, s);
+            }
+            if (!m.scroll)
+                continue;
+            bool have = false;
+            for (const ScrollRow &r : out)
+                have = have || r.at == m.scroll;
+            if (have)
+                continue;
+            ScrollRow r;
+            r.at = m.scroll;
+            r.w0 = word(m.scroll);
+            r.w1 = word(m.scroll + 4u);
+            out.push_back(r);
+        }
+    }
+    // Round 58 (SOTC_FASTNATIVE3): the rows' addresses kept a frame per plan
+    // and model header (the instances of one model drawn in a frame: the
+    // same surfaces, so the same addresses as the per-surface memo gives
+    // within the frame, which already takes them as fixed for the frame);
+    // the two words still read at each hook. SOTC_SCROLL_CHECK=1: both ways,
+    // compared ([scroll-check] every 600 frames).
+    struct ScrollPlanMemo
+    {
+        const ModelPlan *plan = nullptr;
+        uint32_t header = 0, planHeader = 0, lod = 0;
+        uint64_t frame = ~0ull;
+        std::vector<uint32_t> at;
+    };
+    ScrollPlanMemo g_scrollPlanMemo[256];
+    uint64_t g_scrollChecks = 0, g_scrollDiffer = 0;
+    // ---- Round 127 (SOTC_SCROLL127, default on; A/B `scroll127`, `r127all`):
+    // the plan's rows kept across frames. A row's address is the chain
+    // surface record +0x2c (the index) -> the header's object table (+0x40,
+    // +0x44 entries of 0x20) entry +0x10 (the object) -> +0x20 (nto2) -> +0xc
+    // (the row); the per-frame memos above walk it for every surface record
+    // of every plan once a frame (~1% of the game thread riding). Here a
+    // plan's distinct table entries are kept with the object / nto2 / row
+    // they gave, and the next frame checks only those (a few words a texture,
+    // not a dependent chain a surface); the indices are the model's own
+    // surface records (the plan is checked against its packet list every
+    // frame). The rows' two words are read at every hook as before.
+    // SOTC_SCROLL_CHECK=1 compares against the per-surface walk.
+    struct ScrollChain127
+    {
+        uint32_t index = 0, object = 0, nto2 = 0, row = 0;
+    };
+    struct ScrollMemo127
+    {
+        const ModelPlan *plan = nullptr;
+        uint32_t header = 0, planHeader = 0, lod = 0, surfaces = 0, table = 0, tableCount = 0;
+        uint64_t listHash = 0, frame = ~0ull;
+        std::vector<ScrollChain127> chains;
+        std::vector<uint32_t> at;
+    };
+    ScrollMemo127 g_scrollMemo127[1024];
+    uint64_t g_scroll127Hits = 0, g_scroll127Builds = 0, g_scroll127Stale = 0;
+    // The chains and rows of (plan, header) from the records (no memo).
+    void scroll127Build(ScrollMemo127 &pm, const ModelPlan *plan, uint32_t header)
+    {
+        pm.chains.clear();
+        pm.at.clear();
+        pm.table = word(header + 0x40u);
+        pm.tableCount = word(header + 0x44u);
+        for (const uint32_t s : plan->surfaceRecords)
+        {
+            const uint32_t index = word(s + 0x2Cu);
+            if (index >= pm.tableCount)
+                continue;
+            const ScrollChain127 *c = nullptr;
+            for (const ScrollChain127 &k : pm.chains)
+                if (k.index == index)
+                {
+                    c = &k;
+                    break;
+                }
+            if (!c)
+            {
+                ScrollChain127 k;
+                k.index = index;
+                k.object = word(pm.table + index * 0x20u + 0x10u);
+                k.nto2 = k.object ? word(k.object + 0x20u) : 0u;
+                k.row = k.nto2 ? word(k.nto2 + 0xCu) : 0u;
+                pm.chains.push_back(k);
+                c = &pm.chains.back();
+            }
+            const uint32_t row = c->row;
+            if (!row)
+                continue;
+            if (std::find(pm.at.begin(), pm.at.end(), row) == pm.at.end())
+                pm.at.push_back(row);
+        }
+    }
+    bool scroll127Valid(const ScrollMemo127 &pm, uint32_t header)
+    {
+        if (word(header + 0x40u) != pm.table || word(header + 0x44u) != pm.tableCount)
+            return false;
+        for (const ScrollChain127 &k : pm.chains)
+        {
+            if (word(pm.table + k.index * 0x20u + 0x10u) != k.object)
+                return false;
+            const uint32_t nto2 = k.object ? word(k.object + 0x20u) : 0u;
+            if (nto2 != k.nto2 || (nto2 ? word(nto2 + 0xCu) : 0u) != k.row)
+                return false;
+        }
+        return true;
+    }
+    void hookScrolls127(ModelDispJob &job)
+    {
+        const ModelPlan *plan = job.plan;
+        const uint32_t key = (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(plan) >> 4) ^ (job.header >> 5)) * 0x9E3779B1u;
+        ScrollMemo127 &pm = g_scrollMemo127[key >> 22];
+        const bool same = pm.plan == plan && pm.header == job.header && pm.planHeader == plan->header && pm.lod == plan->lod && pm.listHash == plan->listHash &&
+                          pm.surfaces == plan->surfaces;
+        if (!same || (pm.frame != g_frame && !scroll127Valid(pm, job.header)))
+        {
+            g_scroll127Stale += same;
+            ++g_scroll127Builds;
+            scroll127Build(pm, plan, job.header);
+            pm.plan = plan;
+            pm.header = job.header;
+            pm.planHeader = plan->header;
+            pm.lod = plan->lod;
+            pm.listHash = plan->listHash;
+            pm.surfaces = plan->surfaces;
+        }
+        else
+            ++g_scroll127Hits;
+        pm.frame = g_frame;
+        for (const uint32_t at : pm.at)
+        {
+            ScrollRow r;
+            r.at = at;
+            r.w0 = word(at);
+            r.w1 = word(at + 4u);
+            job.scrolls.push_back(r);
+        }
+        static const bool log = ps2_diag::env("SOTC_SCROLL127_LOG") != nullptr;
+        static uint64_t told = 0;
+        if (log && g_frame >= told + 600u)
+        {
+            told = g_frame;
+            std::fprintf(stderr, "[scroll127] frame %llu: kept %llu, made %llu (%llu after a chain moved)\n", (unsigned long long)g_frame,
+                         (unsigned long long)g_scroll127Hits, (unsigned long long)g_scroll127Builds, (unsigned long long)g_scroll127Stale);
+        }
+    }
+    void hookScrolls(ModelDispJob &job)
+    {
+        job.scrolls.clear();
+        job.scrollsTaken = job.plan != nullptr;
+        if (!job.plan)
+        {
+            g_kickMustJoin = true;
+            return;
+        }
+        if (!sotc_decomp::fastNative3On())
+            return hookScrollRows(job.plan, job.header, job.scrolls);
+        const ModelPlan *plan = job.plan;
+        if (sotc_decomp::switchOn(sotc_decomp::kScroll127))
+            hookScrolls127(job);
+        else
+        {
+        ScrollPlanMemo &pm = g_scrollPlanMemo[(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(plan) >> 4) * 0x9E3779B1u) >> 24];
+        if (pm.frame == g_frame && pm.plan == plan && pm.header == job.header && pm.planHeader == plan->header && pm.lod == plan->lod)
+        {
+            for (const uint32_t at : pm.at)
+            {
+                ScrollRow r;
+                r.at = at;
+                r.w0 = word(at);
+                r.w1 = word(at + 4u);
+                job.scrolls.push_back(r);
+            }
+        }
+        else
+        {
+            hookScrollRows(plan, job.header, job.scrolls);
+            pm.plan = plan;
+            pm.header = job.header;
+            pm.planHeader = plan->header;
+            pm.lod = plan->lod;
+            pm.frame = g_frame;
+            pm.at.clear();
+            for (const ScrollRow &r : job.scrolls)
+                pm.at.push_back(r.at);
+        }
+        }
+        static const bool check = ps2_diag::env("SOTC_SCROLL_CHECK") != nullptr;
+        if (check)
+        {
+            std::vector<ScrollRow> ref;
+            hookScrollRows(plan, job.header, ref);
+            bool same = ref.size() == job.scrolls.size();
+            for (size_t i = 0; same && i < ref.size(); ++i)
+                same = ref[i].at == job.scrolls[i].at && ref[i].w0 == job.scrolls[i].w0 && ref[i].w1 == job.scrolls[i].w1;
+            ++g_scrollChecks;
+            g_scrollDiffer += !same;
+            static uint64_t told = ~0ull;
+            if (g_frame % 600u == 0u && told != g_frame)
+            {
+                told = g_frame;
+                std::fprintf(stderr, "[scroll-check] frame %llu: %llu draws compared, %llu differ\n", (unsigned long long)g_frame, (unsigned long long)g_scrollChecks,
+                             (unsigned long long)g_scrollDiffer);
+            }
+        }
+    }
+
+    // ---- Round 61: modelDispState on a lane of its own (SOTC_MDS_LANE) -------
+    //
+    // modelDispState (the game's modelDisp results: the part tree's camera
+    // test at +0x2c, the layers' last surface at *0x118bfc8, setShadowEffect's
+    // flag 0x1186294, and the VU0 CLIP register as the tests leave it) ran on
+    // the game thread at every model hook (1.7 ms a frame in the title
+    // screen's world at 222 MHz). Now the hook takes its inputs (the
+    // instance's LOD word and fade, the camera context's matrix, the globals
+    // the packet loop reads, the plan) and hands it to a thread of its own
+    // (the lane, cores 1-2); the hook's own second part walk and its "out of
+    // view" decision go with it; the model job on the hook worker waits for
+    // its lane job, takes its parts and skips a model the lane found out of
+    // view (the last palette carried in the jobs' order, paletteDeferred).
+    // The instance packet's opacity (mdsOpacity) stays at the hook.
+    // What the game could see of it waits for the lane (join):
+    //  - the CLIP register: pending in the context (sotc_decomp::g_lazyClip);
+    //    clipByMinMaxCube's corners (they decide on their own judgements
+    //    only) shift theirs in as `known`, the next lane job's register is
+    //    the last one's shifted by them; every other reader joins: the
+    //    recompiled functions with a VCLIP / CLIP read (clipBySphere,
+    //    clipByMinMaxCube, ClipPoint, 0108C9C0, 0108C188, modelDisp's walk
+    //    0109xxxx), modelClipPoint's and glVertexKick's natives;
+    //  - the layer cache's users (modelSetSurface, modelResetSurface and the
+    //    model functions that read *0x118bfc8: 01097928 / 01097A68, 01097B70,
+    //    01097D88, 01099828), setShadowEffect's flag (setShadowEffect,
+    //    bossDeathEffectEnd), the part tree's results (the static scan of
+    //    every recompiled function that indexes 0x30-byte nodes and reads
+    //    +0x2c finds modelDisp's own walk and 01097A68 only);
+    //  - every hook worker join (frame change, guest moves, the 2D / cloth /
+    //    particle hooks, ...) and any model hook that cannot use the lane.
+    // SOTC_MDS_LANE=0: on the game thread as before (A/B `mdslane`).
+    // SOTC_MDS_LANE_VERIFY=1: each lane job also made at the hook from the
+    // same state by the old code and compared (the memory it writes, the
+    // CLIP register, the parts, the out-of-view decision), and the CLIP
+    // records (`known`) checked against the register at the next hook.
+    namespace mdslane
+    {
+        enum JoinSite : int { kJClip, kJCache, kJShadow, kJHook, kJSync, kJFrame, kJSites };
+        const char *const kJoinNames[kJSites] = {"clip", "cache", "shadow", "hook", "sync", "frame"};
+        bool g_frameOn = false; // this frame's model hooks use the lane (set at the frame's start)
+        bool g_switch = true;   // SOTC_MDS_LANE (and the A/B's turns)
+        bool g_verify = false;  // SOTC_MDS_LANE_VERIFY
+        struct Job
+        {
+            uint64_t seq = 0;
+            uint32_t instance = 0, table = 0;
+            bool partCulled = false;
+            bool useGame = true;   // the hook's table is the game's LOD's: its parts are the game's results
+            float model[16] = {};
+            float clip[16] = {};   // the hook's camera x model (its own test of a finer LOD's parts)
+            const ModelPlan *plan = nullptr;
+            MdsIn in;
+            bool chained = false; // the register in: the last job's out with (known, shifts) shifted in since
+            uint32_t known = 0, shifts = 0;
+            std::vector<uint8_t> parts; // the hook's partVisible
+            bool skip = false;          // out of view: nothing drawn
+        };
+        constexpr uint32_t kRing = 1024u;
+        Job g_ring[kRing];
+        uint64_t g_pushed = 0, g_frameFirst = 0; // game thread
+        std::atomic<uint64_t> g_done{0};
+        uint32_t g_lastClipOut = 0; // the lane's last job's register (read after a join)
+        std::mutex g_mutex;
+        std::condition_variable g_work, g_idle;
+        std::atomic<bool> g_sleeping{false}, g_waiting{false};
+        bool g_started = false;
+        // Round 72 (SOTC_LANE_HELP, default 3): the jobs are run by whoever
+        // holds g_token, always the oldest not done first (g_done), so they
+        // run in the hand-over order, one at a time, as on the lane alone.
+        // Bit 0: a join of the game thread runs the jobs left itself instead
+        // of sleeping until the lane gets a core (the console: the lane at
+        // priority 191 on cores 1-2 behind the hook worker and the render
+        // thread, ~12 ms a frame of the game thread waiting at the shrine);
+        // bit 1: the hook worker runs the jobs up to the one its model needs.
+        // g_helpWanted: the game is joining; the lane gives the token up
+        // after its job.
+        std::atomic<int> g_help{3};
+        std::atomic<bool> g_token{false}, g_helpWanted{false};
+        uint64_t g_helpUs = 0, g_helpJobs = 0, g_helpJoins = 0; // the game thread's, since the frame log's last line ("lanehelp")
+        uint64_t g_helpUs600 = 0, g_helpJobs600 = 0, g_helpJoins600 = 0; // ([mdslane] every 600 frames)
+        std::atomic<uint64_t> g_workerHelpJobs{0}, g_workerHelpFrame{0};
+        inline bool tryToken() { return !g_token.load(std::memory_order_relaxed) && !g_token.exchange(true, std::memory_order_acquire); }
+        R5900Context g_laneCtx{}; // (modelDispState's ctx argument; the register goes through MdsIn)
+        uint64_t g_jobs = 0, g_joinCount[kJSites] = {}, g_joinWaitUs = 0, g_joinWaits = 0;
+        std::atomic<uint64_t> g_workerWaits{0};
+        uint64_t g_verifyJobs = 0, g_verifyDiffer = 0, g_clipChecks = 0, g_clipDiffer = 0, g_verifyDecisions = 0, g_verifyDecisionsDiffer = 0;
+        struct Job;
+        Job *g_verifyJob = nullptr; // (the hook's verify: its lane job, for the decision's check)
+        bool g_trackValid = false; // (verify) no join since the last hook: the records cover the register
+        uint32_t g_trackOut = 0;
+
+        inline uint32_t combine(uint32_t prev, uint32_t known, uint32_t shifts)
+        {
+            return shifts >= 4u ? known & 0xFFFFFFu : ((prev << (6u * shifts)) | known) & 0xFFFFFFu;
+        }
+
+        // The lane's part of the hook: modelDispState, then the hook's own
+        // part decision (as modelDispHook made it after modelDispState).
+        void run(Job &j)
+        {
+            j.in.clipIn = j.chained ? combine(g_lastClipOut, j.known, j.shifts) : j.in.clipIn;
+            j.in.clipOut = j.in.clipIn; // (left as it is when nothing is tested)
+            j.parts.clear();
+            bool taken = false;
+            uint32_t partsTable = 0;
+            modelDispState(&g_laneCtx, j.instance, j.model, j.plan, &j.parts, &taken, &partsTable, &j.in);
+            g_lastClipOut = j.in.clipOut;
+            j.skip = false;
+            if (!j.partCulled)
+                return;
+            if (j.useGame && taken && partsTable == j.table)
+            {
+                j.skip = j.parts.empty(); // the root out (1)
+                return;
+            }
+            // modelDispHook's second walk, as there: on the game's results
+            // (+0x2c), or its own test of a finer LOD's parts ("Model detail").
+            const uint32_t table = j.table;
+            std::vector<uint8_t> &partVisible = j.parts;
+            const float *const clip = j.clip;
+            const bool useGame = j.useGame;
+            const auto test = [clip, useGame](uint32_t node) -> uint32_t
+            {
+                if (useGame)
+                    return word(node + 0x2Cu);
+                uint32_t all = 0x3Fu, any = 0u;
+                for (int c = 0; c < 8; ++c)
+                {
+                    const float x = real(node + ((c & 1) ? 0x10u : 0u)), y = real(node + ((c & 2) ? 0x14u : 4u)), z = real(node + ((c & 4) ? 0x18u : 8u));
+                    float v[4];
+                    for (int r = 0; r < 4; ++r)
+                        v[r] = clip[r] * x + clip[4 + r] * y + clip[8 + r] * z + clip[12 + r];
+                    const float w = std::fabs(v[3]);
+                    const uint32_t flags = (v[0] > w ? 1u : 0u) | (v[0] < -w ? 2u : 0u) | (v[1] > w ? 4u : 0u) | (v[1] < -w ? 8u : 0u) | (v[2] > w ? 16u : 0u) |
+                                           (v[2] < -w ? 32u : 0u);
+                    all &= flags;
+                    any |= flags;
+                }
+                return all ? 1u : (any ? 0u : 2u);
+            };
+            uint32_t budget = 4096u;
+            const auto visit = [&](auto &&self, uint32_t index, uint32_t inherited, int depth) -> void
+            {
+                if (index >= 4096u || depth > 64 || budget == 0u)
+                    return;
+                --budget;
+                const uint32_t node = table + index * 0x30u;
+                const uint32_t state = inherited ? inherited : test(node);
+                if (partVisible.size() <= index)
+                    partVisible.resize(index + 1u, 0u);
+                partVisible[index] = static_cast<uint8_t>(state);
+                for (uint32_t link : {0x20u, 0x24u})
+                    if (word(node + link) != 0xFFFFFFFFu)
+                        self(self, word(node + link), state, depth + 1);
+            };
+            if (table == 0u)
+            {
+                j.skip = true; // (the hook returns before it hands a model job over)
+                return;
+            }
+            const uint32_t root = test(table);
+            if (root == 1u)
+            {
+                j.skip = true;
+                return;
+            }
+            partVisible.assign(1u, static_cast<uint8_t>(root));
+            for (uint32_t link : {0x20u, 0x24u})
+                if (word(table + link) != 0xFFFFFFFFu)
+                    visit(visit, word(table + link), root, 1);
+        }
+
+        // Round 72: job `seq` run (by the token's holder); its slot must hold
+        // it and it must not have run (counted, the [mdslane] help line).
+        std::atomic<uint64_t> g_orderErrors{0};
+        // SOTC_LANE_HELP_CHECK=1 (checking): at each hand-over the game
+        // thread first runs every job before it, then runs the new job on a
+        // copy as the lane would at once (its memory put back after) and
+        // keeps a digest of its results: the register, the out-of-view
+        // decision, the parts and what it wrote (the part table's +0x2c
+        // words, the layer cache, the flag). When the job really runs later
+        // (a join's help, the hook worker, the lane: whoever has the token)
+        // the same digest is made and compared: a job whose results depend
+        // on when or where it runs would differ.
+        bool g_check = false;
+        struct Digest
+        {
+            uint64_t part[5] = {};
+            bool operator!=(const Digest &o) const { return std::memcmp(part, o.part, sizeof(part)) != 0; }
+        };
+        Digest g_checkDigest[kRing];
+        bool g_checkHave[kRing] = {};
+        std::atomic<uint64_t> g_checks{0}, g_checkDiffer{0};
+        Digest checkDigest(const Job &j);
+        inline void runSeq(uint64_t seq)
+        {
+            Job &j = g_ring[seq % kRing];
+            if (j.seq != seq || g_done.load(std::memory_order_relaxed) != seq)
+                g_orderErrors.fetch_add(1, std::memory_order_relaxed);
+            run(j);
+            if (g_check && g_checkHave[seq % kRing])
+            {
+                g_checkHave[seq % kRing] = false;
+                g_checks.fetch_add(1, std::memory_order_relaxed);
+                const Digest now = checkDigest(j), then = g_checkDigest[seq % kRing];
+                if (now != then && g_checkDiffer.fetch_add(1, std::memory_order_relaxed) < 20u)
+                    std::fprintf(stderr, "[mdslane] help check: job %llu instance %08x table %08x DIFFERS from its run at the hand-over (parts: clip %d decision %d tree %d cache %d flag %d), run by %s; chained %d clip in %06x\n",
+                                 (unsigned long long)seq, j.instance, j.table, now.part[0] != then.part[0], now.part[1] != then.part[1], now.part[2] != then.part[2],
+                                 now.part[3] != then.part[3], now.part[4] != then.part[4],
+                                 hookjobs::t_hookWorker ? "the hook worker" : g_helpWanted.load(std::memory_order_relaxed) ? "a join" : "the lane", j.chained ? 1 : 0, j.in.clipIn);
+            }
+        }
+
+        void loop()
+        {
+            native_renderer::threads::place(native_renderer::threads::kLane);
+            ThreadNaming::SetCurrentThreadName("mdslane");
+            static const uint32_t delayUs = std::getenv("SOTC_MDS_LANE_DELAY_US") ? static_cast<uint32_t>(std::atoi(std::getenv("SOTC_MDS_LANE_DELAY_US"))) : 0u;
+            for (;;)
+            {
+                uint64_t pushed = 0;
+                for (int spin = 0;; ++spin)
+                {
+                    pushed = __atomic_load_n(&g_pushed, __ATOMIC_ACQUIRE);
+                    if (pushed > g_done.load(std::memory_order_acquire))
+                        break;
+                    if (spin < 256)
+                        continue;
+                    std::unique_lock<std::mutex> lock(g_mutex);
+                    // Round 88 (the freeze hunt): the push stores g_pushed
+                    // and then loads g_sleeping; this side stores g_sleeping
+                    // and then loads g_pushed (a Dekker pair). Both sides
+                    // seq_cst: with a release store on the push side ARM may
+                    // let its g_sleeping load pass the store, and both sides
+                    // miss each other (a lost wake-up). The wait is timed as
+                    // well (5 ms), so a wake-up lost any other way costs at
+                    // most that, never an untimed sleep.
+                    g_sleeping.store(true, std::memory_order_seq_cst);
+                    if (__atomic_load_n(&g_pushed, __ATOMIC_SEQ_CST) <= g_done.load(std::memory_order_seq_cst))
+                        g_work.wait_for(lock, std::chrono::milliseconds(5));
+                    g_sleeping.store(false, std::memory_order_relaxed);
+                    spin = 0;
+                }
+                // Round 72: the token (the game thread or the hook worker may
+                // be running the jobs: then wait a little and look again).
+                if (g_helpWanted.load(std::memory_order_seq_cst) || !tryToken())
+                {
+                    std::unique_lock<std::mutex> lock(g_mutex);
+                    g_work.wait_for(lock, std::chrono::microseconds(100));
+                    continue;
+                }
+                bool held = true;
+                for (uint64_t next = g_done.load(std::memory_order_relaxed); next < pushed; ++next)
+                {
+                    if (delayUs)
+                    {
+                        // (the lane without a core: the token not held meanwhile)
+                        g_token.store(false, std::memory_order_release);
+                        std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+                        if (g_helpWanted.load(std::memory_order_seq_cst) || !tryToken())
+                        {
+                            held = false;
+                            break;
+                        }
+                        next = g_done.load(std::memory_order_relaxed);
+                        if (next >= pushed)
+                            break;
+                    }
+                    runSeq(next);
+                    g_done.store(next + 1u, std::memory_order_release);
+                    if (g_waiting.load(std::memory_order_seq_cst))
+                    {
+                        std::lock_guard<std::mutex> lock(g_mutex);
+                        g_idle.notify_all();
+                    }
+                    if (g_helpWanted.load(std::memory_order_seq_cst))
+                        break; // the game thread takes the rest
+                }
+                if (held)
+                    g_token.store(false, std::memory_order_release);
+            }
+        }
+
+        // Round 72: the jobs before `upto` run on the calling thread (the
+        // token held), from the oldest not done; false if another holds it.
+        bool runTo(uint64_t upto, uint64_t *ran = nullptr)
+        {
+            if (!tryToken())
+                return false;
+            uint64_t next = g_done.load(std::memory_order_relaxed);
+            if (ran)
+                *ran = upto > next ? upto - next : 0u;
+            for (; next < upto; ++next)
+            {
+                runSeq(next);
+                g_done.store(next + 1u, std::memory_order_release);
+            }
+            g_token.store(false, std::memory_order_release);
+            if (g_waiting.load(std::memory_order_seq_cst))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_idle.notify_all();
+            }
+            return true;
+        }
+
+        // Until job `seq` is done (the hook worker, or the game thread's join).
+        void waitDone(uint64_t seq)
+        {
+            for (int spin = 0; spin < 2048; ++spin)
+                if (g_done.load(std::memory_order_acquire) > seq)
+                    return;
+            std::unique_lock<std::mutex> lock(g_mutex);
+            g_waiting.store(true, std::memory_order_seq_cst);
+            while (g_done.load(std::memory_order_acquire) <= seq)
+                g_idle.wait_for(lock, std::chrono::microseconds(200));
+            g_waiting.store(false, std::memory_order_relaxed);
+        }
+
+        // The hook worker's: lane job `seq` done before its model job runs.
+        void workerWait(uint64_t seq)
+        {
+            if (g_help.load(std::memory_order_relaxed) & 2)
+            {
+                uint64_t ran = 0;
+                if (runTo(seq + 1u, &ran))
+                {
+                    g_workerHelpJobs.fetch_add(ran, std::memory_order_relaxed);
+                    g_workerHelpFrame.fetch_add(ran, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            g_workerWaits.fetch_add(1, std::memory_order_relaxed);
+            waitDone(seq);
+        }
+
+        // The game thread: every job handed over done, the CLIP register put
+        // back in its context.
+        void join(int site)
+        {
+            sotc_decomp::LazyClip &c = sotc_decomp::g_lazyClip;
+            if (g_verify)
+                g_trackValid = false; // a reader's own judgements are not in the records
+            if (!c.pending && g_done.load(std::memory_order_acquire) == g_pushed)
+                return;
+            ++g_joinCount[site >= 0 && site < kJSites ? site : kJHook];
+            if (g_done.load(std::memory_order_acquire) != g_pushed)
+            {
+                const uint64_t t0 = native_renderer::nowUs();
+                if (g_help.load(std::memory_order_relaxed) & 1)
+                {
+                    // Round 72: the jobs left run here; while the lane (or
+                    // the worker) is inside one, wait for its token (the
+                    // game thread is alone on its core: a spin).
+                    g_helpWanted.store(true, std::memory_order_seq_cst);
+                    uint64_t helpStart = 0;
+                    {
+                        std::optional<ps2_load::Wait> waiting; // (only the spin is a wait: the jobs run here are work)
+                        for (uint32_t spin = 0; g_done.load(std::memory_order_acquire) != g_pushed; ++spin)
+                        {
+                            if (!g_token.load(std::memory_order_relaxed))
+                            {
+                                waiting.reset();
+                                helpStart = native_renderer::nowUs();
+                                uint64_t ran = 0;
+                                if (runTo(g_pushed, &ran))
+                                {
+                                    g_helpJobs += ran;
+                                    g_helpJobs600 += ran;
+                                    ++g_helpJoins;
+                                    ++g_helpJoins600;
+                                    break;
+                                }
+                                helpStart = 0;
+                            }
+                            if (!waiting)
+                                waiting.emplace(ps2_load::kSiteHookJoin);
+                            if (spin >= 4096u)
+                                std::this_thread::yield();
+                        }
+                    }
+                    g_helpWanted.store(false, std::memory_order_seq_cst);
+                    if (helpStart)
+                    {
+                        const uint64_t us = native_renderer::nowUs() - helpStart;
+                        g_helpUs += us;
+                        g_helpUs600 += us;
+                    }
+                }
+                else
+                {
+                    ps2_load::Wait waiting(ps2_load::kSiteHookJoin);
+                    waitDone(g_pushed - 1u);
+                }
+                g_joinWaitUs += native_renderer::nowUs() - t0;
+                ++g_joinWaits;
+            }
+            if (c.pending)
+            {
+                c.ctx->vu0_clip_flags = combine(g_lastClipOut, c.known, c.shifts);
+                c.pending = false;
+                c.known = c.shifts = 0;
+            }
+        }
+
+        void frameStart(bool hookWorkerOn)
+        {
+            join(kJFrame);
+            // (read at the first frame: the Vita's env.txt comes after static init)
+            static const bool envRead = []
+            {
+                g_switch = !std::getenv("SOTC_MDS_LANE") || std::atoi(std::getenv("SOTC_MDS_LANE")) != 0;
+                g_verify = ps2_diag::env("SOTC_MDS_LANE_VERIFY") != nullptr;
+                g_check = ps2_diag::env("SOTC_LANE_HELP_CHECK") != nullptr;
+                g_help.store(std::getenv("SOTC_LANE_HELP") ? std::atoi(std::getenv("SOTC_LANE_HELP")) & 3 : 3, std::memory_order_relaxed);
+                std::fprintf(stderr, "[mdslane] help (SOTC_LANE_HELP): %d (bit 0 the game thread's joins run the jobs left, bit 1 the hook worker runs the ones its models need)\n",
+                             g_help.load(std::memory_order_relaxed));
+                return true;
+            }();
+            (void)envRead;
+            g_frameOn = hookWorkerOn && g_switch && g_hookLean;
+            g_frameFirst = g_pushed;
+            if (g_frameOn && !g_started)
+            {
+                g_started = true;
+                sotc_decomp::g_clipJoin = [] { join(kJClip); };
+                std::thread(loop).detach();
+            }
+            if ((g_jobs || g_verifyJobs) && sotc_native::g_frame % 600u == 0u)
+            {
+                char line[400];
+                int n = std::snprintf(line, sizeof(line), "[mdslane] frame %llu: %llu jobs, joins waited %llu (%.2f ms), worker waits %llu; joins at",
+                                      (unsigned long long)sotc_native::g_frame, (unsigned long long)g_jobs, (unsigned long long)g_joinWaits, g_joinWaitUs / 1000.0,
+                                      (unsigned long long)g_workerWaits.load(std::memory_order_relaxed));
+                for (int k = 0; k < kJSites && n > 0 && n < static_cast<int>(sizeof(line)); ++k)
+                    n += std::snprintf(line + n, sizeof(line) - n, " %s %llu", kJoinNames[k], (unsigned long long)g_joinCount[k]);
+                std::fprintf(stderr, "%s\n", line);
+                std::fprintf(stderr, "[mdslane] help: the game thread's joins ran %llu jobs in %llu joins (%.2f ms), the hook worker %llu jobs; out of order %llu; check %llu jobs, %llu differ\n",
+                             (unsigned long long)g_helpJobs600, (unsigned long long)g_helpJoins600, g_helpUs600 / 1000.0,
+                             (unsigned long long)g_workerHelpJobs.exchange(0, std::memory_order_relaxed), (unsigned long long)g_orderErrors.load(std::memory_order_relaxed),
+                             (unsigned long long)g_checks.load(std::memory_order_relaxed), (unsigned long long)g_checkDiffer.load(std::memory_order_relaxed));
+                g_helpJobs600 = g_helpJoins600 = g_helpUs600 = 0;
+                if (g_verify)
+                    std::fprintf(stderr, "[mdslane] verify: %llu jobs made both ways, %llu differ (memory, CLIP); decisions %llu, %llu differ; CLIP records %llu checked, %llu differ\n",
+                                 (unsigned long long)g_verifyJobs, (unsigned long long)g_verifyDiffer, (unsigned long long)g_verifyDecisions,
+                                 (unsigned long long)g_verifyDecisionsDiffer, (unsigned long long)g_clipChecks, (unsigned long long)g_clipDiffer);
+                g_jobs = g_joinWaits = g_joinWaitUs = 0;
+                g_workerWaits.store(0, std::memory_order_relaxed);
+                std::fill(std::begin(g_joinCount), std::end(g_joinCount), 0ull);
+            }
+        }
+
+        // The hook: its inputs into the next job, the job handed over.
+        Job &take(R5900Context *ctx)
+        {
+            sotc_decomp::LazyClip &c = sotc_decomp::g_lazyClip;
+            if ((c.pending && c.ctx != ctx) || g_pushed - g_frameFirst >= kRing)
+            {
+                // Another context's register pending, or the ring's slots all
+                // this frame's (the hook worker may still read them): all done first.
+                hookJoin(hookjobs::k_move);
+                join(kJHook);
+                g_frameFirst = g_pushed;
+            }
+            Job &j = g_ring[g_pushed % kRing];
+            j.seq = g_pushed;
+            if (c.pending)
+            {
+                j.chained = true;
+                j.known = c.known;
+                j.shifts = c.shifts;
+            }
+            else
+            {
+                j.chained = false;
+                j.in.clipIn = ctx->vu0_clip_flags & 0xFFFFFFu;
+            }
+            return j;
+        }
+        void checkAtPush();
+        void push(R5900Context *ctx)
+        {
+            if (g_check)
+                checkAtPush();
+            sotc_decomp::LazyClip &c = sotc_decomp::g_lazyClip;
+            c.ctx = ctx;
+            c.pending = true;
+            c.known = c.shifts = 0;
+            ++g_jobs;
+            // Round 88: seq_cst (not release), so the g_sleeping load below
+            // cannot be ordered before this store (see loop()).
+            __atomic_store_n(&g_pushed, g_pushed + 1u, __ATOMIC_SEQ_CST);
+            if (g_sleeping.load(std::memory_order_seq_cst))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_work.notify_one();
+            }
+        }
+
+        // Round 61's check (SOTC_MDS_LANE_VERIFY), at the hook with the lane
+        // idle: the old code's results (memory, register, parts) against the
+        // lane's code on the same state. The memory it can write: the part
+        // table (up to 4096 nodes), the layer cache's 64 slots, the flag.
+        struct Snap
+        {
+            std::vector<uint8_t> table, cache;
+            uint32_t flag = 0;
+        };
+        void snap(Snap &s, uint32_t table, uint32_t cache)
+        {
+            const uint32_t tb = std::min<uint32_t>(4096u * 0x30u, table < PS2_RAM_SIZE ? PS2_RAM_SIZE - table : 0u);
+            s.table.assign(g_ram + table, g_ram + table + tb);
+            const uint32_t cb = cache && cache < PS2_RAM_SIZE - 256u ? 256u : 0u;
+            s.cache.assign(g_ram + cache, g_ram + cache + cb);
+            std::memcpy(&s.flag, g_ram + 0x1186294u, 4);
+        }
+        void unsnap(const Snap &s, uint32_t table, uint32_t cache)
+        {
+            uint8_t *const ram = const_cast<uint8_t *>(g_ram);
+            std::memcpy(ram + table, s.table.data(), s.table.size());
+            std::memcpy(ram + cache, s.cache.data(), s.cache.size());
+            std::memcpy(ram + 0x1186294u, &s.flag, 4);
+        }
+
+        // Round 72's check (SOTC_LANE_HELP_CHECK), above.
+        // Its parts (8 bits each in the digest): the register, the decision
+        // and parts, the part tree's +0x2c words (the nodes reached from the
+        // root by the 0x20 / 0x24 links, as the walks go), the layer cache,
+        // the flag.
+        Digest checkDigest(const Job &j)
+        {
+            Digest d;
+            uint64_t *const part = d.part;
+            const auto mix = [](uint64_t &h, uint64_t v) { h = (h ^ v) * 1099511628211ull + 1u; };
+            mix(part[0], j.in.clipOut);
+            mix(part[1], j.skip ? 1u : 0u);
+            mix(part[1], j.parts.size());
+            for (uint8_t p : j.parts)
+                mix(part[1], p);
+            if (j.table && j.table < PS2_RAM_SIZE - 4096u * 0x30u)
+            {
+                static std::vector<uint32_t> stack;
+                static std::vector<uint8_t> seen;
+                seen.assign(4096u, 0u);
+                stack.assign(1u, 0u);
+                uint32_t budget = 4096u;
+                while (!stack.empty() && budget--)
+                {
+                    const uint32_t i = stack.back();
+                    stack.pop_back();
+                    if (i >= 4096u || seen[i])
+                        continue;
+                    seen[i] = 1u;
+                    const uint32_t node = j.table + i * 0x30u;
+                    mix(part[2], (static_cast<uint64_t>(i) << 32) | word(node + 0x2Cu));
+                    for (uint32_t link : {0x20u, 0x24u})
+                        if (word(node + link) != 0xFFFFFFFFu)
+                            stack.push_back(word(node + link));
+                }
+            }
+            if (j.in.cache && j.in.cache < PS2_RAM_SIZE - 256u)
+                for (uint32_t a = 0; a < 256u; a += 4u)
+                    mix(part[3], word(j.in.cache + a));
+            mix(part[4], word(0x1186294u));
+            return d;
+        }
+        void checkAtPush()
+        {
+            // Every job before it run first (here, with the token).
+            g_helpWanted.store(true, std::memory_order_seq_cst);
+            while (g_done.load(std::memory_order_acquire) != g_pushed)
+                if (!runTo(g_pushed))
+                    std::this_thread::yield();
+            g_helpWanted.store(false, std::memory_order_seq_cst);
+            Job copy = g_ring[g_pushed % kRing];
+            static Snap pre;
+            snap(pre, copy.table, copy.in.cache);
+            const uint32_t lastClip = g_lastClipOut;
+            run(copy);
+            g_checkDigest[g_pushed % kRing] = checkDigest(copy);
+            g_checkHave[g_pushed % kRing] = true;
+            unsnap(pre, copy.table, copy.in.cache);
+            g_lastClipOut = lastClip;
+        }
+    }
+
+    void modelDispHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Round 132: the hook's phases as prof129 zones (0x2000 | phase; a
+        // relaxed store each on the game thread, put back at the way out).
+        const ps2_load::GameZone hookZone(0x2001u);
+        const auto zone = [](uint32_t z)
+        {
+            if (ps2_load::t_slot == ps2_load::kGame)
+                ps2_load::gameZone.store(z, std::memory_order_relaxed);
+        };
+        { SOTC_PROF_SCOPE(kHookSync); syncFrame(rdram); }
+        zone(0x2002u);
+        const lines67::Scope l67(lines67::kHook, true);
+        static const ModelDispEnv env;
+        const uint32_t instance = GPR_U32(ctx, 4), matrix = GPR_U32(ctx, 5);
+        float model[16];
+#if defined(SOTC_HOOK_ASM_LEAN)
+        constexpr bool lean = true, leanCheck = false, leanStats = false;
+#else
+        static const bool lean = g_hookLean = !std::getenv("SOTC_HOOK_LEAN") || std::atoi(std::getenv("SOTC_HOOK_LEAN")) != 0;
+        static const bool leanCheck = ps2_diag::env("SOTC_HOOK_LEAN_CHECK") != nullptr;
+        static const bool leanStats = g_leanStats.on = leanCheck || ps2_diag::env("SOTC_HOOK_LEAN_STATS") != nullptr;
+#endif
+        g_leanStats.draws += leanStats;
+        if (leanStats && g_frame % 600u == 0u)
+        {
+            static uint64_t told = ~0ull;
+            if (told != g_frame)
+            {
+                told = g_frame;
+                const LeanStats &l = g_leanStats;
+                std::fprintf(stderr, "[hook-lean] frame %llu (%s): parts %llu checked, %llu differ; palette, lights and projection %llu checked, %llu differ | "
+                             "draws %llu, second-walk nodes %llu, palette host bytes %llu, queued lines asked for %llu, dropped %llu\n",
+                             (unsigned long long)g_frame, lean ? "lean" : "round 31", (unsigned long long)l.partChecks, (unsigned long long)l.partDiffer,
+                             (unsigned long long)l.paletteChecks, (unsigned long long)l.paletteDiffer, (unsigned long long)l.draws, (unsigned long long)l.walkNodes,
+                             (unsigned long long)l.paletteHostBytes, (unsigned long long)l.queuePumped, (unsigned long long)l.queueDropped);
+            }
+        }
+        if (lean)
+            guestBlock(matrix, 64u, model);
+        else
+            for (int i = 0; i < 16; ++i)
+                model[i] = real(matrix + i * 4u);
+        // The lists are built while the GS draws (the emulated picture shown).
+        const bool ps2Lists = native_renderer::tuning().ps2Lists || !GS::skipRaster();
+        static const bool check = ps2_diag::env("SOTC_MODELDISP_CHECK") != nullptr;
+        if (ps2Lists && !check)
+            { SOTC_PROF_SCOPE(kHookPs2List); g_modelDisp(rdram, ctx, runtime); runtime->checkTransfer(); } // the emulated drawing goes on as before
+        else
+        {
+            // iosgluGetCameraContext -> get_cur_camera_context, as modelDisp asks.
+            g_cameraContext = word(0x0122A8F0u + word(0x0118FE4Cu) * 4u);
+            if (!check)
+                ctx->pc = GPR_U32(ctx, 31); // jr ra
+        }
+        HookTimer hookTimer;
+        SOTC_PROF_SCOPE(kHookModelDisp);
+        if (!g_cameraContext)
+            return;
+        // SOTC_HIDE_HEADER=<hex> (debugging, round 12): that model left out.
+        static const uint32_t hideHeader = std::getenv("SOTC_HIDE_HEADER") ? static_cast<uint32_t>(std::strtoul(std::getenv("SOTC_HIDE_HEADER"), nullptr, 16)) : 0u;
+        if (hideHeader && word(word(instance) + 0x20u) == hideHeader)
+            return;
+        CallRecord *record = nullptr; // this draw's, for the next frame's prefetch
+        if (g_prefetch)
+        {
+            queueNextDraw(instance);
+            const uint32_t object = word(instance);
+            CallRecord r{instance, object, word(object + 0x20u), word(instance + 0xCu)};
+            if (lean)
+                r.matrix = matrix;
+            g_calls.push_back(r);
+            if (lean)
+                record = &g_calls.back();
+        }
+
+        float camera[16], clip[16];
+        if (lean)
+            guestBlock(g_cameraContext + 0x5A0u, 64u, camera);
+        else
+            for (int i = 0; i < 16; ++i)
+                camera[i] = real(g_cameraContext + 0x5A0u + i * 4u);
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k)
+                    sum += camera[k * 4 + r] * model[c * 4 + k];
+                clip[c * 4 + r] = sum;
+            }
+        static const bool viewChecks = ps2_diag::env("SOTC_VIEW_CHECK") != nullptr;
+        if (viewChecks)
+        {
+            const uint32_t own = word(instance + 0xCu);
+            if (((word(own) >> 28) & 7u) == 2u)
+            {
+                const uint32_t ret = word(own + 4u);
+                if ((word(ret) & 0xFFFFu) == 5u)
+                {
+                    float vu[16];
+                    for (int i = 0; i < 16; ++i)
+                        vu[i] = real(ret + 16u + i * 4u);
+                    viewCheck(0, clip, vu);
+                }
+            }
+        }
+        // The draw plan of the game's LOD (round 8): modelDispState's packet
+        // tests and the packet loop below go through it.
+        const bool planOn = g_planOn && !check && native_renderer::tuning().fastHooks && g_surfaceMemo && native_renderer::tuning().packetQuickCheck;
+        ModelPlan *gamePlan = nullptr;
+        if (planOn)
+        {
+            const uint32_t h = word(word(instance) + 0x20u);
+            uint64_t lw;
+            std::memcpy(&lw, rdram + ((instance + 0x250u) & 0x1FFFFF8u), 8);
+            uint32_t l = static_cast<uint32_t>((lw >> 40) & 7u);
+            if ((word(h + 0x18u) & 1u) && l >= word(h + 0x1Cu) && word(h + 0x1Cu) != 0u)
+                l = word(h + 0x1Cu) - 1u;
+            gamePlan = modelPlan(h, l);
+            ++g_planStats.uses;
+            if (record && gamePlan)
+            {
+                record->plan = gamePlan->pk.data();
+                record->planBytes = static_cast<uint32_t>(std::min<size_t>(gamePlan->pk.size() * sizeof(PlanPacket), 0xFFFFFFFFu));
+            }
+        }
+        // The job (on the worker when hookjobs::g_on), taken before
+        // modelDispState: round 32 has the part results go into it there.
+        HookJob *hookJob = hookjobs::g_on ? &hookjobs::next() : nullptr;
+        ModelDispJob &job = hookJob ? hookJob->model : g_syncJob;
+        bool partsTaken = false; // job.partVisible made by modelDispState's walk (lean)
+        uint32_t partsTable = 0;
+        bool laneUsed = false; // round 61: the state made on the lane (mdslane)
+        uint64_t laneSeq = 0;
+        zone(0x2003u);
+        if (check)
+            modelDispCheck(rdram, ctx, runtime, instance, model);
+        else if (!ps2Lists)
+        {
+            SOTC_PROF_SCOPE(kHookState);
+            // Round 61: on the lane when the hook's own part decision can go
+            // with it (lean, the game's own LOD: no finer "Model detail").
+            const bool laneOk = mdslane::g_frameOn && hookJob && lean && !leanCheck;
+            if (laneOk)
+            {
+                mdslane::Job &lj = mdslane::take(ctx);
+                const uint32_t h = word(word(instance) + 0x20u);
+                uint64_t lw;
+                std::memcpy(&lw, rdram + ((instance + 0x250u) & 0x1FFFFF8u), 8);
+                // The hook's LOD and table as it works them out below (gameLod,
+                // then "Model detail"'s finer level, tested by the hook itself).
+                uint32_t gl = static_cast<uint32_t>((lw >> 40) & 7u);
+                if ((word(h + 0x18u) & 1u) && gl >= word(h + 0x1Cu) && word(h + 0x1Cu) != 0u)
+                    gl = word(h + 0x1Cu) - 1u;
+                uint32_t l = gl;
+                if (const int finer = static_cast<int>(native_renderer::tuning().modelDetail + 0.5f); finer > 0 && l > 0u)
+                {
+                    l = finer >= 2 ? 0u : l - 1u;
+                    if (word(h + 0x30u + l * 4u) == 0u && word(h + 0x30u + gl * 4u) != 0u)
+                        l = gl;
+                }
+                lj.instance = instance;
+                lj.table = word(h + 0x30u + l * 4u);
+                lj.useGame = l == gl;
+                std::memcpy(lj.clip, clip, sizeof(lj.clip));
+                lj.partCulled = (word(h + 0x18u) & 1u) == 0u && word(h + 0x54u) != 1u;
+                std::memcpy(lj.model, model, sizeof(lj.model));
+                lj.plan = gamePlan;
+                MdsIn &in = lj.in;
+                in.lane = true;
+                in.header = h;
+                in.lodWord = lw;
+                guestBlock(g_cameraContext + 0x5A0u, 64u, in.camera);
+                in.fading = 0.0f < real(instance + 0x244u);
+                in.boss = word(0x1186290u);
+                in.cache = word(0x118BFC8u);
+                in.fog = word(0x1186328u);
+                if (!mdslane::g_verify)
+                {
+                    mdsOpacity(instance, h);
+                    laneSeq = lj.seq;
+                    mdslane::push(ctx);
+                    laneUsed = true;
+                }
+                else
+                {
+                    // SOTC_MDS_LANE_VERIFY: the old code for the game, the
+                    // lane's on the same state, compared.
+                    sotc_decomp::LazyClip &c = sotc_decomp::g_lazyClip;
+                    if (mdslane::g_trackValid && c.ctx == ctx)
+                    {
+                        ++mdslane::g_clipChecks;
+                        mdslane::g_clipDiffer += mdslane::combine(mdslane::g_trackOut, c.known, c.shifts) != (ctx->vu0_clip_flags & 0xFFFFFFu);
+                    }
+                    lj.chained = false;
+                    lj.in.clipIn = ctx->vu0_clip_flags & 0xFFFFFFu;
+                    static mdslane::Snap pre, post;
+                    mdslane::snap(pre, lj.table, in.cache);
+                    modelDispState(ctx, instance, model, gamePlan, &job.partVisible, &partsTaken, &partsTable);
+                    mdslane::snap(post, lj.table, in.cache);
+                    const uint32_t clipOld = ctx->vu0_clip_flags & 0xFFFFFFu;
+                    mdslane::unsnap(pre, lj.table, in.cache);
+                    mdslane::run(lj);
+                    mdslane::snap(pre, lj.table, in.cache);
+                    const bool sameMemory = pre.table == post.table && pre.cache == post.cache && pre.flag == post.flag;
+                    bool same = sameMemory && lj.in.clipOut == clipOld;
+                    mdslane::g_verifyJob = &lj; // (its decision checked against the hook's below)
+                    ++mdslane::g_verifyJobs;
+                    if (!same && mdslane::g_verifyDiffer++ < 20u)
+                        std::fprintf(stderr, "[mdslane] verify: instance %08x header %08x table %08x DIFFERS (memory same %d, clip %06x / %06x, parts %zu / %zu)\n",
+                                     instance, h, lj.table, sameMemory ? 1 : 0, lj.in.clipOut, clipOld, lj.parts.size(), job.partVisible.size());
+                    c.tracking = true;
+                    c.ctx = ctx;
+                    c.known = c.shifts = 0;
+                    mdslane::g_trackValid = true;
+                    mdslane::g_trackOut = clipOld;
+                }
+            }
+            else
+            {
+                mdslane::join(mdslane::kJSync); // (the register and the walk's statics)
+                if (lean)
+                    modelDispState(ctx, instance, model, gamePlan, &job.partVisible, &partsTaken, &partsTable);
+                else
+                    modelDispState(ctx, instance, model, gamePlan);
+            }
+            if (mdsTraceOn())
+                mdsTraceModel();
+        }
+        zone(0x2004u);
+
+        const uint32_t header = word(word(instance) + 0x20u);
+        static const uint32_t skipHeader = std::getenv("SOTC_NATIVE_SKIP") ? static_cast<uint32_t>(std::strtoul(std::getenv("SOTC_NATIVE_SKIP"), nullptr, 16)) : 0u; // debugging
+        if (header == skipHeader)
+            return;
+        const bool fading = real(instance + 0x244u) > 0.0f; // modelDisp: param_1[0x91]
+        // modelDisp's instance opacity (the microcode's, at its packet + 0xdc).
+        float opacity = 1.0f - real(instance + 0x244u);
+        if (word(header + 0xCu) != 0u)
+            opacity *= 1.0f - real(instance + 0x248u);
+        if (!(opacity > 0.0f))
+        {
+            static const bool log = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
+            static uint64_t logged = 0;
+            if (log && g_frame >= logged + 120u)
+            {
+                logged = g_frame;
+                std::fprintf(stderr, "[native-hidden] frame %llu header %08x f91 %g f92 %g hc %08x\n", (unsigned long long)g_frame, header,
+                             real(instance + 0x244u), real(instance + 0x248u), word(header + 0xCu));
+            }
+            return;
+        }
+        opacity = std::min(opacity, 1.0f);
+        uint64_t lodWord;
+        std::memcpy(&lodWord, rdram + ((instance + 0x250u) & 0x1FFFFF8u), 8);
+        uint32_t lod = static_cast<uint32_t>((lodWord >> 40) & 7u);
+        if ((word(header + 0x18u) & 1u) && lod >= word(header + 0x1Cu) && word(header + 0x1Cu) != 0u)
+            lod = word(header + 0x1Cu) - 1u;
+        // Quality "Model detail" (SOTC_MODEL_DETAIL): one level finer than
+        // the game's, or always level 0 (the finest; far hills and colossi
+        // lose their blocky outlines). The parts are then tested here, as
+        // the game's results (+0x2c) are for its own level's table.
+        const uint32_t gameLod = lod;
+        if (const int finer = static_cast<int>(native_renderer::tuning().modelDetail + 0.5f); finer > 0 && lod > 0u)
+        {
+            lod = finer >= 2 ? 0u : lod - 1u;
+            if (word(header + 0x30u + lod * 4u) == 0u && word(header + 0x30u + gameLod * 4u) != 0u)
+                lod = gameLod; // no part table there: as the game has it
+        }
+        const uint32_t table = word(header + 0x30u + lod * 4u);
+        // modelDisp (0x1097118) tests the parts against the camera only when
+        // the model has bit 0 of +0x18 clear and +0x54 != 1; otherwise every
+        // packet of the LOD is drawn. The test is made here again rather than
+        // read from the parts' +0x2c: the recompiled modelDisp can come back
+        // to this hook before its test has run (a checkpoint inside
+        // manager_sub_01099A08 returns with pc there, the rest of modelDisp
+        // runs after), so +0x2c still held another instance's or an earlier
+        // frame's result (on-screen parts skipped, off-screen ones drawn).
+        const bool partCulled = (word(header + 0x18u) & 1u) == 0u && word(header + 0x54u) != 1u;
+        if (partCulled && table == 0u)
+            return; // modelDisp returns too (bVar4 stays set): nothing drawn
+        // The rest is the job's (on the worker when hookjobs::g_on): what it
+        // needs of this moment taken now.
+        if (hookJob)
+            hookJob->kind = kJobModel;
+        std::vector<uint8_t> &partVisible = job.partVisible;
+        // Round 32: modelDispState's walk made the parts (the game's level,
+        // the same table, each node once): the second walk below would give
+        // the same vector. SOTC_HOOK_LEAN_CHECK=1 makes it anyway and compares.
+        const bool partsReady = partCulled && lean && partsTaken && partsTable == table && !ps2Lists && !check && lod == gameLod;
+        static std::vector<uint8_t> partsLean;
+        if (partsReady && leanCheck)
+            partsLean = partVisible;
+        job.lane = laneUsed; // round 61: the lane makes the parts and the out-of-view decision
+        job.laneSeq = laneSeq;
+        // SOTC_MDS_LANE_VERIFY: the lane's decision against the hook's (below).
+        mdslane::Job *const verifyLane = mdslane::g_verifyJob;
+        mdslane::g_verifyJob = nullptr;
+        const auto verifyDecision = [&](bool skip)
+        {
+            if (!verifyLane)
+                return;
+            ++mdslane::g_verifyDecisions;
+            if (verifyLane->skip != skip || (!skip && partCulled && verifyLane->parts != partVisible))
+                if (mdslane::g_verifyDecisionsDiffer++ < 20u)
+                    std::fprintf(stderr, "[mdslane] verify: instance %08x decision DIFFERS (skip %d / %d, parts %zu / %zu)\n", instance, verifyLane->skip ? 1 : 0,
+                                 skip ? 1 : 0, verifyLane->parts.size(), partVisible.size());
+        };
+        if (laneUsed)
+        {
+        }
+        else if (partsReady && !leanCheck)
+        {
+            if (partVisible.empty())
+            {
+                verifyDecision(true);
+                return; // the root out (1): modelDisp returns, nothing drawn
+            }
+        }
+        else if (partCulled)
+        {
+            SOTC_PROF_SCOPE(kHookPartTest);
+            partVisible.clear();
+            // The box (node +0 min, +0x10 max) through camera x model, VCLIP
+            // against |w|: 1 every corner out past one plane, 2 all inside, 0 partly.
+            // Without the PS2 lists modelDispState has made the game's own
+            // test already (left at +0x2c, as modelDisp would): taken as is.
+            const auto test = [&](uint32_t node) -> uint32_t
+            {
+                if (!ps2Lists && !check && lod == gameLod)
+                    return word(node + 0x2Cu); // modelDispState's (the game's own) result
+                uint32_t all = 0x3Fu, any = 0u;
+                for (int c = 0; c < 8; ++c)
+                {
+                    const float x = real(node + ((c & 1) ? 0x10u : 0u)), y = real(node + ((c & 2) ? 0x14u : 4u)), z = real(node + ((c & 4) ? 0x18u : 8u));
+                    float v[4];
+                    for (int r = 0; r < 4; ++r)
+                        v[r] = clip[r] * x + clip[4 + r] * y + clip[8 + r] * z + clip[12 + r];
+                    const float w = std::fabs(v[3]);
+                    const uint32_t flags = (v[0] > w ? 1u : 0u) | (v[0] < -w ? 2u : 0u) | (v[1] > w ? 4u : 0u) | (v[1] < -w ? 8u : 0u) | (v[2] > w ? 16u : 0u) |
+                                           (v[2] < -w ? 32u : 0u);
+                    all &= flags;
+                    any |= flags;
+                }
+                return all ? 1u : (any ? 0u : 2u);
+            };
+            // manager_sub_01099A08: a node takes its parent's result unless
+            // that is 0 (partly inside), then it is tested; +0x20 / +0x24 the
+            // two nodes under it.
+            // A tree has at most 4096 nodes (index < 4096), each reached once:
+            // the budget stops a table that is not (shared or looping links,
+            // e.g. a model still being loaded) from walking exponentially.
+            uint32_t budget = 4096u;
+            const auto visit = [&](auto &&self, uint32_t index, uint32_t inherited, int depth) -> void
+            {
+                if (index >= 4096u || depth > 64 || budget == 0u)
+                    return;
+                --budget;
+                g_leanStats.walkNodes += leanStatsOn();
+                const uint32_t node = table + index * 0x30u;
+                const uint32_t state = inherited ? inherited : test(node);
+                if (partVisible.size() <= index)
+                    partVisible.resize(index + 1u, 0u); // not reached: drawn
+                partVisible[index] = static_cast<uint8_t>(state);
+                for (uint32_t link : {0x20u, 0x24u})
+                    if (word(node + link) != 0xFFFFFFFFu)
+                        self(self, word(node + link), state, depth + 1);
+            };
+            const uint32_t root = test(table);
+            if (partsReady) // SOTC_HOOK_LEAN_CHECK
+            {
+                ++g_leanStats.partChecks;
+                std::vector<uint8_t> ref;
+                if (root != 1u)
+                {
+                    partVisible.assign(1u, static_cast<uint8_t>(root));
+                    for (uint32_t link : {0x20u, 0x24u})
+                        if (word(table + link) != 0xFFFFFFFFu)
+                            visit(visit, word(table + link), root, 1);
+                    ref = partVisible;
+                }
+                if (ref != partsLean)
+                    ++g_leanStats.partDiffer;
+                partVisible = ref;
+            }
+            if (root == 1u)
+            {
+                verifyDecision(true);
+                return; // modelDisp returns: nothing of the model is drawn
+            }
+            if (!partsReady)
+            {
+                partVisible.assign(1u, static_cast<uint8_t>(root));
+                for (uint32_t link : {0x20u, 0x24u})
+                    if (word(table + link) != 0xFFFFFFFFu)
+                        visit(visit, word(table + link), root, 1);
+            }
+        }
+        verifyDecision(false);
+        job.instance = instance;
+        job.matrix = matrix;
+        job.header = header;
+        job.table = table;
+        job.lod = lod;
+        job.gameLod = gameLod;
+        job.fading = fading;
+        job.partCulled = partCulled;
+        job.opacity = opacity;
+        job.planOn = planOn;
+        job.plan = planOn ? (lod == gameLod ? gamePlan : modelPlan(header, lod)) : nullptr;
+        std::memcpy(job.clip, clip, sizeof(clip));
+        zone(0x2005u);
+        if (lean)
+            guestBlock(g_cameraContext + 0x40u, 64u, job.projection);
+        else
+            for (int i = 0; i < 16; ++i)
+                job.projection[i] = real(g_cameraContext + 0x40u + i * 4u);
+        job.ripple[0] = real(0x0118C030u);
+        job.ripple[1] = static_cast<float>(static_cast<int32_t>(word(0x01192090u)));
+        job.lodScale = real(0x0118C180u);
+        if (hookjobs::g_on && g_kickDefer)
+            hookScrolls(job);
+        else
+        {
+            job.scrolls.clear();
+            job.scrollsTaken = false;
+        }
+        {
+            SOTC_PROF_SCOPE(kHookPalette);
+            static VuPalette now;
+            const uint32_t own = word(instance + 0xCu);
+            job.own = own;
+            if (lean)
+            {
+                // Straight into the job; lo / hi as the VU picture's last
+                // palette left them when there is none (as before).
+                // (Round 61: with the lane on, the last palette is the worker's,
+                // in the jobs' order: a job the lane finds out of view keeps it.)
+                uint32_t &lastLo = g_palLastLo, &lastHi = g_palLastHi;
+                uint32_t lo = lastLo, hi = lastHi, ret = 0, bytes = 0;
+                job.hasPalette = readChainPaletteLean(own, lo, hi, job.palette, ret, bytes);
+                job.paletteDeferred = mdslane::g_frameOn;
+                if (leanStatsOn() && job.hasPalette)
+                    g_leanStats.paletteHostBytes += job.palette.size() * 4u; // its own copy
+                if (job.paletteDeferred)
+                {
+                    job.paletteLo = lo, job.paletteHi = hi; // (its own when it has one; resolved by the worker)
+                    if (job.hasPalette && hookjobs::g_on && g_kickDefer && (g_kickOwns.empty() || g_kickOwns.back() != own))
+                        g_kickOwns.push_back(own);
+                    if (!job.hasPalette)
+                        job.palette.clear();
+                }
+                else if (job.hasPalette)
+                {
+                    lastLo = lo, lastHi = hi;
+                    if (hookjobs::g_on && g_kickDefer && (g_kickOwns.empty() || g_kickOwns.back() != own))
+                        g_kickOwns.push_back(own); // its palette copied again at the kick (round 34)
+                }
+                else
+                    job.palette.clear();
+                if (!job.paletteDeferred)
+                {
+                    job.paletteLo = lastLo;
+                    job.paletteHi = lastHi;
+                }
+                if (record)
+                    record->palette = ret, record->paletteBytes = bytes;
+                guestBlock(own + 0x10u, 128u, job.lights);
+                if (leanCheck)
+                {
+                    // The old way into `now` (kept in step) and compared.
+                    ++g_leanStats.paletteChecks;
+                    const bool had = readPalette(instance, now);
+                    float lights[32];
+                    for (uint32_t i = 0; i < 32u; ++i)
+                        lights[i] = real(own + 0x10u + i * 4u);
+                    const bool same = had == job.hasPalette && now.lo == job.paletteLo && now.hi == job.paletteHi &&
+                                      (!had || now.hi <= now.lo ? job.palette.empty()
+                                                                : job.palette.size() == (now.hi - now.lo) * 4u &&
+                                                                      std::memcmp(job.palette.data(), now.data() + now.lo * 4u, job.palette.size() * 4u) == 0) &&
+                                      std::memcmp(lights, job.lights, sizeof(lights)) == 0;
+                    g_leanStats.paletteDiffer += same ? 0u : 1u;
+                    float projection[16];
+                    for (int i = 0; i < 16; ++i)
+                        projection[i] = real(g_cameraContext + 0x40u + i * 4u);
+                    g_leanStats.paletteDiffer += std::memcmp(projection, job.projection, sizeof(projection)) == 0 ? 0u : 1u;
+                }
+            }
+            else
+            {
+                const uint32_t before = now.hi > now.lo ? now.hi - now.lo : 0u;
+                job.hasPalette = readPalette(instance, now);
+                if (job.hasPalette && hookjobs::g_on && g_kickDefer && (g_kickOwns.empty() || g_kickOwns.back() != own))
+                    g_kickOwns.push_back(own);
+                if (leanStatsOn() && job.hasPalette) // the clear of the last palette's range, then its copy in and out
+                    g_leanStats.paletteHostBytes += (before + 2u * (now.hi > now.lo ? now.hi - now.lo : 0u)) * 16u;
+                job.paletteLo = now.lo;
+                job.paletteHi = now.hi;
+                if (job.hasPalette && now.hi > now.lo)
+                    job.palette.assign(now.data() + now.lo * 4u, now.data() + now.hi * 4u);
+                else
+                    job.palette.clear();
+                for (uint32_t i = 0; i < 32u; ++i)
+                    job.lights[i] = real(own + 0x10u + i * 4u);
+            }
+        }
+        if (!hookjobs::g_on)
+        {
+            modelDispDraw(job, false);
+            return;
+        }
+        if (hookjobs::g_verify)
+            job.inputs = modelDispInputs(job), job.runInputs = modelRunInputs(job);
+        hookjobs::push();
+    }
+
+    // The instance's inputs the job reads of guest memory (the verify hash):
+    // 4 bits, one per part that changed since the hook would be told apart
+    // by comparing parts: [0] the own packet's tags, [1] its lights, [2] the
+    // palette, [3] the model header's lists and the globals.
+    uint64_t modelDispInputs(const ModelDispJob &job)
+    {
+        SOTC_READ_SITE(2);
+        uint64_t h[4] = {0xcbf29ce484222325ull, 0xcbf29ce484222325ull, 0xcbf29ce484222325ull, 0xcbf29ce484222325ull};
+        const auto mix = [&h](int k, uint32_t v) { h[k] = (h[k] ^ v) * 0x100000001b3ull; };
+        const uint32_t own = job.own; // (round 34: as taken at the hook; the instance's +0xc moves to the next frame's chain)
+        for (uint32_t a = own; a < own + 0x10u; a += 4u)
+            mix(0, word(a));
+        for (uint32_t a = own + 0x10u; a < own + 0x90u; a += 4u) // its lights
+            mix(1, word(a));
+        if (((word(own) >> 28) & 7u) == 2u)
+        {
+            const uint32_t ret = word(own + 4u); // the palette's packet
+            const uint32_t n = std::min<uint32_t>(word(ret) & 0xFFFFu, 64u);
+            for (uint32_t a = ret; a < ret + 16u + n * 16u; a += 4u)
+                mix(2, word(a));
+        }
+        mix(3, word(job.header + 0x60u));
+        mix(3, word(job.header + 0x50u));
+        mix(3, word(0x1186290u));
+        mix(3, word(0x1186328u));
+        // 16 bits of each part's hash
+        return (h[0] & 0xFFFFu) | ((h[1] & 0xFFFFu) << 16) | ((h[2] & 0xFFFFu) << 32) | ((h[3] & 0xFFFFu) << 48);
+    }
+
+    // Round 32: what a model job reads of guest memory when it runs (not
+    // taken at the hook: the PS2's DMA reads it at the kick), hashed: the
+    // plan's surfaces (flags, texture mode, scroll row, texture header),
+    // the packets' first words, the LOD scale. With the waits at zFog and the
+    // textured 2D draws gone the jobs run later; this says nothing they read
+    // moved under them (SOTC_HOOK_ASYNC_VERIFY).
+    uint64_t modelRunInputs(const ModelDispJob &job)
+    {
+        SOTC_READ_SITE(2);
+        uint64_t h = 0xcbf29ce484222325ull;
+        const auto mix = [&h](uint32_t v) { h = (h ^ v) * 0x100000001b3ull; };
+        {
+            uint32_t bits; // round 34: the job's own copy (taken at the hook)
+            std::memcpy(&bits, &job.lodScale, 4);
+            mix(bits);
+        }
+        if (!job.plan)
+            return h;
+        const uint32_t header = job.header;
+        for (const PlanPacket &e : job.plan->pk)
+        {
+            mix(word(e.data)), mix(word(e.data + 4u)), mix(word(e.data + 8u)), mix(word(e.data + 12u));
+            const uint32_t s = e.s;
+            mix(word(s + 0x18u)), mix(word(s + 0x1Cu)), mix(word(s + 0x2Cu)), mix(word(s + 0x3Cu));
+            if (const uint32_t scroll = surfaceScroll(header, s))
+            {
+                // Round 34: the job's copy when its hook took the rows.
+                const ScrollRow *row = nullptr;
+                for (const ScrollRow &r : job.scrolls)
+                    if (job.scrollsTaken && r.at == scroll)
+                        row = &r;
+                mix(row ? row->w0 : word(scroll)), mix(row ? row->w1 : word(scroll + 4u));
+            }
+            const uint32_t index = word(s + 0x2Cu);
+            if (index < word(header + 0x44u))
+            {
+                const uint32_t object = word(word(header + 0x40u) + index * 0x20u + 0x10u);
+                const uint32_t nto2 = object ? word(object + 0x20u) : 0u;
+                mix(nto2);
+                if (nto2)
+                    for (uint32_t a = nto2; a < nto2 + 0x20u; a += 4u)
+                        mix(word(a));
+            }
+        }
+        return h;
+    }
+
+    uint64_t jobCopyHash(const HookJob &job)
+    {
+        uint64_t h = 0xcbf29ce484222325ull ^ job.kind;
+        const auto bytes = [&h](const void *p, size_t n)
+        {
+            const uint8_t *b = static_cast<const uint8_t *>(p);
+            for (size_t i = 0; i < n; ++i)
+                h = (h ^ b[i]) * 0x100000001b3ull;
+        };
+        switch (job.kind)
+        {
+        case kJobModel:
+        {
+            const ModelDispJob &m = job.model;
+            bytes(&m.instance, sizeof(m.instance)), bytes(&m.header, 4), bytes(&m.lod, 4), bytes(&m.opacity, 4);
+            bytes(m.clip, sizeof(m.clip)), bytes(m.projection, sizeof(m.projection)), bytes(m.ripple, sizeof(m.ripple)), bytes(m.lights, sizeof(m.lights));
+            bytes(&m.hasPalette, 1), bytes(&m.paletteLo, 4), bytes(&m.paletteHi, 4);
+            bytes(&m.own, 4), bytes(&m.lodScale, 4), bytes(&m.scrollsTaken, 1), bytes(m.scrolls.data(), m.scrolls.size() * sizeof(ScrollRow));
+            bytes(m.palette.data(), m.palette.size() * sizeof(float));
+            if (m.partCulled)
+                bytes(m.partVisible.data(), m.partVisible.size());
+            break;
+        }
+        case kJobMesh:
+            bytes(&job.mesh.buffer, 4), bytes(&job.mesh.rows, 4), bytes(&job.mesh.columns, 4), bytes(job.mesh.camera, sizeof(job.mesh.camera));
+            bytes(job.mesh.grid.data(), job.mesh.grid.size());
+            break;
+        case kJobShadow:
+            bytes(job.shadow.projection, sizeof(job.shadow.projection)), bytes(job.shadow.rigid, sizeof(job.shadow.rigid)), bytes(job.shadow.extrude, 12);
+            bytes(job.shadow.palette.data(), job.shadow.palette.size() * sizeof(float));
+            break;
+        case kJobPtcl:
+            bytes(job.ptcl.camera, sizeof(job.ptcl.camera)), bytes(job.ptcl.eye, 12), bytes(job.ptcl.env.data(), job.ptcl.env.size());
+            bytes(job.ptcl.data.data(), job.ptcl.data.size() * sizeof(float));
+            break;
+        case kJob2D:
+            bytes(job.draw2d.batch.data(), job.draw2d.batch.size() * sizeof(native_renderer::Vertex));
+            break;
+        case kJobKick:
+            for (uint32_t i = 0; i < g_kickJobs[job.kick].count; ++i)
+            {
+                const KickPalette &k = g_kickJobs[job.kick].palettes[i];
+                bytes(&k.own, 4), bytes(&k.lo, 4), bytes(&k.hi, 4), bytes(&k.ok, 1);
+                bytes(k.data.data(), k.data.size() * sizeof(float));
+            }
+            break;
+        }
+        return h;
+    }
+
+    void runJob(HookJob &job)
+    {
+        switch (job.kind)
+        {
+        case kJobModel:
+        {
+            ModelDispJob &m = job.model;
+            if (m.lane) // round 61: its state from the lane
+            {
+                mdslane::Job &l = mdslane::g_ring[m.laneSeq % mdslane::kRing];
+                if (mdslane::g_done.load(std::memory_order_acquire) <= m.laneSeq)
+                    mdslane::workerWait(m.laneSeq); // round 72: runs them itself when the token is free (SOTC_LANE_HELP bit 1)
+                if (l.skip)
+                    break; // out of view: modelDisp draws nothing (and keeps the last palette)
+                m.partVisible.swap(l.parts);
+            }
+            if (m.paletteDeferred)
+            {
+                if (m.hasPalette)
+                    g_palLastLo = m.paletteLo, g_palLastHi = m.paletteHi;
+                else
+                    m.paletteLo = g_palLastLo, m.paletteHi = g_palLastHi;
+            }
+            modelDispDraw(m, true);
+            break;
+        }
+        case kJobMesh:
+            meshDispDraw(job.mesh);
+            break;
+        case kJobShadow:
+            shadowDispDraw(job.shadow);
+            break;
+        case kJob2D:
+            draw2DRun(job.draw2d);
+            break;
+        case kJobKick:
+            kickRun(g_kickJobs[job.kick]);
+            g_kickDone.fetch_add(1, std::memory_order_release);
+            break;
+        case kJobPtcl:
+            ptclVtxDraw(job.ptcl, *reinterpret_cast<const ParticleEnv *>(job.ptcl.env.data()));
+            // A big batch's room let go (every slot keeps what it held:
+            // 512 slots of the largest batch would be tens of MB on the Vita).
+            if (job.ptcl.data.capacity() > 1024u)
+                std::vector<float>().swap(job.ptcl.data);
+            break;
+        }
+        // Round mem99: the same for every other vector of the slot. Each of
+        // the 512 slots kept the largest of each it ever held (and flush2D's
+        // swap traded the 2D batches' room around the ring): the console's
+        // 9-minute session grew the heap 58 -> 135 MB and died of bad_alloc
+        // (SOTC_HEAP_PROF in Vita3K, route 6 at 210 s: 2D batches 14.7 MB in
+        // 446 slots, up to 144 KB each; palettes, cloth grids, shadow
+        // palettes ~2 MB each). What a usual job holds stays (no allocation
+        // a frame for it); a big one's room goes after its run.
+        // SOTC_JOB_KEEP_KB (default 16; 0: keep everything, as before).
+        static const size_t keep = []
+        {
+            const char *e = std::getenv("SOTC_JOB_KEEP_KB");
+            return e ? static_cast<size_t>(std::max(0, std::atoi(e))) * 1024u : size_t(16u * 1024u);
+        }();
+        if (keep && !g_jobTrimOff)
+        {
+            auto trim = [](auto &v)
+            {
+                if (v.capacity() * sizeof(v[0]) > keep)
+                    std::remove_reference_t<decltype(v)>().swap(v);
+            };
+            trim(job.draw2d.batch);
+            trim(job.model.palette);
+            trim(job.model.scrolls);
+            trim(job.mesh.grid);
+            trim(job.shadow.palette);
+        }
+    }
+
+    void modelDispDraw(const ModelDispJob &job, const bool onWorker)
+    {
+        SOTC_READ_SITE(1);
+        // Round 34: the scroll rows and the mip K scale as the hook took them.
+        struct DrawInputs
+        {
+            explicit DrawInputs(const ModelDispJob &job)
+            {
+                g_drawScrolls = job.scrollsTaken ? &job.scrolls : nullptr;
+                g_drawLodScale = job.lodScale;
+                g_drawLodScaleSet = true;
+            }
+            ~DrawInputs()
+            {
+                g_drawScrolls = nullptr;
+                g_drawLodScaleSet = false;
+            }
+        } drawInputs(job);
+        static const ModelDispEnv env;
+        const uint32_t instance = job.instance, matrix = job.matrix, header = job.header, table = job.table, lod = job.lod;
+        const bool fading = job.fading, partCulled = job.partCulled;
+        const float opacity = job.opacity;
+        const float *clip = job.clip, *projection = job.projection;
+        const std::vector<uint8_t> &partVisible = job.partVisible;
+        (void)matrix;
+        // Its packet list ends at a packet of size 0 (32 bytes each), not at a count.
+        const uint32_t packets = word(header + 0x60u), count = 0x10000u;
+        static std::vector<native_renderer::Vertex> vertices;
+        static std::vector<Strip> strips;
+        static VuPalette palette;
+        bool hasPalette;
+        {
+            SOTC_PROF_SCOPE(kHookPalette);
+            // As at the hook (job.palette), into the VU memory picture.
+            hasPalette = job.hasPalette;
+            if (hasPalette)
+            {
+                if (palette.hi > palette.lo)
+                    std::fill(palette.vu.begin() + palette.lo * 4u, palette.vu.begin() + palette.hi * 4u, 0.0f);
+                std::copy(job.palette.begin(), job.palette.end(), palette.vu.begin() + job.paletteLo * 4u);
+                palette.lo = job.paletteLo;
+                palette.hi = job.paletteHi;
+            }
+            if (g_staleCheck)
+            {
+                staleRecord(matrix, 64u, instance, 0);
+                if (hasPalette)
+                {
+                    const uint32_t ret = word(word(instance + 0xCu) + 4u);
+                    staleRecord(ret + 16u, (word(ret) & 0xFFFFu) * 16u, instance, 1);
+                }
+            }
+        }
+        const bool fast = native_renderer::tuning().fastHooks;
+        const bool memo = fast && g_surfaceMemo;
+        uint32_t paletteHandle = 0, paletteLo = 0, paletteHi = 0; // this instance's palette as last sent
+        // This instance's record for skinAtKick (made at its first skinned draw).
+        int32_t skinRecordIndex = -1;
+        const auto skinRecord = [&]() -> uint32_t
+        {
+            if (skinRecordIndex < 0)
+            {
+                SOTC_READ_SITE(8);
+                skinRecordIndex = static_cast<int32_t>(g_skinRecords.size());
+                g_skinRecords.push_back({job.own, palette.lo, palette.hi,
+                                         std::vector<float>(palette.data() + palette.lo * 4u, palette.data() + palette.hi * 4u)});
+            }
+            return static_cast<uint32_t>(skinRecordIndex);
+        };
+        SOTC_PROF_SCOPE(kHookPackets);
+        HookStats &hs = hookStats();
+        if (hs.on)
+            ++hs.instances, hs.headers.insert(header);
+        float lights[32];
+        bool haveLights = false;
+        // Runs (g_planRun) only without the per-packet debugging outputs.
+        const bool runs = g_planRuns && !env.logPasses && !env.logMat && env.logLayer < 0 && !r2Check().on;
+        // One packet's draws (both walks below).
+        const auto drawPacket = [&](uint32_t k, uint32_t surface, uint32_t s, SurfaceInfo *info, uint32_t size, uint32_t data, uint64_t id, bool changedInPlace,
+                                    PlanPacket *e)
+        {
+            // A plan's packet: what was found out about its id before.
+            const bool known = e && e->resolved;
+            SkinnedPacket *skinnedPacket = nullptr;
+            if (known)
+                skinnedPacket = e->skinned;
+            else if (g_skinnedIds.count(id))
+            {
+                const auto found = g_skinnedPackets.find(id);
+                if (found != g_skinnedPackets.end())
+                    skinnedPacket = &found->second;
+            }
+            const bool twoPasses = (info ? info->texMode : word(s + 0x1Cu)) == 2u;
+            const bool needsBuild = !skinnedPacket && ((!(known && e->ready) && !native_renderer::hasMesh(id)) ||
+                                                       (twoPasses && !(known && e->readyTwo) && !native_renderer::hasMesh(id ^ (1ull << 61))));
+            // Round 27: the terrain's packets (layers 1-3) are built here, up
+            // to a time budget a frame, rather than on the worker: a few of them
+            // missing held the whole picture (or, before, showed holes).
+            bool here = false;
+            if (needsBuild && !changedInPlace && native_renderer::tuning().asyncBuilds)
+            {
+                const uint32_t l = info ? info->layer[fading ? 1 : 0] : surfaceLayer(header, s, fading);
+                here = l >= 1u && l <= 3u && terrainBuildBudgetLeft();
+                if (!here && !native_renderer::asyncBudgetLeft())
+                {
+                    // This frame's builds are spent (round 12, the area change):
+                    // left out like a draw still on the worker, built next frame.
+                    ++native_renderer::frameCounters().heldDraws;
+                    if (l >= 1u && l <= 3u)
+                        ++native_renderer::frameCounters().heldTerrain;
+                    return;
+                }
+            }
+            const uint64_t buildStart = here ? native_renderer::nowUs() : 0u;
+            bool queued = false;
+            if (needsBuild && !changedInPlace && !here)
+            {
+                SOTC_PROF_SCOPE(kHookQueue);
+                queued = buildPacketAsync(id, data, size, twoPasses);
+            }
+            if (queued)
+                ; // on the worker: this packet is left out until it is taken up
+            else if (needsBuild)
+            {
+                SOTC_PROF_SCOPE(kHookBuild);
+                strips.clear();
+                readBatches(data, size, strips);
+                if (skinned(strips) && lit(strips))
+                    g_litPackets.insert(id);
+                if (skinned(strips))
+                {
+                    try
+                    {
+                        skinnedPacket = &g_skinnedPackets.emplace(id, makeSkinnedPacket(std::move(strips))).first->second;
+                        g_skinnedIds.insert(id);
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        return; // no room in the heap: not drawn this time
+                    }
+                    g_skinnedPacketBytes += skinnedPacket->bytes;
+                }
+                else
+                {
+                    vertices.clear();
+                    if (lit(strips))
+                        g_litPackets.insert(id);
+                    const auto place = [](const BatchVertex &v, native_renderer::Vertex &o)
+                    {
+                        o.x = v.x;
+                        o.y = v.y;
+                        o.z = v.z;
+                        o.nx = v.nx;
+                        o.ny = v.ny;
+                        o.nz = v.nz;
+                    };
+                    triangulate(strips, place, vertices);
+                    native_renderer::uploadMesh(id, vertices.data(), static_cast<uint32_t>(vertices.size()));
+                    if (twoPasses) // two textures: the second pass's mesh, with the second coordinates
+                    {
+                        vertices.clear();
+                        triangulate(strips, place, vertices, true);
+                        native_renderer::uploadMesh(id ^ (1ull << 61), vertices.data(), static_cast<uint32_t>(vertices.size()));
+                    }
+                }
+                if (here)
+                    terrainBuildSpent(native_renderer::nowUs() - buildStart);
+            }
+            if (e && (!e->resolved || (twoPasses && !e->readyTwo)))
+            {
+                // Known from now on (until the id changes, or meshes / skinned packets go).
+                e->skinned = skinnedPacket;
+                e->ready = skinnedPacket || native_renderer::meshKnown(id);
+                e->readyTwo = native_renderer::meshKnown(id ^ (1ull << 61));
+                e->lit = g_litPackets.count(id);
+                e->resolved = e->ready;
+            }
+            uint64_t mesh = id;
+            const float *transform = clip;
+            bool posed = false;                         // skinned: camera space
+            uint32_t skinPalette = 0, skinPaletteCount = 0; // posed by the GPU: its palette
+            if (skinnedPacket)
+            {
+                SOTC_PROF_SCOPE(kHookSkin);
+                skinnedPacket->used = g_frame;
+                if (!hasPalette)
+                    return;
+                posed = true;
+                SkinnedPacket &packet = *skinnedPacket;
+                if (fast && packet.gpu && native_renderer::gpuSkinning())
+                {
+                    // Posed by the GPU: the bind pose kept under the packet's
+                    // id, this instance's matrices sent with the draw.
+                    if (!native_renderer::hasMesh(id))
+                        uploadSkinned(id, packet);
+                    if (!paletteHandle || paletteLo != packet.lo || paletteHi != packet.hi)
+                    {
+                        paletteHandle = native_renderer::framePalette(palette.data() + packet.lo * 4u, packet.hi - packet.lo);
+                        paletteLo = packet.lo;
+                        paletteHi = packet.hi;
+                        if (paletteHandle && g_skinAtKick)
+                            g_skinDrawList.push_back({skinRecord(), &packet, 0u, paletteHandle, packet.lo, packet.hi - packet.lo});
+                    }
+                    if (!paletteHandle)
+                        return;
+                    skinPalette = paletteHandle;
+                    skinPaletteCount = packet.hi - packet.lo;
+                    transform = projection;
+                }
+                // Posed on the CPU (camera space), one mesh per draw this frame.
+                else if (fast)
+                {
+                    // Written straight into the frame's vertex buffer.
+                    mesh = (1ull << 63) | g_skinnedDraws++;
+                    if (native_renderer::Vertex *out = native_renderer::frameMesh(std::max<uint32_t>(packet.maxVertices, static_cast<uint32_t>(packet.bind.size()))))
+                    {
+                        const PosedMesh written = poseSkinned(packet, palette.data(), out);
+                        native_renderer::commitFrameMesh(mesh, written.vertices, written.indices);
+                        if (g_skinAtKick)
+                            g_skinDrawList.push_back({skinRecord(), &packet, mesh, 0u, 0u, 0u});
+                    }
+                    transform = projection;
+                }
+                else
+                {
+                    vertices.clear();
+                    triangulate(skinnedPacket->strips, [](const BatchVertex &v, native_renderer::Vertex &o)
+                    {
+                        o.x = o.y = o.z = o.nx = o.ny = o.nz = 0.0f;
+                        for (uint32_t b = 0; b < v.bones; ++b)
+                        {
+                            const float *m = &palette[(v.bone[b] * 4u % 1024u) * 4u];
+                            const float w = v.weight[b];
+                            o.x += w * (m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12]);
+                            o.y += w * (m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13]);
+                            o.z += w * (m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14]);
+                            o.nx += w * (m[0] * v.nx + m[4] * v.ny + m[8] * v.nz);
+                            o.ny += w * (m[1] * v.nx + m[5] * v.ny + m[9] * v.nz);
+                            o.nz += w * (m[2] * v.nx + m[6] * v.ny + m[10] * v.nz);
+                        }
+                    }, vertices);
+                    mesh = (1ull << 63) | g_skinnedDraws++;
+                    native_renderer::uploadMesh(mesh, vertices.data(), static_cast<uint32_t>(vertices.size()), true);
+                    transform = projection;
+                }
+            }
+            const bool logPasses = env.logPasses;
+            if (logPasses)
+            {
+                uint64_t f;
+                noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&f, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+                static std::set<uint64_t> seen;
+                if ((f & 0x2000200u) && seen.insert((static_cast<uint64_t>(header) << 32) | surface).second)
+                {
+                    uint32_t alphaReg = 0;
+                    for (uint32_t q = s + 0x60u; q < s + 0xC0u; q += 16u)
+                        if (word(q + 8u) == 0x42u)
+                            alphaReg = word(q);
+                    std::fprintf(stderr, "[native-pass] header %08x surface %u flags %016llx alpha %02x layer %u texmode %u opacity %g\n", header, surface,
+                                 (unsigned long long)f, alphaReg & 0xFFu, surfaceLayer(header, s, fading), word(s + 0x1Cu), opacity);
+                }
+            }
+            const uint32_t skipLayers = env.skipLayers;
+            // Layers 12/13 are the reflection pass (reflectionBegin): the world
+            // seen in a mirror, drawn by the game into a buffer of its own with
+            // the camera context's +0x520 matrix and sampled by the reflecting
+            // surfaces (layers 14/15). Never on the screen; not rendered yet.
+            const uint32_t layer = info ? info->layer[fading ? 1 : 0] : surfaceLayer(header, s, fading);
+            const int logLayer = env.logLayer;
+            if (static_cast<int>(layer) == logLayer)
+            {
+                static std::set<uint64_t> told;
+                if (told.insert((static_cast<uint64_t>(header) << 16) | surface).second)
+                {
+                    std::string regs;
+                    char item[40];
+                    for (uint32_t q = s + 0x20u; q < s + 0x100u; q += 16u)
+                    {
+                        std::snprintf(item, sizeof(item), " %02x:%08x%08x", word(q + 8u) & 0xFFu, word(q + 4u), word(q));
+                        regs += item;
+                    }
+                    std::fprintf(stderr, "[layer %u model] header %08x surface %u flags %08x texmode %u frame %u regs%s\n", layer, header, surface,
+                                 word(s + 0x18u), word(s + 0x1Cu), g_frame, regs.c_str());
+                }
+            }
+            const bool noReflect = !native_renderer::tuning().reflections;
+            if ((layer == 12u || layer == 13u) && noReflect)
+                return;
+            if ((skipLayers >> (layer & 31u)) & 1u)
+                return;
+            native_renderer::DrawState state;
+            state.skinPalette = skinPalette;
+            state.skinPaletteCount = skinPaletteCount;
+            const SurfaceInfo *full = info ? &surfaceInfoFull(*info, surface) : nullptr;
+            state.texture = full ? full->texture : surfaceTexture(header, surface);
+            state.blend = full ? full->blend : surfaceBlend(s);
+            state.clamp = full ? full->clamp : surfaceClamp(s);
+            state.order = layer; // surfaceLayer above (pure)
+            state.opacity = opacity;
+            // The models' TEST (both contexts; PS2X_TEST_LOG on the route: 0x5140b
+            // for ~95% of the batches): ATE, GEQUAL, AREF 0x40, AFAIL FB_ONLY.
+            state.alphaTest = 0x140Bu;
+            const bool noMips = !native_renderer::tuning().mipmaps;
+            if (!noMips)
+            {
+                if (full)
+                    applyLod(full->lod[0], state);
+                else
+                    surfaceLod(header, surface, state);
+            }
+            if (logPasses && state.maxLod > 0.0f)
+            {
+                static std::set<uint64_t> told;
+                if (told.insert((static_cast<uint64_t>(header) << 16) | surface).second && told.size() < 30)
+                    std::fprintf(stderr, "[mip] header %08x surface %u levels %g L x%g K %g\n", header, surface, state.maxLod + 1.0f, state.lodScale, state.lodK);
+            }
+            const bool noRow = !native_renderer::tuning().textureScroll;
+            if (full && !logPasses)
+            {
+                if (!noRow && full->scroll)
+                {
+                    SOTC_READ_SITE(13);
+                    uint32_t pair, second;
+                    scrollRead(full->scroll, pair, second);
+                    state.uvOffset[0] = static_cast<float>(static_cast<int32_t>(pair & 0xFFFFu)) / 4096.0f;
+                    state.uvOffset[1] = static_cast<float>(static_cast<int32_t>(second & 0xFFFFu)) / 4096.0f;
+                }
+            }
+            else if (!noRow && surfaceRow(header, surface, state.uvOffset) && logPasses)
+            {
+                static std::set<uint64_t> told;
+                if (told.insert((static_cast<uint64_t>(header) << 16) | surface).second)
+                    std::fprintf(stderr, "[row] header %08x surface %u layer %u offset %g %g\n", header, surface, surfaceLayer(header, s, fading), state.uvOffset[0], state.uvOffset[1]);
+            }
+            if (R2Check &c = r2Check(); c.on && !full && g_frame % 600u == 0u)
+            {
+                static uint64_t lastFrame = 0;
+                if (lastFrame != g_frame)
+                {
+                    lastFrame = g_frame;
+                    std::fprintf(stderr, "[r2-check] frame %llu (old paths): %llu quick packets, %llu stale; %u garbage moves\n", (unsigned long long)g_frame,
+                                 (unsigned long long)c.packetQuick, (unsigned long long)c.packetStale, sotc_decomp::g_guestMoveSerial);
+                }
+            }
+            if (R2Check &c = r2Check(); c.on && full)
+            {
+                ++c.surfaces;
+                native_renderer::DrawState ref;
+                surfaceLod(header, surface, ref);
+                native_renderer::DrawState mine;
+                applyLod(full->lod[0], mine);
+                float row[2] = {0.0f, 0.0f};
+                surfaceRow(header, surface, row);
+                uint64_t f;
+                noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&f, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+                c.note("texture", surfaceTexture(header, surface) != full->texture);
+                c.note("blend", surfaceBlend(s) != full->blend);
+                c.note("clamp", surfaceClamp(s) != full->clamp);
+                c.note("layer", surfaceLayer(header, s, fading) != layer);
+                c.note("lod", std::memcmp(&ref.lodK, &mine.lodK, 4) || ref.lodScale != mine.lodScale || ref.maxLod != mine.maxLod);
+                c.note("row", !noRow && (row[0] != state.uvOffset[0] || row[1] != state.uvOffset[1]));
+                c.note("flags", f != full->flags || word(s + 0x1Cu) != full->texMode);
+                c.note("drawn", !surfaceDrawn(s));
+                if (full->texMode == 2u)
+                {
+                    native_renderer::DrawState ref2, mine2;
+                    surfaceLod(header, surface, ref2, 0x3Cu);
+                    applyLod(full->lod[1], mine2);
+                    c.note("texture2", surfaceTexture(header, surface, 0x3Cu) != full->texture2);
+                    c.note("blend2", surfaceBlend(s, 0x43u) != full->blend2);
+                    c.note("clamp2", surfaceClamp(s, 0x09u) != full->clamp2);
+                    c.note("lod2", std::memcmp(&ref2.lodK, &mine2.lodK, 4) || ref2.lodScale != mine2.lodScale || ref2.maxLod != mine2.maxLod);
+                }
+                if (g_frame % 600u == 0u)
+                {
+                    static uint64_t lastFrame = 0;
+                    if (lastFrame != g_frame)
+                    {
+                        lastFrame = g_frame;
+                        std::fprintf(stderr, "[r2-check] frame %llu: %llu surface draws checked, %llu mismatches; %llu quick textures, %llu stale; "
+                                     "%llu quick packets, %llu stale; %u garbage moves\n",
+                                     (unsigned long long)g_frame, (unsigned long long)c.surfaces, (unsigned long long)c.surfaceMismatches,
+                                     (unsigned long long)c.texQuick, (unsigned long long)c.texStale, (unsigned long long)c.packetQuick,
+                                     (unsigned long long)c.packetStale, sotc_decomp::g_guestMoveSerial);
+                    }
+                }
+            }
+            const int idFrom = env.idFrom; // SOTC_NATIVE_IDCOLOR
+            if (idFrom && (idFrom == 1 || static_cast<int>(state.order) >= idFrom) && state.blend != native_renderer::Blend::Additive) // glows keep their look
+            {
+                uint32_t h = (header ^ (surface * 0x9E37u)) * 2654435761u;
+                h ^= h >> 13;
+                state.debugColour = (h & 0xFFFFFFu) | 0x101010u;
+                state.blend = native_renderer::Blend::Opaque;
+                static std::set<uint64_t> told;
+                if (told.insert((static_cast<uint64_t>(header) << 16) | surface).second)
+                    std::fprintf(stderr, "[native-id] %06x header %08x layer %u blend %d tex %08llx surface %u flags %08x\n", state.debugColour & 0xFFFFFFu, header, state.order,
+                                 static_cast<int>(surfaceBlend(s)), static_cast<unsigned long long>(state.texture), surface, word(s + 0x18u));
+            }
+            state.background = state.order == 1u;            // the sky
+            // Its GIF tag (+0xd0, PRE: PRIM in bits 47-57): FGE, bit 5 of
+            // PRIM, set on the far scenery, not on the sky (round 65e).
+            if (state.background)
+            {
+                const uint32_t tagHi = word(s + 0xD4u);
+                state.backgroundFge = ((tagHi >> 14) & 1u) != 0u && ((tagHi >> 20) & 1u) != 0u;
+            }
+            if ((state.background || state.order == 18u) && ps2_stats::bloomLogNow()) // SOTC_BLOOM_LOG: the layer-1 (and 18) models of the frame
+            {
+                std::string regs;
+                char item[40];
+                for (uint32_t q = s + 0x20u; q < s + 0x100u; q += 16u)
+                    if ((word(q + 8u) & 0xFFu) == 0x06u || (word(q + 8u) & 0xFFu) == 0x42u)
+                    {
+                        std::snprintf(item, sizeof(item), " %02x:%08x%08x", word(q + 8u) & 0xFFu, word(q + 4u), word(q));
+                        regs += item;
+                    }
+                std::fprintf(stderr, "[bloom:game] f=%llu layer-1/18 model header %08x surface %u tex %llx fading %d info %d flags %08x regs%s tags c0 %08x%08x d0 %08x%08x\n",
+                             (unsigned long long)ps2_stats::vif1Chains.load(std::memory_order_relaxed), header, surface, (unsigned long long)state.texture,
+                             fading ? 1 : 0, info ? 1 : 0, word(s + 0x18u), regs.c_str(), word(s + 0xC4u), word(s + 0xC0u), word(s + 0xD4u), word(s + 0xD0u));
+            }
+            // Flag bit 17 (drawn only while 0x1186290 bit 0 is set): modelDisp
+            // binds bossDeathEffectBegin's mask instead (setBossEffectTexture):
+            // no texture transfer, so no ROW scroll; TEX1 linear without mips,
+            // ALPHA 0x44 (normal), TEST without the alpha cut.
+            uint64_t bossMask = 0;
+            if (bossMaskOn() && (((full ? full->flags : [&] { uint64_t f; noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&f, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8); return f; }()) >> 17) & 1u))
+            {
+                bossMask = bossMaskTexture();
+                if (!bossMask)
+                    return;
+                if (!state.debugColour)
+                {
+                    state.texture = bossMask;
+                    state.blend = native_renderer::Blend::Normal;
+                }
+                state.maxLod = 0.0f;
+                state.lodK = 0.0f;
+                state.lodScale = 1.0f;
+                state.uvOffset[0] = state.uvOffset[1] = 0.0f;
+            }
+            const bool logMat = env.logMat;
+            if (logMat && k == 0u)
+            {
+                static int n = 0;
+                const uint32_t own = word(instance + 0xCu), ret = word(own + 4u);
+                if (n++ < 200 && (word(ret) & 0xFFFFu) == 5u)
+                    std::fprintf(stderr, "[mat] layer %u header %08x mine %g %g %g %g | %g %g %g %g || vu %g %g %g %g | %g %g %g %g\n", state.order, header,
+                                 clip[0], clip[1], clip[3], clip[12], clip[5], clip[13], clip[14], clip[15],
+                                 real(ret + 16u), real(ret + 20u), real(ret + 28u), real(ret + 64u), real(ret + 36u), real(ret + 68u), real(ret + 72u), real(ret + 76u));
+            }
+            state.fogged = false; // zFog is a pass over the picture (layer 4), as the game does it
+            if (known ? e->lit : g_litPackets.count(id))
+            {
+                // The instance's lights (its own 15 qwords, unpacked to VU1
+                // 0x3d8): the light matrix, then colours and ambient; read
+                // once for the instance's draws.
+                state.lit = true;
+                if (!haveLights)
+                {
+                    for (uint32_t i = 0; i < 32u; ++i)
+                        lights[i] = job.lights[i];
+                    haveLights = true;
+                }
+                std::memcpy(state.light, lights, sizeof(lights));
+                if (posed) // skinned: its lights are in camera space
+                {
+                    std::memcpy(g_viewLights, state.light, sizeof(g_viewLights));
+                    g_haveViewLights = true;
+                }
+            }
+            state.reflectionSource = layer == 12u || layer == 13u;
+            // Reflecting surfaces (the water): the world's TEST (0x5140b: AREF 0x40,
+            // AFAIL FB_ONLY) keeps their colour but not their Z, their vertex alpha
+            // being 0x20; the splash rings drawn after on the surface stay visible.
+            if (((full ? static_cast<uint32_t>(full->flags) : word(s + 0x18u)) & 0x2200u) == 0x2200u)
+                state.noDepthWrite = true;
+            const bool twoTextures = (full ? full->texMode : word(s + 0x1Cu)) == 2u && !posed && !state.debugColour;
+            // SOTC_LOG_HEADER=<hex> (debugging, round 38): that model's surfaces as drawn.
+            static const uint32_t logHeader = std::getenv("SOTC_LOG_HEADER") ? static_cast<uint32_t>(std::strtoul(std::getenv("SOTC_LOG_HEADER"), nullptr, 16)) : 0u;
+            if (logHeader && header == logHeader && g_frame % 30u == 0u)
+                std::fprintf(stderr, "[header] frame %llu surface %u texMode %u posed %d lit %d blend %d layer %u ALPHA_2 %d tex2 %llx\n", (unsigned long long)g_frame, surface,
+                             full ? full->texMode : word(s + 0x1Cu), posed ? 1 : 0, state.lit ? 1 : 0, (int)state.blend, layer,
+                             (int)surfaceBlend(s, 0x43u), (unsigned long long)surfaceTexture(header, surface, 0x3Cu));
+            if (twoTextures)
+                state.writeDepth = true;
+            uint64_t sflags;
+            if (full)
+                sflags = full->flags;
+            else
+                noteRead((s + 0x18u) & ~7u, 8u), std::memcpy(&sflags, g_ram + ((s + 0x18u) & 0x1FFFFF8u), 8);
+            const bool layer14 = ((sflags >> 25) & 1u) != 0;
+            const bool reflective = (layer14 || (sflags & 0x2200u) == 0x2200u) && !noReflect && !state.debugColour;
+            if (runs && e && e->resolved && !posed && !twoTextures && !reflective && info && info->texMode != 2u && mesh == id)
+            {
+                // The first packet of a run (planPackets adds the next ones).
+                g_planRun.flush();
+                g_planRun.n = 1;
+                g_planRun.s = s;
+                g_planRun.lit = state.lit;
+                g_planRun.transform = transform;
+                g_planRun.state = state;
+                g_planRun.ids.assign(1u, mesh);
+                ++g_frameDraws;
+                ++g_modelDraws;
+                hs.draws += hs.on;
+                return;
+            }
+            g_planRun.flush();
+            native_renderer::draw(mesh, transform, state);
+            ++g_frameDraws;
+            ++g_modelDraws;
+            hs.draws += hs.on;
+            if (twoTextures)
+            {
+                // The microcode draws the batch again with the second texture
+                // and coordinates, blended by ALPHA_2 (context 2).
+                native_renderer::DrawState second = state;
+                second.texture = full ? full->texture2 : surfaceTexture(header, surface, 0x3Cu);
+                second.uvOffset[0] = second.uvOffset[1] = 0.0f; // the second pair takes ROW z / w (0)
+                second.maxLod = 0.0f;
+                if (!noMips)
+                {
+                    if (full)
+                        applyLod(full->lod[1], second);
+                    else
+                        surfaceLod(header, surface, second, 0x3Cu);
+                }
+                second.blend = full ? full->blend2 : surfaceBlend(s, 0x43u);
+                second.clamp = full ? full->clamp2 : surfaceClamp(s, 0x09u);
+                if (bossMask)
+                {
+                    // context 2 gets the same mask, ALPHA_2 0x44, TEX1_2 0x60
+                    second.texture = bossMask;
+                    second.blend = native_renderer::Blend::Normal;
+                    second.maxLod = 0.0f;
+                }
+                second.writeDepth = false;
+                second.overlay = true;
+                native_renderer::draw(id ^ (1ull << 61), transform, second);
+                ++g_frameDraws;
+            }
+            // Reflecting surfaces (flags 0x2200, modelDisp): their pass packet
+            // (header +0x14 [1] + s x 0x40 + 0x20, a CALL to the constants
+            // unpacked to VU 0x3f3) and their vertices again, in layer 9
+            // (microcode 2) over waterRefractionBegin's blurred copy and in
+            // layer 15 (microcode 1) over reflectionBegin's rippled mirror;
+            // surfaces with bit 25 go to layer 14 instead (unrippled mirror,
+            // ALPHA 0x8000000064: written as is).
+            if (reflective)
+            {
+                const uint32_t rec = word(word(header + 0x14u) + 4u) + surface * 0x40u + 0x20u;
+                const uint32_t data = word(rec + 4u); // CALL target: its VU constants
+                native_renderer::DrawState refl = state;
+                refl.reflectionSource = false;
+                refl.reflectionSample = true;
+                refl.overlay = true;
+                refl.writeDepth = false;
+                refl.lit = false;
+                refl.maxLod = 0.0f;
+                refl.blend = native_renderer::Blend::Normal;
+                refl.order = layer14 ? 14u : 15u;
+                // Microcode 1 (VU1 image 98a396b7, routine 0x648): ST from the
+                // screen position, RGB the vertex colour as is, alpha = vertex
+                // alpha x (VU 0x3f3 w / 128) x (0.2 + 0.8 (1 - |n . v|)), v the
+                // normalised camera-space position, n the model's up axis in
+                // camera space (VU 972-975, the part's model-view matrix).
+                refl.fresnel = true;
+                const float *mv = nullptr;
+                float modelView[16];
+                if (transform == clip && invert4(projection, modelView))
+                {
+                    float m[16];
+                    for (int c = 0; c < 4; ++c)
+                        for (int r = 0; r < 4; ++r)
+                        {
+                            float sum = 0.0f;
+                            for (int k = 0; k < 4; ++k)
+                                sum += modelView[k * 4 + r] * clip[c * 4 + k];
+                            m[c * 4 + r] = sum;
+                        }
+                    std::memcpy(modelView, m, sizeof(m));
+                    mv = modelView;
+                }
+                static const float identity4[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+                std::memcpy(refl.light, mv ? mv : identity4, 16 * sizeof(float));
+                const float tintAlpha = env.tintAlpha;
+                refl.reflectionTint[0] = refl.reflectionTint[1] = refl.reflectionTint[2] = 1.0f;
+                refl.reflectionTint[3] = std::clamp(real(data + 0x3Cu) / 128.0f, 0.0f, 2.0f) * tintAlpha;
+                // reflectionBegin's ripple: the mirror copied to fbp + 0x20 in 32
+                // bands of 8 rows, band i shifted by (sin(2 (12 i + t) x 24 pi / H)
+                // + 1) (0.8 x 8 i / H + 0.2) texels, t = *0x118c030 (+0.1 x the
+                // frame step), H = *0x1192090.
+                refl.mirrorRipple[0] = job.ripple[0];
+                refl.mirrorRipple[1] = job.ripple[1];
+                if (layer14)
+                {
+                    refl.mirrorRipple[1] = 0.0f;
+                    refl.blend = native_renderer::Blend::Opaque;
+                }
+                native_renderer::draw(mesh, transform, refl);
+                ++g_frameDraws;
+                // Microcode 2 in layer 9: the copy's colour as is (RGB 128), the
+                // vertex alpha under PABE (below 0x80 not blended): opaque.
+                const bool noRefract = !native_renderer::tuning().refraction;
+                const float refractAlpha = env.refractAlpha;
+                if (!noRefract && !layer14)
+                {
+                    native_renderer::DrawState refr = refl;
+                    refr.reflectionSample = false;
+                    refr.refractionSample = true;
+                    refr.fresnel = false;
+                    refr.blend = native_renderer::Blend::Normal;
+                    refr.order = 9;
+                    refr.reflectionTint[0] = refr.reflectionTint[1] = refr.reflectionTint[2] = 1.0f;
+                    refr.reflectionTint[3] = refractAlpha;
+                    const bool showRefraction = env.showRefraction; // debugging: where it lands, in red
+                    if (showRefraction)
+                    {
+                        refr.reflectionTint[0] = 4.0f;
+                        refr.reflectionTint[1] = refr.reflectionTint[2] = 0.0f;
+                    }
+                    native_renderer::draw(mesh, transform, refr);
+                    ++g_frameDraws;
+                }
+            }
+        };
+        // The packet list as the game has it (no plan).
+        const auto walkPackets = [&]
+        {
+            for (uint32_t k = 0; k < count; ++k)
+            {
+                const uint32_t pk = packets + k * 32u;
+                if (word(pk) == 0u)
+                    break;
+                hs.packets += hs.on;
+                if (g_prefetch)
+                {
+                    // The next packets' memo lines (the tags two ahead, the entry
+                    // and the surface's state one ahead), the next draw's lines.
+                    const uint32_t next = pk + 32u;
+                    if (word(next) != 0u)
+                    {
+                        if (word(next + 32u) != 0u)
+                            g_packetMemo.prefetch(word(next + 48u), false);
+                        g_packetMemo.prefetch(word(next + 16u), true);
+                        __builtin_prefetch(&g_surfaceInfo[surfaceSlot(word(header + 0x50u) + word(next + 8u) * 0x120u)]);
+                    }
+                    if (!onWorker) // the game thread's queue
+                        g_prefetchQueue.pump(2u);
+                }
+                if (word(pk + 4u) != lod)
+                    continue;
+                hs.lodPackets += hs.on;
+                const uint32_t part = word(pk + 12u);
+                if (partCulled && part != 0xFFFFFFFFu && part < partVisible.size() && partVisible[part] == 1u)
+                    continue;
+                const uint32_t surface = word(pk + 8u), s = word(header + 0x50u) + surface * 0x120u;
+                SurfaceInfo *info = memo ? &surfaceInfo(header, s) : nullptr;
+                if (info ? !surfaceDrawnFlags(info->flags) : !surfaceDrawn(s))
+                    continue;
+                if (hs.on)
+                    ++hs.surfaces, hs.surfaceSet.insert(s);
+                const uint32_t size = word(pk), data = word(pk + 16u);
+                uint64_t id;
+                {
+                    SOTC_PROF_SCOPE(kHookPacketId);
+                    id = packetId(data, size, fast);
+                }
+                drawPacket(k, surface, s, info, size, data, id, g_packetChangedInPlace, nullptr);
+            }
+        };
+        // The plan's packets: the same tests, the id kept while packetId
+        // would keep it without looking (drawn the frame before, not its
+        // stagger frame, not rewritten in place).
+        ModelPlan *plan = job.plan;
+        const auto planPackets = [&]
+        {
+            SOTC_READ_SITE(14);
+            const size_t n = plan->pk.size();
+            for (size_t k = 0; k < n; ++k)
+            {
+                PlanPacket &e = plan->pk[k];
+                if (hs.on)
+                    ++hs.packets, ++hs.lodPackets;
+                if (g_prefetch)
+                {
+                    if (k + 1u < n)
+                        __builtin_prefetch(&g_surfaceInfo[plan->pk[k + 1u].slot]);
+                    if (!onWorker) // the game thread's queue
+                        g_prefetchQueue.pump(2u);
+                }
+                if (planStatsOn())
+                {
+                    ++g_planStats.visited;
+                    const bool culled = partCulled && e.part != 0xFFFFFFFFu && e.part < partVisible.size() && partVisible[e.part] == 1u;
+                    if (k == 0u || plan->pk[k - 1u].part != e.part)
+                        ++g_planStats.partRuns, g_planStats.partRunsSkipped += culled;
+                    g_planStats.partSkipped += culled;
+                }
+                if (partCulled && e.part != 0xFFFFFFFFu && e.part < partVisible.size() && partVisible[e.part] == 1u)
+                    continue;
+                SurfaceInfo *info = &g_surfaceInfo[e.slot];
+                if (!(info->s == e.s && info->header == header && info->frame == g_frame))
+                    info = &surfaceInfo(header, e.s);
+                if (!surfaceDrawnFlags(info->flags))
+                {
+                    if (planStatsOn())
+                        ++g_planStats.surfaceSkipped;
+                    continue;
+                }
+                if (hs.on)
+                    ++hs.surfaces, hs.surfaceSet.insert(e.s);
+                uint64_t id;
+                bool changedInPlace = false;
+                if (e.idFrame == g_frame || (!e.rewritten && e.idFrame + 1u == g_frame && ((g_frame + (e.data >> 5)) & 15u) != 0u))
+                {
+                    id = e.id;
+                    ++g_planStats.trusted;
+                }
+                else
+                {
+                    {
+                        SOTC_PROF_SCOPE(kHookPacketId);
+                        id = packetId(e.data, e.size, true);
+                    }
+                    changedInPlace = g_packetChangedInPlace;
+                    e.rewritten = g_packetRewritten;
+                    if (id != e.id)
+                    {
+                        e.id = id;
+                        e.resolved = false;
+                    }
+                    ++g_planStats.asked;
+                }
+                e.idFrame = g_frame;
+                if (g_planRun.n && runs && e.resolved && e.ready && !e.skinned && e.s == g_planRun.s && e.lit == g_planRun.lit && id == e.id && !changedInPlace)
+                {
+                    // The run's draw, for this packet's mesh too.
+                    g_planRun.ids.push_back(id);
+                    ++g_planRun.n;
+                    ++g_frameDraws;
+                    ++g_modelDraws;
+                    hs.draws += hs.on;
+                    if (planStatsOn())
+                        ++g_planStats.drawn;
+                    continue;
+                }
+                if (planStatsOn())
+                    ++g_planStats.drawn;
+                drawPacket(static_cast<uint32_t>(k), e.surface, e.s, info, e.size, e.data, id, changedInPlace, &e);
+            }
+            g_planRun.flush();
+        };
+        // SOTC_PLAN_VERIFY=<n>: every n-th frame the old walk too, dry, and
+        // the two lists of draw hashes compared.
+        const bool verify = plan && g_planVerify && g_frame % g_planVerify == 0u && !native_renderer::drawTap();
+        if (!verify)
+        {
+            if (plan)
+                planPackets();
+            else
+                walkPackets();
+            return;
+        }
+        static std::vector<uint64_t> fromPlan, fromWalk;
+        fromPlan.clear();
+        fromWalk.clear();
+        native_renderer::setDrawTap(&fromPlan);
+        planPackets();
+        native_renderer::setDrawTap(&fromWalk);
+        native_renderer::setDrawTapOnly(true);
+        walkPackets();
+        native_renderer::setDrawTapOnly(false);
+        native_renderer::setDrawTap(nullptr);
+        PlanStats &ps = g_planStats;
+        ++ps.checks;
+        ps.draws += fromWalk.size();
+        size_t differ = fromPlan.size() != fromWalk.size() ? 1u : 0u;
+        ps.countDiffer += differ;
+        for (size_t i = 0; i < std::min(fromPlan.size(), fromWalk.size()); ++i)
+            differ += fromPlan[i] != fromWalk[i];
+        ps.differ += differ;
+        if (differ && ps.differ < 40u)
+            std::fprintf(stderr, "[plan-verify] frame %llu instance %08x header %08x lod %u: %zu draws (plan) / %zu (walk), %zu differ\n",
+                         (unsigned long long)g_frame, instance, header, lod, fromPlan.size(), fromWalk.size(), differ);
+    }
+}
+
+// Round 61 (SOTC_MDS_TRACE=1, debugging): who reads what modelDispState
+// writes, and how soon after a model hook: the layer cache's users
+// (modelSetSurface, modelResetSurface and the four model functions that
+// read *0x118bfc8), setShadowEffect's flag (0x1186294) and the VU0 CLIP
+// register's guest users, each counted as it comes after model hooks.
+namespace mdstrace
+{
+    enum : int { kClip, kCache, kShadow, kKinds };
+    const char *const kKindNames[kKinds] = {"clip", "cache", "shadow"};
+    struct Fn
+    {
+        uint32_t address;
+        int kind;
+        const char *name;
+    };
+    const Fn kFns[] = {
+        {0x01087260u, kClip, "clipBySphere"}, {0x01087300u, kClip, "clipByMinMaxCube"}, {0x011333B8u, kClip, "ClipPoint"},
+        {0x0108C9C0u, kClip, "0108C9C0"},     {0x01099C50u, kClip, "modelClipPoint"},   {0x0108D730u, kClip, "glVertexKick"},
+        {0x0108C188u, kClip, "0108C188"},     {0x010993C8u, kCache, "modelResetSurface"}, {0x01099768u, kCache, "modelSetSurface"},
+        {0x01097B70u, kCache, "01097B70"},    {0x01097D88u, kCache, "01097D88"},        {0x01099828u, kCache, "01099828"},
+        {0x01097928u, kCache, "01097928"},    {0x010871C8u, kShadow, "setShadowEffect"}, {0x01085E40u, kShadow, "bossDeathEffectEnd"},
+    };
+    constexpr int kFnCount = sizeof(kFns) / sizeof(kFns[0]);
+    PS2Runtime::RecompiledFunction g_orig[kFnCount] = {};
+    bool g_on = false;
+    uint64_t g_models = 0, g_calls[kFnCount] = {}, g_after[kFnCount] = {}, g_joins[kKinds] = {};
+    uint32_t g_since = 0; // model hooks since the last reader of any kind
+    bool g_pending[kKinds] = {};
+    uint64_t g_frames = 0, g_lastFrame = 0;
+    void model()
+    {
+        ++g_models;
+        ++g_since;
+        for (bool &p : g_pending)
+            p = true;
+    }
+    void report()
+    {
+        if (!g_on || sotc_native::g_frame == g_lastFrame)
+            return;
+        g_lastFrame = sotc_native::g_frame;
+        if (++g_frames % 600u != 0u)
+            return;
+        std::string line = "[mdstrace] 600 frames: model hooks " + std::to_string(g_models);
+        for (int k = 0; k < kKinds; ++k)
+            line += std::string(", ") + kKindNames[k] + " joins " + std::to_string(g_joins[k]);
+        line += " | calls (after a hook):";
+        for (int i = 0; i < kFnCount; ++i)
+            if (g_calls[i])
+                line += std::string(" ") + kFns[i].name + " " + std::to_string(g_calls[i]) + " (" + std::to_string(g_after[i]) + ")";
+        std::fprintf(stderr, "%s\n", line.c_str());
+        g_models = 0;
+        std::fill(std::begin(g_calls), std::end(g_calls), 0ull);
+        std::fill(std::begin(g_after), std::end(g_after), 0ull);
+        std::fill(std::begin(g_joins), std::end(g_joins), 0ull);
+    }
+    template <int I>
+    void wrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++g_calls[I];
+        const int kind = kFns[I].kind;
+        if (g_pending[kind])
+        {
+            ++g_after[I];
+            ++g_joins[kind];
+            g_pending[kind] = false;
+        }
+        g_orig[I](rdram, ctx, runtime);
+    }
+    template <int... I>
+    void installAll(PS2Runtime &runtime, std::integer_sequence<int, I...>)
+    {
+        ((runtime.hasFunction(kFns[I].address) ? (g_orig[I] = runtime.lookupFunction(kFns[I].address), runtime.registerFunction(kFns[I].address, wrap<I>), 0) : 0),
+         ...);
+    }
+    void install(PS2Runtime &runtime)
+    {
+        g_on = ps2_diag::env("SOTC_MDS_TRACE") != nullptr;
+        if (g_on)
+            installAll(runtime, std::make_integer_sequence<int, kFnCount>{});
+    }
+}
+
+// Round 61: the guest code that can see what modelDispState's lane writes
+// joins the lane first (sotc_native mdslane: the CLIP register's readers,
+// the layer cache's and setShadowEffect's flag's users, modelDisp's walk).
+namespace mdsjoin
+{
+    struct Fn
+    {
+        uint32_t address;
+        int site;
+    };
+    constexpr int kClip = 0, kCache = 1, kShadow = 2; // mdslane::kJClip / kJCache / kJShadow
+    const Fn kFns[] = {
+        {0x01087260u, kClip},  {0x01087300u, kClip},  {0x011333B8u, kClip},  {0x0108C9C0u, kClip},  {0x0108C188u, kClip},
+        {0x01099A08u, kClip},  {0x01099BA8u, kClip},  {0x01099BC0u, kClip},  {0x010993C8u, kCache}, {0x01099768u, kCache},
+        {0x01097B70u, kCache}, {0x01097D88u, kCache}, {0x01099828u, kCache}, {0x01097928u, kCache}, {0x01097A68u, kCache},
+        {0x010871C8u, kShadow}, {0x01085E40u, kShadow},
+    };
+    constexpr int kFnCount = sizeof(kFns) / sizeof(kFns[0]);
+    PS2Runtime::RecompiledFunction g_orig[kFnCount] = {};
+    template <int I>
+    void wrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        sotc_native::mdslane::join(kFns[I].site);
+        g_orig[I](rdram, ctx, runtime);
+    }
+    template <int... I>
+    void installAll(PS2Runtime &runtime, std::integer_sequence<int, I...>)
+    {
+        ((runtime.hasFunction(kFns[I].address) ? (g_orig[I] = runtime.lookupFunction(kFns[I].address), runtime.registerFunction(kFns[I].address, wrap<I>), 0) : 0),
+         ...);
+    }
+}
+
+namespace decomp_collcensus
+{
+    void install(PS2Runtime &runtime);
+}
+namespace decomp_readcensus
+{
+    void install(PS2Runtime &runtime);
+}
+namespace decomp_tex64
+{
+    void install(PS2Runtime &runtime);
+}
+// After sotc_decomp::install (the natives at these addresses wrapped too).
+void installSotcNativeLate(PS2Runtime &runtime)
+{
+    decomp_collcensus::install(runtime); // round 63, SOTC_COLL_CENSUS=1
+    decomp_readcensus::install(runtime); // round 64, SOTC_READ_CENSUS=<subsystem> (the Mac)
+    decomp_tex64::install(runtime);      // round 64: texReset's loop's join sites
+    sotc_worker::install(runtime);       // round 91: the guest worker's join sites (the particle / wind module, the loader, the heap's moves)
+    char104::install(runtime);           // round 104: the characters' census (SOTC_CHAR104_LOG)
+    if (std::getenv("SOTC_NATIVE") && runtime.hasFunction(sotc_native::kModelDisp))
+        mdsjoin::installAll(runtime, std::make_integer_sequence<int, mdsjoin::kFnCount>{});
+    mdstrace::install(runtime);
+}
+namespace sotc_native
+{
+    bool mdsTraceOn() { return mdstrace::g_on; }
+    void mdsTraceModel() { mdstrace::model(); }
+    void mdsTraceFrame() { mdstrace::report(); }
+}
+
+void installSotcNative(PS2Runtime &runtime)
+{
+    using namespace sotc_native;
+    if (!std::getenv("SOTC_NATIVE") || !runtime.hasFunction(kModelDisp) || !runtime.hasFunction(kGetCameraContext))
+        return;
+    if (!native_renderer::available())
+    {
+        std::cerr << "[sotc:native] no native renderer on this platform" << std::endl;
+        return;
+    }
+    g_runtimeForLog = &runtime;
+    if (ps2_diag::env("SOTC_HOOK_ORDER_CHECK"))
+        native_renderer::setDrawCheck(hookjobs::drawOrderCheck);
+    if (ps2x::iop::audio_stats::level() && runtime.hasFunction(0x001B0FC0u) && runtime.hasFunction(0x001B1138u))
+    {
+        g_sendMsg = runtime.lookupFunction(0x001B0FC0u);
+        runtime.registerFunction(0x001B0FC0u, sendMsgHook);
+        g_recvMsg = runtime.lookupFunction(0x001B1138u);
+        runtime.registerFunction(0x001B1138u, recvMsgHook);
+    }
+    g_modelDisp = runtime.lookupFunction(kModelDisp);
+    runtime.registerFunction(kModelDisp, modelDispHook);
+    sotc_decomp::g_beforeGuestMove = [] { sotc_native::hookJoin(hookjobs::k_move); }; // the jobs' memos by address
+    g_getCameraContext = sotc_decomp::behindHook(runtime, kGetCameraContext); // its native when registered (round 42)
+    runtime.registerFunction(kGetCameraContext, getCameraContextHook);
+    if (runtime.hasFunction(kGsReg) && runtime.hasFunction(kTexTransRequest) && runtime.hasFunction(kPushLayer) && runtime.hasFunction(kPopLayer))
+    {
+        g_gsReg = sotc_decomp::behindHook(runtime, kGsReg); // its native when registered (round 44)
+        runtime.registerFunction(kGsReg, gsRegHook);
+        g_texTransRequest = sotc_decomp::behindHook(runtime, kTexTransRequest); // its native when registered (round 48)
+        runtime.registerFunction(kTexTransRequest, texTransRequestHook);
+        g_pushLayer = sotc_decomp::behindHook(runtime, kPushLayer);
+        runtime.registerFunction(kPushLayer, pushLayerHook);
+        g_popLayer = sotc_decomp::behindHook(runtime, kPopLayer);
+        runtime.registerFunction(kPopLayer, popLayerHook);
+        if (runtime.hasFunction(kGlEnd))
+        {
+            g_glEnd = runtime.lookupFunction(kGlEnd);
+            runtime.registerFunction(kGlEnd, glEndHook);
+        }
+    }
+    if (runtime.hasFunction(kSpriteTexFast))
+    {
+        g_spriteTexFast = runtime.lookupFunction(kSpriteTexFast);
+        runtime.registerFunction(kSpriteTexFast, spriteTexFastHook);
+    }
+    if (runtime.hasFunction(kShadowDisp))
+    {
+        g_shadowDisp = runtime.lookupFunction(kShadowDisp);
+        runtime.registerFunction(kShadowDisp, shadowDispHook);
+    }
+    if (runtime.hasFunction(kPtclEnv) && runtime.hasFunction(kPtclVtx))
+    {
+        g_ptclEnv = runtime.lookupFunction(kPtclEnv);
+        runtime.registerFunction(kPtclEnv, ptclEnvHook);
+        g_ptclVtx = runtime.lookupFunction(kPtclVtx);
+        runtime.registerFunction(kPtclVtx, ptclVtxHook);
+        g_ptclMat = runtime.lookupFunction(kPtclMat);
+        runtime.registerFunction(kPtclMat, ptclMatHook);
+    }
+    if (runtime.hasFunction(kScreenBlur))
+    {
+        g_screenBlur = runtime.lookupFunction(kScreenBlur);
+        runtime.registerFunction(kScreenBlur, screenBlurHook);
+    }
+    if (runtime.hasFunction(kMeshDisp))
+    {
+        g_meshDisp = runtime.lookupFunction(kMeshDisp);
+        runtime.registerFunction(kMeshDisp, meshDispHook);
+        // At each display list's kick: the skinned parts as its DMA reads them
+        // (skinAtKick), and the debugging checks.
+        ps2_stats::kickHook = []
+        {
+            // Round 34 (SOTC_KICK_DEFER): no join; the kick's palettes copied
+            // and its skinned pass a job behind the frame's model jobs, joined
+            // at the next frame's first hook.
+            if (hookjobs::g_on && sotc_native::g_kickDefer && !sotc_native::g_staleCheck && !sotc_native::g_kickMustJoin)
+            {
+                if (sotc_native::g_skinAtKick && !sotc_native::g_kickOwns.empty())
+                {
+                    using sotc_native::kKickJobs;
+                    // Its copies' buffer free (kicks without a hook between them: a load's).
+                    if (sotc_native::g_kickPushed - sotc_native::g_kickDone.load(std::memory_order_acquire) >= kKickJobs)
+                        sotc_native::hookJoin(hookjobs::k_kick);
+                    const uint32_t k = sotc_native::g_kickPushed++ % kKickJobs;
+                    sotc_native::kickCopy(sotc_native::g_kickJobs[k]);
+                    sotc_native::HookJob &job = hookjobs::next();
+                    job.kind = sotc_native::kJobKick;
+                    job.kick = k;
+                    hookjobs::push();
+                }
+#if !defined(__vita__) && !defined(__SWITCH__)
+                if (hookjobs::g_deferCheck)
+                    hookjobs::deferCheckKick();
+#endif
+                return;
+            }
+            // The frame's model jobs done before the game goes on to the next
+            // frame's logic (and skinAtKick reads their records).
+            if (hookjobs::g_on && sotc_native::g_kickDefer && sotc_native::g_kickMustJoin)
+                ++sotc_native::g_kickJoined;
+            sotc_native::hookJoin(hookjobs::k_kick);
+            if (sotc_native::g_staleCheck)
+            {
+                sotc_native::staleCompare("kick");
+                sotc_native::staleCompare("kick2 (the frame before's)", sotc_native::g_stalePrevious);
+            }
+            if (sotc_native::g_skinAtKick)
+                sotc_native::skinAtKick();
+        };
+    }
+    if (runtime.hasFunction(kZFog))
+    {
+        g_zFog = runtime.lookupFunction(kZFog);
+        runtime.registerFunction(kZFog, zFogHook);
+    }
+    std::cerr << "[sotc:native] models drawn by the native renderer" << std::endl;
+}
+
+#if defined(__vita__)
+// Round 55: room for vita-elf-create. It appends the module's SCE data
+// (~4.5 KB of import/export tables) to the end of the text segment, and the
+// linker puts the data segment at the next 64 KB boundary after the text:
+// when the text ends less than ~4.5 KB below a boundary the VPK build fails
+// with "Cannot allocate N bytes for SCE data at end of segment 0; segment 1
+// overlaps" (round 55's text ended 0x2e0 below one). These 8 KB of read-only
+// data move the end past it; if that message comes back after code grows or
+// shrinks, change the size (any value that moves the text end more than
+// ~4.5 KB away from the boundary below it). Round 73: 16 KB. Round 85: 24 KB.
+// Round mem99: 32 KB. Round 105 (with round 104): 40 KB. Round 120: 56 KB. Round 122: 64 KB. Round 121: SOTC_VITA_ELF_ROOM
+// overrides it (the instrumented PGO build, CMake PS2X_VITA_PGO=gen, sets its own).
+#ifndef SOTC_VITA_ELF_ROOM
+#if SOTC_RELEASE // round 130: the release build's smaller text needs more ("segment 1 overlaps" at 64 KB)
+#define SOTC_VITA_ELF_ROOM 73728
+#else
+#define SOTC_VITA_ELF_ROOM 65536
+#endif
+#endif
+extern "C" __attribute__((used)) const unsigned char sotc_vita_elf_room[SOTC_VITA_ELF_ROOM] = {1};
+#endif

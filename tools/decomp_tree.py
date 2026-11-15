@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""What is native and what is still recompiled MIPS, by area of the game:
+docs/decomp_tree.json, the rows the status dashboard draws as treemaps.
+
+Two weights per area:
+  bytes  MIPS code size (docs/decomp_status.json, tools/decomp_status.py's count)
+  time   % of the Vita game thread's instructions, from a Vita3K profile window
+         (VITA3K_PROFILE snapshots), split native / recompiled / runtime
+
+Usage:
+  tools/decomp_tree.py --profile LATE EARLY ELF THREAD [--label rNN]
+  tools/decomp_tree.py --readme      rewrite README.md's decomp block (between
+                                     the decomp:start / decomp:end comments)
+                                     from docs/decomp_tree.json and
+                                     docs/decomp_history.json
+"""
+import argparse
+import bisect
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from decomp_status import area_of, recompiled_functions, sizes, stub_functions  # noqa: E402
+
+GUEST = '(unsigned char*, R5900Context*, PS2Runtime*)'
+RUNTIME = 'Runtime (DMA walk, memory, scheduler)'
+
+
+def symbols(elf):
+    nm = os.path.expanduser('~/vitasdk/bin/arm-vita-eabi-nm')
+    out = subprocess.run([nm, '-n', '-C', '-S', '--defined-only', elf], capture_output=True, text=True).stdout
+    syms = []
+    for line in out.splitlines():
+        p = line.split(' ', 3)
+        if len(p) == 4 and p[2] in 'tTwW':
+            syms.append((int(p[0], 16) & ~1, int(p[1], 16), p[3]))
+    syms.sort()
+    return syms
+
+
+def short_name(name):
+    """A readable function name: no argument list, no lean_ prefix; a
+    recompiled one keeps its guest address."""
+    head = name.split('(')[0]
+    m = re.match(r'(?:lean_|leant_)?(\w+?)_0x([0-9a-f]+)$', head)
+    if m and '::' not in head:
+        return '%s @ %08x' % (m.group(1), int(m.group(2), 16))
+    head = re.sub(r'<[^<>]*>', '', head)
+    head = re.sub(r'\(anonymous namespace\)::', '', head)
+    return head[:80]
+
+
+def classify(name):
+    """(kind, area) of a game-thread symbol."""
+    head = name.split('(')[0]
+    m = re.match(r'(?:lean_|leant_)?(\w+?)_0x([0-9a-f]+)$', head)
+    if m and name.endswith(GUEST) and '::' not in head:
+        return 'recompiled', area_of(int(m.group(2), 16), m.group(1))
+    # The qualified name without template arguments or a return type (templated
+    # natives demangle as "void decomp_chara::charaLinksT<true>(...)").
+    q = head
+    while True:
+        r = re.sub(r'<[^<>]*>', '', q)
+        if r == q:
+            break
+        q = r
+    q = q.strip().split(' ')[-1].lstrip('*&')
+    ns = q.split('::')[0] if '::' in q else ''
+    if ns.startswith('decomp_'):
+        area = area_of(0x1000000, q, ns + '.cpp')
+        return 'native', area if area != 'Other game code' else area_of(0x1000000, q.split('::')[-1])
+    if ns == 'sotc_native':
+        return 'native', 'Display and models'
+    if ns in override_namespaces():
+        area = NATIVE_NS_AREAS.get(ns) or area_of(0x1000000, q)
+        return 'native', area
+    return 'runtime', RUNTIME
+
+
+# Natives written in their own namespaces (game/overrides), not decomp_*:
+# their area when the name alone does not say it.
+NATIVE_NS_AREAS = {'pose82': 'Characters and motion', 'char104': 'Characters and motion', 'char122': 'Characters and motion',
+                   'charlod78': 'Characters and motion', 'rest81': 'Characters and motion', 'ground85': 'Collision and physics'}
+# Namespaces in game/overrides that are glue, profiling or tooling, not decomp.
+GLUE_NS = {'sotc_decomp', 'sotc_prof', 'sotc_replay', 'sotc_worker', 'ps2_worker', 'ps2_lean', 'mdstrace', 'probe84', 'std'}
+_override_ns = None
+
+
+def override_namespaces():
+    global _override_ns
+    if _override_ns is None:
+        _override_ns = set()
+        for f in glob.glob(os.path.join(ROOT, 'game/overrides/*.cpp')) + glob.glob(os.path.join(ROOT, 'game/overrides/*.h')):
+            _override_ns |= set(re.findall(r'^namespace (\w+)', open(f, errors='replace').read(), re.M))
+        _override_ns -= GLUE_NS
+    return _override_ns
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--profile', nargs=4, metavar=('LATE', 'EARLY', 'ELF', 'THREAD'))
+    ap.add_argument('--label', default='')
+    ap.add_argument('--status', default=os.path.join(ROOT, 'docs/decomp_status.json'))
+    ap.add_argument('--out', default=os.path.join(ROOT, 'docs/decomp_tree.json'))
+    ap.add_argument('--readme', action='store_true')
+    args = ap.parse_args()
+    if args.readme:
+        write_readme(args.out)
+        return
+    if not args.profile:
+        ap.error('--profile or --readme')
+    late, early, elf, thread = args.profile
+
+    syms = symbols(elf)
+    starts = [s[0] for s in syms]
+
+    def name(a):
+        i = bisect.bisect_right(starts, a & ~1) - 1
+        if i >= 0 and a < syms[i][0] + max(syms[i][1], 2):
+            return syms[i][2]
+        return None
+
+    def load(path):
+        d = {}
+        for line in open(path):
+            q = line.split()
+            if len(q) == 4 and q[0] == thread:
+                d[q[1]] = d.get(q[1], 0) + int(q[3])
+        return d
+
+    a, b = load(late), load(early)
+    time = {}
+    per_fn = {}
+    for pc, v in a.items():
+        d = v - b.get(pc, 0)
+        if d <= 0:
+            continue
+        n = name(int(pc, 16))
+        key = classify(n) if n else ('runtime', RUNTIME)
+        time[key] = time.get(key, 0) + d
+        fkey = (key[0], key[1], short_name(n) if n else 'unknown code')
+        per_fn[fkey] = per_fn.get(fkey, 0) + d
+    total = sum(time.values()) or 1
+    top = []
+    for kind, count in (('recompiled', 40), ('native', 25), ('runtime', 15)):
+        items = sorted(((k, v) for k, v in per_fn.items() if k[0] == kind), key=lambda kv: -kv[1])[:count]
+        top += [{'kind': kind, 'area': k[1], 'name': k[2], 'time': round(100.0 * v / total, 2)} for k, v in items]
+
+    status = json.load(open(args.status))
+    rows = []
+    for area, s in status['areas'].items():
+        for kind, nbytes, nfuncs in (('native', s['native_bytes'], s['native_functions']),
+                                     ('recompiled', s['bytes'] - s['native_bytes'], s['functions'] - s['native_functions'])):
+            rows.append({'area': area, 'kind': kind, 'bytes': nbytes, 'functions': nfuncs,
+                         'time': round(100.0 * time.pop((kind, area), 0) / total, 2)})
+    for (kind, area), v in sorted(time.items()):
+        rows.append({'area': area, 'kind': kind, 'bytes': 0, 'functions': 0, 'time': round(100.0 * v / total, 2)})
+    # Drill-down lists: per area, the functions by MIPS size (code map) and
+    # the profile's functions by time (time map), largest first, the tail
+    # folded into one "n more" item.
+    funcs, size, stubs = recompiled_functions(), sizes(), stub_functions()
+    native = {int(f['address'], 16): f for f in status['native_functions']}
+    code = {}
+    for addr, fname in funcs.items():
+        nat = addr in native or addr in stubs
+        src = native[addr].get('source', '') if addr in native else ''
+        area = native[addr]['area'] if addr in native else area_of(addr, fname, src)
+        code.setdefault(area, []).append({'name': '%s @ %08x' % (fname, addr), 'kind': 'native' if nat else 'recompiled', 'bytes': size.get(addr, 0)})
+    timefn = {}
+    for (kind, area, fname), v in per_fn.items():
+        timefn.setdefault(area, []).append({'name': fname, 'kind': kind, 'time': round(100.0 * v / total, 3)})
+
+    def fold(items, key, keep):
+        items.sort(key=lambda r: -r[key])
+        head, tail = items[:keep], items[keep:]
+        for kind in ('native', 'recompiled', 'runtime'):
+            rest = [r for r in tail if r['kind'] == kind]
+            if rest:
+                head.append({'name': '%d more %s functions' % (len(rest), {'native': 'native', 'recompiled': 'MIPS', 'runtime': 'runtime'}[kind]),
+                             'kind': kind, key: round(sum(r[key] for r in rest), 3), 'more': len(rest)})
+        return head
+
+    areas_out = {}
+    for area in set(code) | set(timefn):
+        areas_out[area] = {'code': fold(code.get(area, []), 'bytes', 70), 'time': fold(timefn.get(area, []), 'time', 50)}
+    out = {'updated': datetime.date.today().isoformat(), 'label': args.label, 'status_commit': status.get('commit'),
+           'note': 'bytes: MIPS code size by area (decomp_status.json); time: % of the Vita game thread instructions (Vita3K profile)',
+           'rows': rows, 'top': top, 'functions': areas_out}
+    with open(args.out, 'w') as f:
+        json.dump(out, f, indent=1)
+        f.write('\n')
+    for kind in ('native', 'recompiled', 'runtime'):
+        print('%-10s time %5.1f%%' % (kind, sum(r['time'] for r in rows if r['kind'] == kind)))
+    for r in sorted(rows, key=lambda r: -r['time'])[:12]:
+        print('  %-40s %-10s %5.2f%%  %7d bytes' % (r['area'], r['kind'], r['time'], r['bytes']))
+
+
+
+def bar(part, whole, width=12):
+    n = int(round(width * part / whole)) if whole else 0
+    return '`' + '█' * n + '░' * (width - n) + '`'
+
+
+def write_readme(tree_path):
+    tree = json.load(open(tree_path))
+    hist = json.load(open(os.path.join(ROOT, 'docs/decomp_history.json')))['entries']
+    rows = tree['rows']
+    areas = {}
+    for r in rows:
+        a = areas.setdefault(r['area'], {'native': 0, 'recompiled': 0, 'runtime': 0, 'tn': 0.0, 'tr': 0.0, 'tu': 0.0, 'fn': 0, 'ft': 0})
+        a[r['kind']] += r['bytes']
+        a['t' + {'native': 'n', 'recompiled': 'r', 'runtime': 'u'}[r['kind']]] += r['time']
+        a['ft'] += r['functions']
+        if r['kind'] == 'native':
+            a['fn'] += r['functions']
+    tn = sum(a['tn'] for a in areas.values())
+    tr = sum(a['tr'] for a in areas.values())
+    tu = sum(a['tu'] for a in areas.values())
+    out = ['<!-- decomp:start (tools/decomp_tree.py --readme writes this block) -->', '',
+           '**Game thread time on the Vita** (%s, Vita3K profile of the route):' % tree.get('label', ''), '',
+           '| | share | |', '|---|---:|---|',
+           '| Native code | %.1f%% | %s |' % (tn, bar(tn, 100, 20)),
+           '| Recompiled MIPS | %.1f%% | %s |' % (tr, bar(tr, 100, 20)),
+           '| Runtime (DMA walk, memory, scheduler, glue) | %.1f%% | %s |' % (tu, bar(tu, 100, 20)), '',
+           '<details open>', '<summary><b>By area of the game</b>: what is native and what still runs as recompiled MIPS</summary>', '',
+           '| Area | Code native | | Functions | Game thread time: native / MIPS |', '|---|---:|---|---:|---|']
+    order = sorted(areas.items(), key=lambda kv: (kv[0] == RUNTIME, -(kv[1]['tn'] + kv[1]['tr'])))
+    for name, a in order:
+        size = a['native'] + a['recompiled']
+        if not size and not a['tu']:
+            continue
+        if not size:
+            out.append('| %s | | | | %.1f%% (runtime) |' % (name, a['tu']))
+            continue
+        out.append('| %s | %.1f%% | %s | %d / %d | %.1f%% / %.1f%% |' % (
+            'Other game code (names not identified yet)' if name == 'Other game code' else name, 100.0 * a['native'] / size, bar(a['native'], size), a['fn'], a['ft'], a['tn'], a['tr']))
+    out += ['', '</details>', '']
+    pts = [e for e in hist if e.get('time') is not None]
+    out += ['<details>', '<summary><b>History</b></summary>', '',
+            '| Measured | Commit | Code native | Calls native | Game thread time native |', '|---|---|---:|---:|---:|']
+    for e in hist:
+        out.append('| %s | %s | %.2f%% | %.1f%% | %s |' % (e['date'], e.get('label') or e['commit'], e['code'], e['calls'],
+                                                       ('%.1f%%' % e['time']) if e.get('time') is not None else ''))
+    out += ['', '</details>', '']
+    if len(pts) > 2:
+        out += ['```mermaid', 'xychart-beta', '    title "Game thread time in native code (%)"',
+                '    x-axis [%s]' % ', '.join('"%s"' % e['label'] for e in pts),
+                '    y-axis "%" 0 --> 100', '    line [%s]' % ', '.join('%.1f' % e['time'] for e in pts), '```', '']
+    out.append('<!-- decomp:end -->')
+    path = os.path.join(ROOT, 'README.md')
+    text = open(path).read()
+    a, b = text.index('<!-- decomp:start'), text.index('<!-- decomp:end -->') + len('<!-- decomp:end -->')
+    open(path, 'w').write(text[:a] + '\n'.join(out) + text[b:])
+    print('README.md decomp block: %d lines' % len(out))
+
+
+if __name__ == '__main__':
+    main()

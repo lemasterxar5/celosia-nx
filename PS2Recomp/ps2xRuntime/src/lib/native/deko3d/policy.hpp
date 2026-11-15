@@ -54,6 +54,50 @@ inline size_t textureBytes(uint32_t w, uint32_t h, uint32_t levels) {
         throw std::invalid_argument("deko3d: single texture exceeds 256 MiB budget");
     return bytes;
 }
+// Model-space axis-aligned bounds of a mesh, gathered once at upload so sampled
+// frames can estimate screen coverage without reading GPU-visible memory back.
+struct MeshBounds { float lo[3]{0,0,0}, hi[3]{0,0,0}; bool valid=false; };
+inline MeshBounds meshBounds(const Vertex *vertices, uint32_t count) {
+    MeshBounds b;
+    if (!vertices || !count) return b;
+    b.lo[0]=b.hi[0]=vertices[0].x; b.lo[1]=b.hi[1]=vertices[0].y; b.lo[2]=b.hi[2]=vertices[0].z;
+    for (uint32_t i = 1; i < count; ++i) {
+        const float p[3]{vertices[i].x, vertices[i].y, vertices[i].z};
+        for (int k = 0; k < 3; ++k) { b.lo[k] = std::min(b.lo[k], p[k]); b.hi[k] = std::max(b.hi[k], p[k]); }
+    }
+    b.valid = std::isfinite(b.lo[0]) && std::isfinite(b.lo[1]) && std::isfinite(b.lo[2]) &&
+              std::isfinite(b.hi[0]) && std::isfinite(b.hi[1]) && std::isfinite(b.hi[2]);
+    return b;
+}
+// Upper-bound fraction of the screen a draw can touch: the clipped NDC bounding box of the
+// bounds' eight corners under the column-major clip matrix (c = clip * (p,1), x/w, y/w).
+// Corners at or behind the camera plane make the estimate conservative: all behind -> 0,
+// mixed -> 1 (whole screen). Screen-space draws pass their positions through unchanged.
+inline float screenCoverage(const float clip[16], const MeshBounds &b, bool screenSpace = false) {
+    if (!b.valid) return 1.0f;
+    float minX = 1, maxX = -1, minY = 1, maxY = -1;
+    unsigned behind = 0;
+    for (unsigned corner = 0; corner < 8; ++corner) {
+        const float p[3]{corner & 1 ? b.hi[0] : b.lo[0], corner & 2 ? b.hi[1] : b.lo[1], corner & 4 ? b.hi[2] : b.lo[2]};
+        float x, y, w;
+        if (screenSpace) { x = p[0]; y = p[1]; w = 1; }
+        else {
+            x = clip[0]*p[0] + clip[4]*p[1] + clip[8]*p[2] + clip[12];
+            y = clip[1]*p[0] + clip[5]*p[1] + clip[9]*p[2] + clip[13];
+            w = clip[3]*p[0] + clip[7]*p[1] + clip[11]*p[2] + clip[15];
+        }
+        if (!(w > 1e-6f) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w)) { ++behind; continue; }
+        const float nx = x / w, ny = y / w;
+        minX = std::min(minX, nx); maxX = std::max(maxX, nx);
+        minY = std::min(minY, ny); maxY = std::max(maxY, ny);
+    }
+    if (behind == 8) return 0.0f;
+    if (behind) return 1.0f;
+    minX = std::clamp(minX, -1.0f, 1.0f); maxX = std::clamp(maxX, -1.0f, 1.0f);
+    minY = std::clamp(minY, -1.0f, 1.0f); maxY = std::clamp(maxY, -1.0f, 1.0f);
+    if (maxX <= minX || maxY <= minY) return 0.0f;
+    return (maxX - minX) * (maxY - minY) * 0.25f;
+}
 inline size_t vertexBytes(uint32_t count) {
     if (!count || size_t(count) * sizeof(Vertex) > 128 * 1024 * 1024)
         throw std::invalid_argument("deko3d: empty mesh or mesh exceeds 128 MiB");

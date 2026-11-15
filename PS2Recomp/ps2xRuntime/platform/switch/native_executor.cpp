@@ -61,7 +61,7 @@ struct NativeExecutor::Impl {
     std::mutex serialized,state;
     std::function<void()> queued;
     std::exception_ptr result,infrastructureFailure;
-    bool closing=false,closed=false,outstanding=false;
+    bool closing=false,closed=false,outstanding=false,posted=false;
 
     ~Impl()
     {
@@ -133,40 +133,70 @@ struct NativeExecutor::Impl {
             waitCold();
         }
     }
+    // Hands the job to the worker under the serialized lock (caller holds it).
+    void submit(std::function<void()> job)
+    {
+        std::lock_guard lock(state);
+        if(closing || closed) throw std::logic_error("Native executor: already shut down");
+        if(infrastructureFailure) std::rethrow_exception(infrastructureFailure);
+        result=nullptr;queued=std::move(job);outstanding=true;
+        // Worker cannot claim the job until signal succeeds and this state
+        // lock is released. On failure it sees no caller-owned callback.
+        if(semaphores.signal(work)!=work) {
+            queued={};outstanding=false;throw std::runtime_error("Native executor: work signal failed");
+        }
+    }
+    // Waits for the submitted job and returns its error (caller holds the serialized lock).
+    std::exception_ptr complete()
+    {
+        const auto completion=completionWait();
+        waitForRelease();
+        std::lock_guard lock(state);
+        if(infrastructureFailure) std::rethrow_exception(infrastructureFailure);
+        const auto remaining=semaphores.poll(done);
+        if(remaining!=done && remaining!=SemaphoreSet::Empty)
+            throw std::runtime_error("Native executor: completion drain failed");
+        if(completion!=done) throw std::runtime_error("Native executor: completion wait failed");
+        return std::exchange(result,nullptr);
+    }
+    // A posted job still running (or finished, not yet collected) completes before any other
+    // call proceeds: at most one job is ever in flight, and its error reaches the next caller.
+    void collectPosted()
+    {
+        if(!posted) return;
+        posted=false;
+        if(auto error=complete()) std::rethrow_exception(error);
+    }
     void execute(std::function<void()> job)
     {
         if(threads.currentId()==worker) throw std::logic_error("Native executor: nested worker execute rejected");
         if(!job) throw std::invalid_argument("Native executor: empty job");
         std::lock_guard call(serialized);
-        {
-            std::lock_guard lock(state);
-            if(closing || closed) throw std::logic_error("Native executor: already shut down");
-            if(infrastructureFailure) std::rethrow_exception(infrastructureFailure);
-            result=nullptr;queued=std::move(job);outstanding=true;
-            // Worker cannot claim the job until signal succeeds and this state
-            // lock is released. On failure it sees no caller-owned callback.
-            if(semaphores.signal(work)!=work) {
-                queued={};outstanding=false;throw std::runtime_error("Native executor: work signal failed");
-            }
-        }
-        const auto completion=completionWait();
-        waitForRelease();
-        std::exception_ptr error;
-        {
-            std::lock_guard lock(state);
-            if(infrastructureFailure) std::rethrow_exception(infrastructureFailure);
-            const auto remaining=semaphores.poll(done);
-            if(remaining!=done && remaining!=SemaphoreSet::Empty)
-                throw std::runtime_error("Native executor: completion drain failed");
-            if(completion!=done) throw std::runtime_error("Native executor: completion wait failed");
-            error=std::exchange(result,nullptr);
-        }
-        if(error) std::rethrow_exception(error);
+        collectPosted();
+        submit(std::move(job));
+        if(auto error=complete()) std::rethrow_exception(error);
+    }
+    void post(std::function<void()> job)
+    {
+        if(threads.currentId()==worker) throw std::logic_error("Native executor: nested worker post rejected");
+        if(!job) throw std::invalid_argument("Native executor: empty job");
+        std::lock_guard call(serialized);
+        collectPosted();
+        submit(std::move(job));
+        posted=true;
+    }
+    void drain()
+    {
+        if(threads.currentId()==worker) throw std::logic_error("Native executor: nested worker drain rejected");
+        std::lock_guard call(serialized);
+        collectPosted();
     }
     void close()
     {
         if(nativeIdentity()!=owner) throw std::logic_error("Native executor: shutdown requires creator OS thread");
         std::lock_guard call(serialized);
+        // A posted job finishes (its captures released on the worker) before shutdown.
+        if(posted) {posted=false;try{(void)complete();}catch(...){}}
         {
             std::lock_guard lock(state);
             if(closed) return;
@@ -181,5 +211,7 @@ struct NativeExecutor::Impl {
 NativeExecutor::NativeExecutor() : impl(std::make_unique<Impl>()) {impl->initialize();}
 NativeExecutor::~NativeExecutor()=default;
 void NativeExecutor::execute(std::function<void()> job) {impl->execute(std::move(job));}
+void NativeExecutor::post(std::function<void()> job) {impl->post(std::move(job));}
+void NativeExecutor::drain() {impl->drain();}
 void NativeExecutor::shutdown() {impl->close();}
 }

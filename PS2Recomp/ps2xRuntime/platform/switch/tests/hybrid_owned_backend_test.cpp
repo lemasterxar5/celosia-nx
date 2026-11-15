@@ -55,6 +55,8 @@ int main()
     backend->setDepthOfField({});backend->addScreenBlur({});backend->holdFrame();
     bool rejected=false;try{backend->endFrame(512,448);}catch(const std::invalid_argument &){rejected=true;}check(rejected);
     backend->draw(1,identity,{});backend->endFrame(1280,720);
+    // endFrame hands the frame over asynchronously: finishFrames waits for it.
+    backend->finishFrames();
     check(position==7&&pixel==43&&operations>=5);
     backend->beginFrame();
     native_renderer::DrawState sky;sky.background=true;
@@ -75,7 +77,7 @@ int main()
     dynamic=backend->frameMesh(4);dynamic[0].x=23;
     indices=backend->frameMeshIndices(6,base);std::copy_n(quad,6,indices);
     backend->commitFrameMesh(4,4,6);dynamic[0].x=99;indices[0]=3;
-    backend->endFrame(1280,720);
+    backend->endFrame(1280,720);backend->finishFrames();
     check(indexedCommits==2 && committedVertices==4);
     check(committedIndices==std::vector<uint32_t>({7,8,9,9,10,7}));
     check(committedPositions==std::vector<float>({17,23}));
@@ -94,12 +96,14 @@ int main()
     invalid([&]{backend->commitFrameMesh(0,4,6);});
     backend->cancelFrameMesh();invalid([&]{backend->commitFrameMesh(5,4,6);});
     dynamic=backend->frameMesh(3);dynamic[0].x=37;backend->commitFrameMesh(5,3,0);
-    backend->draw(5,identity,{});backend->endFrame(1280,720);
+    backend->draw(5,identity,{});backend->endFrame(1280,720);backend->finishFrames();
     check(indexedCommits==3 && committedVertices==3 && committedIndices.empty());
     check(committedPositions.back()==37 && !backend->hasMesh(5));
     backend->finishFrames();std::vector<uint8_t> image;uint32_t w=0,h=0;check(!backend->latestFrame(image,w,h));
     fail=true;backend->beginFrame();backend->draw(1,identity,{});
-    bool failed=false;try{backend->endFrame(1280,720);}catch(const std::runtime_error &){failed=true;}check(failed);
+    // The asynchronous frame's failure reaches the next call that waits for it.
+    bool failed=false;try{backend->endFrame(1280,720);backend->finishFrames();}catch(const std::runtime_error &){failed=true;}check(failed);
+    rejected=false;try{backend->beginFrame();}catch(const std::runtime_error &){rejected=true;}check(rejected);
     backend.reset();check(operations>=9);
     std::unique_ptr<native_renderer::detail::Backend> capacity(native_renderer::detail::createOwnedDekoBackend([]{
         gpuThread=std::this_thread::get_id();return new Gpu;

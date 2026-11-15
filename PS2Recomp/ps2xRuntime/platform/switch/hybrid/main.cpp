@@ -20,6 +20,7 @@ namespace {constexpr const char *Root="sdmc:/switch/celosia-native-boot";}
 // from the bounded GPU resource arena and from console clock settings.
 extern "C" {u32 __nx_nv_transfermem_size=32u*1024u*1024u;}
 void prepareSwitchDiagnostics();
+extern "C" void celosia_saltynx_start(void); // saltynx_fps.cpp
 void recordSwitchTermination();
 static void recordHardwareClocks()
 {
@@ -42,6 +43,38 @@ static void recordHardwareClocks()
     }
     clkrstExit();
     if(report && std::fclose(report)!=0)std::fputs("[hardware] clock report write failed\n",stderr);
+}
+// Optional GPU clock request (diagnosis key CELOSIA_DIAG_GPU_HZ). The project's limit is 386 MHz:
+// anything above the 384 MHz step is refused, never rounded up. CPU and memory clocks are not touched.
+// The applied and read-back rates go to hardware-clocks-request.txt.
+static void requestGpuClock(const char *value)
+{
+    if(!value)return;
+    constexpr u32 MaxGpuHz=384000000u;
+    const unsigned long requested=std::strtoul(value,nullptr,10);
+    auto *report=std::fopen("sdmc:/switch/celosia-native-boot/hardware-clocks-request.txt","w");
+    if(requested==0 || requested>MaxGpuHz){
+        if(report){std::fprintf(report,"gpu_requested_hz=%lu\ngpu_request=refused_over_limit\n",requested);std::fclose(report);}
+        return;
+    }
+    Result result=clkrstInitialize();
+    u32 before=0,after=0;
+    if(R_SUCCEEDED(result)){
+        ClkrstSession session{};
+        result=clkrstOpenSession(&session,PcvModuleId_GPU,3);
+        if(R_SUCCEEDED(result)){
+            clkrstGetClockRate(&session,&before);
+            result=clkrstSetClockRate(&session,u32(requested));
+            clkrstGetClockRate(&session,&after);
+            clkrstCloseSession(&session);
+        }
+        clkrstExit();
+    }
+    std::fprintf(stderr,"[hardware] gpu request %lu: before=%u after=%u result=0x%x\n",requested,before,after,result);
+    if(report){
+        std::fprintf(report,"gpu_requested_hz=%lu\ngpu_before_hz=%u\ngpu_after_hz=%u\ngpu_request_result=0x%x\n",requested,before,after,result);
+        std::fclose(report);
+    }
 }
 int main()
 {
@@ -103,6 +136,34 @@ int main()
         setenv("SOTC_LOG76","0",1);
         setenv("PS2X_STATS","1",1); // development progression diagnostics
         setenv("PS2X_GS_HW","0",1);
+        // Optional development diagnosis: diag-env.txt lines KEY=VALUE, only CELOSIA_DIAG_* keys.
+        if(auto *file=std::fopen("diag-env.txt","rb")) {
+            std::unique_ptr<FILE,decltype(&std::fclose)> diag(file,&std::fclose);
+            char line[160];
+            while(std::fgets(line,sizeof(line),file)) {
+                line[std::strcspn(line,"\r\n")]=0;
+                char *eq=std::strchr(line,'=');
+                if(!eq || std::strncmp(line,"CELOSIA_DIAG_",13)!=0)continue;
+                *eq=0;setenv(line,eq+1,1);
+                std::printf("Diagnosis setting %s=%s\n",line,eq+1);
+            }
+        }
+        // CELOSIA_DIAG_PROF129=1: the game thread's sampling profiler (game/overrides/sotc_prof129.cpp)
+        // writes [prof129] windows to hybrid-error.log; CELOSIA_DIAG_PROF129_SECS sets the window.
+        if(const char *prof=std::getenv("CELOSIA_DIAG_PROF129"); prof && std::atoi(prof)!=0) {
+            setenv("SOTC_PROF129","1",1);
+            const char *secs=std::getenv("CELOSIA_DIAG_PROF129_SECS");
+            setenv("SOTC_PROF129_SECS",secs?secs:"15",1);
+        }
+        // CELOSIA_DIAG_FRAME_LOG=1: the native frame log (60-frame [frame] summaries plus slow frames over
+        // CELOSIA_DIAG_FRAME_SLOW_MS, default 60) in hybrid-error.log: hooks/render/present/wait/sync split.
+        if(const char *log=std::getenv("CELOSIA_DIAG_FRAME_LOG"); log && std::atoi(log)!=0) {
+            setenv("SOTC_FRAME_LOG","1",1);
+            const char *slow=std::getenv("CELOSIA_DIAG_FRAME_SLOW_MS");
+            setenv("SOTC_FRAME_SLOW_MS",slow?slow:"60",1);
+        }
+        requestGpuClock(std::getenv("CELOSIA_DIAG_GPU_HZ"));
+        celosia_saltynx_start();
         auto runtime=std::make_unique<PS2Runtime>();
         if(!runtime->initialize("Celosia Switch | deko3d"))throw std::runtime_error("Runtime initialization failed");
         // Development profile: keep native scene geometry/materials and vertex

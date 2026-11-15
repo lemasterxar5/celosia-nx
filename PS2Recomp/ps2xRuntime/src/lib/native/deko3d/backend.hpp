@@ -6,8 +6,12 @@
 #include "frame_rate.hpp"
 #include "pipeline.hpp"
 #include "gpu_timing.hpp"
+#include "gpu_segments.hpp"
+#include "descriptor_slots.hpp"
+#include <chrono>
 #include <array>
 #include <unordered_map>
+#include <vector>
 
 namespace native_renderer::detail::deko {
 constexpr uint32_t Width = 1280, Height = 720, Frames = 3;
@@ -17,11 +21,24 @@ struct Mesh {
     uint32_t vertexOffset = 0, indexOffset = 0;
     uint8_t minAlpha = 0;
     bool transient = false;
+    MeshBounds bounds;
+};
+// One shared image descriptor pool: textures take a slot and draws select them through
+// the texture handle, so the GPU texture header pool base is bound once per frame.
+// Textures that find the pool exhausted keep a private one-entry descriptor set.
+constexpr uint32_t ImageDescriptorSlots = 4096;
+struct ImageDescriptorPool {
+    std::shared_ptr<Buffer> storage;
+    DescriptorSlots slots{ImageDescriptorSlots};
+    DkImageDescriptor *entries() const { return static_cast<DkImageDescriptor *>(storage->cpu()); }
 };
 struct Texture {
     std::shared_ptr<Image> image;
-    std::shared_ptr<Buffer> descriptor;
+    std::shared_ptr<Buffer> descriptor;      // private set, used only when slot == None
+    std::shared_ptr<ImageDescriptorPool> pool;
+    uint32_t slot = DescriptorSlots::None;
     uint8_t minAlpha = 0;
+    ~Texture() { if (pool) pool->slots.release(slot); }
 };
 struct Upload {
     std::shared_ptr<Texture> texture;
@@ -49,6 +66,11 @@ struct Frame {
     uint32_t gpuTimingFrame=0;
     bool gpuCountersPending=false;
     uint32_t gpuCounterFrame=0;
+    // GPU time by draw category (gpu_segments.hpp), on counter-sampled frames only.
+    std::shared_ptr<Buffer> segmentReports;
+    std::array<uint8_t,MaxGpuSegments> segmentKinds{};
+    unsigned segmentCount=0;
+    bool segmentsPending=false;
 };
 struct alignas(16) Material {
     float clip[16], directions[16], colours[16];
@@ -69,6 +91,26 @@ class DekoBackend final : public Backend {
     Unique<DkSwapchain, dkSwapchainDestroy> swapchain;
     std::unique_ptr<Shader> vertexShader, fragmentShader;
     std::unique_ptr<Shader> opaqueFragmentShader;
+    // Generic shader with forced early depth tests; used only for draws that write neither
+    // depth nor stencil, where testing before the shader cannot change the result.
+    std::unique_ptr<Shader> earlyFragmentShader;
+    uint32_t lastEarlyDraws=0;
+    // Depth-only shader for the planned pre-pass (prepass_policy.hpp); boundFragment 3.
+    std::unique_ptr<Shader> depthFragmentShader;
+    std::vector<uint8_t> prepassFlags;
+    uint32_t lastPrepassDraws=0,lastPrepassBackdrops=0;
+    GpuSegmentRecorder segments;
+    GpuSegmentWindow segmentWindow;
+    DkGpuAddr segmentBase=0;
+    void markSegment(GpuSegment kind){
+        const int slot=segments.change(kind);
+        if(slot>=0)dkCmdBufReportCounter(commands,DkCounter_Timestamp,segmentBase+DkGpuAddr(slot)*16);
+    }
+    bool prepassEnabled=true;
+    // Off: measured on hardware (v55) it removed only 0.6% of fragment invocations, so the
+    // failure-pass cost is genuinely failing (translucent) pixels. CELOSIA_DIAG_FAILURE_STRICT=1 enables it.
+    bool strictFailureDepth=false;
+    uint32_t lastStrictFailureDraws=0;
     std::unique_ptr<Shader> shadowVertexShader,shadowFragmentShader;
     std::shared_ptr<Buffer> uniforms, samplers, shadowTriangle;
     std::array<Frame, Frames> frames;
@@ -76,6 +118,9 @@ class DekoBackend final : public Backend {
     std::unordered_map<uint64_t, std::shared_ptr<Mesh>> meshes;
     std::unordered_map<uint64_t, std::shared_ptr<Texture>> textures;
     std::shared_ptr<Texture> dummyTexture;
+    std::shared_ptr<ImageDescriptorPool> imageDescriptors;
+    uint32_t privateDescriptorTextures=0;
+    uint32_t lastDescriptorSetBinds=0,lastTextureHandleBinds=0;
     std::vector<Upload> uploads;
     std::vector<Draw> draws;
     std::vector<Vertex> scratchVertices;
@@ -97,9 +142,25 @@ class DekoBackend final : public Backend {
     uint32_t lastOpaqueDraws=0,lastGenericDraws=0,lastShadowDraws=0;
     std::array<uint32_t,8> lastGenericAlphaModes{};
     uint32_t lastGenericBackdrop=0,lastGenericFresnel=0,lastGenericDisabledAlpha=0,lastGenericOther=0;
-    int boundDepth=-1,boundMask=-1,boundBlend=-1,boundClamp=-1;
-    bool boundOpaque=false;
+    // Background (sky, layer 1) and screen draws by Blend (Normal, Additive, Opaque, Subtract).
+    uint32_t lastBackgroundBlend[4]{},lastScreenBlend[4]{};
+    // CELOSIA_DIAG_SKY (development diagnosis only, default 0 = unchanged rendering):
+    // 1 skip background Subtract, 2 skip background Additive, 3 skip background Normal/Opaque,
+    // 4 skip all background, 5 background Subtract drawn as Additive.
+    int diagSky=0,diagSkyRequested=0;
+    // Clear to the fog colour on frames with background layers (as GL); CELOSIA_DIAG_SKY_CLEAR_BLACK=1 reverts.
+    bool backgroundClearFog=true,lastClearToFog=false;
+    // CELOSIA_DIAG_SKY_AFTER: seconds after renderer start before the mode applies (menus stay intact).
+    std::chrono::steady_clock::time_point diagSkyFrom{};
+    // Sampled-frame screen coverage upper bounds (screen multiples) by pass kind.
+    struct CoverageSample{uint32_t frame=0;float opaque=0,generic=0,failure=0,backdrop=0,shadow=0;uint32_t fullScreenDraws=0;} lastCoverage;
+    int boundDepth=-1,boundMask=-1,boundBlend=-1;
+    uint32_t boundHandle=0; // 0 is never a bound handle: slot 0 with clamp 0 is dummy/none state reset
+    // Bound fragment shader: 0 generic, 1 opaque (no discard), 2 generic with early fragment tests.
+    int boundFragment=0;
+    bool boundHandleValid=false;
     DkGpuAddr boundImages=0;
+    void bindTexture(const Texture &, uint8_t clamp);
     uint32_t submittedFrames = 0, diagnosticCaptureFrame = 0, diagnosticCaptureInterval = 0;
     std::shared_ptr<Buffer> latestCapture;
     uint32_t captureFrameIndex = 0;
@@ -108,12 +169,14 @@ class DekoBackend final : public Backend {
     static void addCommandMemory(void *, DkCmdBuf, size_t);
     void startCommands(Frame &);
     void emitUploads(const std::vector<Upload> &);
-    void emitDraw(const Draw &, bool failurePass = false);
+    void emitDraw(const Draw &, bool failurePass = false, bool farBackdrop = false);
+    void emitDepthOnly(const Draw &);
+    void submitGeometry(const Mesh &);
     void emitShadowVolume(const Draw &);
     void resolveShadows(float amount);
     void restoreShadowState();
     Material materialFor(const Draw &, bool) const;
-    void configureTargets(int slot);
+    void configureTargets(int slot, bool clearToFog);
 public:
     DekoBackend();
     ~DekoBackend() override;

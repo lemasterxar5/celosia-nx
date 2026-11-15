@@ -6,6 +6,7 @@
 #include "../../../src/lib/native/deko3d/render_progress.hpp"
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <unordered_set>
@@ -30,12 +31,20 @@ class OwnedBackend final:public Backend {
             throw std::runtime_error("Native GPU frame batch capacity exceeded");
         commands.push_back(std::move(operation));queuedBytes+=bytes;
     }
-    void flush()
+    // CELOSIA_DIAG_SYNC_RENDER=1: the caller waits for each frame's recording (previous behaviour).
+    const bool asyncFrames=[]{const char *sync=std::getenv("CELOSIA_DIAG_SYNC_RENDER");return !(sync && std::atoi(sync)!=0);}();
+    // asynchronous: the frame's batch (it owns all its data) records on the render worker while the
+    // caller builds the next frame; any later call waits for it first (one frame in flight at most).
+    void flush(bool asynchronous=false)
     {
         std::vector<std::function<void(Backend &)>> batch;
         {std::lock_guard lock(mutex);ready();batch=std::move(commands);commands.clear();queuedBytes=0;}
         deko::markRender(deko::RenderPhase::Dispatch);
-        try{worker.execute([this,batch=std::move(batch)]{for(const auto &operation:batch)operation(*gpu);});deko::markRender(deko::RenderPhase::Idle);}
+        try{
+            auto job=[this,batch=std::move(batch)]{for(const auto &operation:batch)operation(*gpu);};
+            if(asynchronous)worker.post(std::move(job));
+            else {worker.execute(std::move(job));deko::markRender(deko::RenderPhase::Idle);}
+        }
         catch(...){deko::markRender(deko::RenderPhase::Failed);std::lock_guard lock(mutex);failed=true;throw;}
     }
 public:
@@ -46,7 +55,8 @@ public:
     }
     ~OwnedBackend()override
     {
-        try{worker.execute([&]{gpu.reset();});}
+        try{try{worker.drain();}catch(...){std::fputs("Native GPU frame failed before cleanup\n",stderr);}
+            worker.execute([&]{gpu.reset();});}
         catch(...){std::fputs("Native GPU owner cleanup failed\n",stderr);std::terminate();}
     }
     bool hasMesh(uint64_t id)override{std::lock_guard lock(mutex);ready();return meshes.count(id)!=0;}
@@ -143,7 +153,7 @@ public:
         if(width!=1280 || height!=720)throw std::invalid_argument("Native raster must be 1280x720");
         {std::lock_guard lock(mutex);ready();if(!open)throw std::logic_error("Native GPU frame is closed");
             enqueue([width,height](Backend &backend){backend.endFrame(width,height);});open=false;}
-        flush();
+        flush(asyncFrames);
         // The GPU drops transient mesh ownership after submission. Mirror its
         // cache here so subsequent frames rebuild animated geometry correctly.
         std::lock_guard lock(mutex);
@@ -156,7 +166,10 @@ public:
     }
     bool latestFrame(std::vector<uint8_t> &rgba,uint32_t &width,uint32_t &height)override
     {
-        bool result=false;worker.execute([&]{result=gpu->latestFrame(rgba,width,height);});return result;
+        bool result=false;
+        try{worker.execute([&]{result=gpu->latestFrame(rgba,width,height);});}
+        catch(...){std::lock_guard lock(mutex);failed=true;throw;}
+        return result;
     }
 };
 }

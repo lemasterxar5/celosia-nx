@@ -34,6 +34,16 @@ foreach($family in @('native','shadow')){foreach($stage in @('vert','frag')){
 }
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_opaque.frag.dksh') (Join-Path $backend 'opaque.frag.glsl')
 if($LASTEXITCODE){throw 'Switch opaque shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_depth.frag.dksh') (Join-Path $backend 'depth.frag.glsl')
+if($LASTEXITCODE){throw 'Switch depth pre-pass shader compilation failed'}
+# Early-depth-test variant of the generic shader, generated from the same source.
+$earlySource=Join-Path $shaderDir 'native_early.frag.glsl'
+$generic=Get-Content -LiteralPath (Join-Path $backend 'native.frag.glsl')
+if($generic[0] -notmatch '^#version'){throw 'native.frag.glsl must start with #version'}
+Set-Content -LiteralPath $earlySource -Encoding ascii -Value (@($generic[0],'layout(early_fragment_tests) in;')+$generic[1..($generic.Count-1)])
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_native_early.frag.dksh') $earlySource
+if($LASTEXITCODE){throw 'Switch early-test shader compilation failed'}
+Remove-Item -LiteralPath $earlySource
 $elf=Join-Path $OutputDirectory 'celosia_switch_game.elf'
 Copy-Item -LiteralPath (Join-Path $BuildDirectory 'celosia_switch_game.elf') -Destination $elf
 $nacp=Join-Path $OutputDirectory 'control.nacp'

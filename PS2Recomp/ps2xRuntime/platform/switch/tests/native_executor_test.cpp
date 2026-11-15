@@ -87,6 +87,20 @@ int main()
         require(captureDestroyedOn==worker && game.erase(faultCaller)==faultCaller,"faulted job capture cleaned on worker and caller joined");
         executor.execute([&]{require(std::this_thread::get_id()==worker,"cleanup job works after wait fault and completion drain");});
 #endif
+        {
+            // post: returns before the job ends; the next call waits for it and gets its error.
+            std::atomic<bool> release=false,ran=false;
+            executor.post([&]{while(!release.load())std::this_thread::yield();ran=true;});
+            require(!ran.load(),"post returns while its job is still running");
+            release=true;executor.drain();
+            require(ran.load(),"drain waits for the posted job");
+            executor.post([]{throw JobFailure("posted error");});
+            bool postedThrown=false;
+            try{executor.execute([]{});}catch(const JobFailure &error){postedThrown=std::string(error.what())=="posted error";}
+            require(postedThrown,"posted job error reaches the next caller");
+            executor.execute([&]{require(std::this_thread::get_id()==worker,"worker survives posted failure");});
+            executor.drain();
+        }
         std::atomic<unsigned> active=0,total=0;
         std::array<int32_t,8> callers{};
         for(auto &id:callers) {

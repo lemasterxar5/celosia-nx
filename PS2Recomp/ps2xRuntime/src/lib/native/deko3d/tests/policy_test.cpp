@@ -17,6 +17,30 @@ template<class F> static void rejects(F fn, const char *message) {
 }
 int main() {
     try {
+        {
+            // Screen coverage upper bound: identity clip, unit box spanning NDC [-0.5,0.5]^2 -> 1/4 screen.
+            Vertex quad[4]{};
+            quad[0].x=-0.5f;quad[0].y=-0.5f;quad[1].x=0.5f;quad[1].y=-0.5f;quad[2].x=0.5f;quad[2].y=0.5f;quad[3].x=-0.5f;quad[3].y=0.5f;
+            const auto bounds=meshBounds(quad,4);
+            check(bounds.valid && bounds.lo[0]==-0.5f && bounds.hi[1]==0.5f, "mesh bounds gather min/max");
+            float identity[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            check(std::abs(screenCoverage(identity,bounds)-0.25f)<1e-6f, "quarter-screen box covers 0.25");
+            check(std::abs(screenCoverage(identity,bounds,true)-0.25f)<1e-6f, "screen-space box bypasses the matrix");
+            float scaled[16]{4,0,0,0, 0,4,0,0, 0,0,1,0, 0,0,0,1};
+            check(std::abs(screenCoverage(scaled,bounds)-1.0f)<1e-6f, "oversized box clamps to the whole screen");
+            float offscreen[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 5,0,0,1};
+            check(screenCoverage(offscreen,bounds)==0.0f, "box entirely outside the viewport covers nothing");
+            float behind[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,-1};
+            check(screenCoverage(behind,bounds)==0.0f, "box behind the camera covers nothing");
+            float straddle[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0,0.25f};
+            // w = z + 0.25 with z in {0}: all w>0; move one corner behind via z range
+            Vertex depthQuad[2]{};depthQuad[0].x=-0.1f;depthQuad[0].y=-0.1f;depthQuad[0].z=-1;depthQuad[1].x=0.1f;depthQuad[1].y=0.1f;depthQuad[1].z=1;
+            check(screenCoverage(straddle,meshBounds(depthQuad,2))==1.0f, "box straddling the camera plane is conservative");
+            check(screenCoverage(identity,MeshBounds{})==1.0f, "unknown bounds are conservative");
+            // Perspective: w=4 shrinks the same box to 1/64 of the screen.
+            float perspective[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,4};
+            check(std::abs(screenCoverage(perspective,bounds)-0.25f/16)<1e-6f, "perspective divide scales coverage");
+        }
         AllocationBudget budget(20);
         check(budget.tryReserve(8), "first allocation fits shared budget");
         check(budget.tryReserve(8), "second allocation counted once");

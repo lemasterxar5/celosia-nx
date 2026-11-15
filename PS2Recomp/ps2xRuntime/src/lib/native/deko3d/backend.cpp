@@ -57,6 +57,16 @@ DekoBackend::DekoBackend() {
         "romfs:/shaders/celosia_native.vert.dksh", DkStage_Vertex, allocationBudget);
     fragmentShader = std::make_unique<Shader>(device,
         "romfs:/shaders/celosia_native.frag.dksh", DkStage_Fragment, allocationBudget);
+    if(const char *sky=std::getenv("CELOSIA_DIAG_SKY"))diagSkyRequested=std::atoi(sky);
+    diagSkyFrom=std::chrono::steady_clock::now()+std::chrono::seconds(
+        std::getenv("CELOSIA_DIAG_SKY_AFTER")?std::atoi(std::getenv("CELOSIA_DIAG_SKY_AFTER")):0);
+    earlyFragmentShader=std::make_unique<Shader>(device,
+        "romfs:/shaders/celosia_native_early.frag.dksh",DkStage_Fragment,allocationBudget);
+    depthFragmentShader=std::make_unique<Shader>(device,
+        "romfs:/shaders/celosia_depth.frag.dksh",DkStage_Fragment,allocationBudget);
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_PREPASS"))prepassEnabled=std::atoi(off)==0;
+    if(const char *black=std::getenv("CELOSIA_DIAG_SKY_CLEAR_BLACK"))backgroundClearFog=std::atoi(black)==0;
+    if(const char *strict=std::getenv("CELOSIA_DIAG_FAILURE_STRICT"))strictFailureDepth=std::atoi(strict)!=0;
     opaqueFragmentShader=std::make_unique<Shader>(device,
         "romfs:/shaders/celosia_opaque.frag.dksh",DkStage_Fragment,allocationBudget);
     shadowVertexShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_shadow.vert.dksh",DkStage_Vertex,allocationBudget);
@@ -69,6 +79,9 @@ DekoBackend::DekoBackend() {
     triangle[2].x=-1;triangle[2].y=3;
     for(auto &vertex:triangle)vertex.r=vertex.g=vertex.b=vertex.a=128;
     std::memcpy(shadowTriangle->cpu(),triangle,sizeof(triangle));
+    imageDescriptors=std::make_shared<ImageDescriptorPool>();
+    imageDescriptors->storage=std::make_shared<Buffer>(device,size_t(ImageDescriptorSlots)*sizeof(DkImageDescriptor),allocationBudget);
+    std::memset(imageDescriptors->storage->cpu(),0,size_t(ImageDescriptorSlots)*sizeof(DkImageDescriptor));
     samplers = std::make_shared<Buffer>(device, 4 * sizeof(DkSamplerDescriptor), allocationBudget,bufferPool);
     for (uint32_t mode = 0; mode < 4; ++mode) {
         DkSampler sampler; dkSamplerDefaults(&sampler);
@@ -132,6 +145,7 @@ void DekoBackend::uploadMesh(uint64_t id, const Vertex *vertices, uint32_t count
     if (!vertices) throw std::invalid_argument("deko3d: null mesh vertices");
     auto mesh = std::make_shared<Mesh>();
     mesh->minAlpha=minimumVertexAlpha(vertices,count);
+    mesh->bounds=meshBounds(vertices,count);
     mesh->vertices = vertexStorage(bytes,mesh->vertexOffset,transient);
     std::memcpy(static_cast<uint8_t *>(mesh->vertices->cpu())+mesh->vertexOffset, vertices, bytes);
     mesh->count = count; mesh->transient = transient;
@@ -145,10 +159,20 @@ void DekoBackend::uploadTexture(uint64_t id, uint32_t w, uint32_t h,
     auto texture = std::make_shared<Texture>();
     texture->minAlpha=minimumTextureAlpha(rgba,bytes);
     texture->image = std::make_shared<Image>(device, w, h, DkImageFormat_RGBA8_Unorm, 0, allocationBudget, levels);
-    texture->descriptor = std::make_shared<Buffer>(device, sizeof(DkImageDescriptor), allocationBudget,bufferPool);
     auto view = texture->image->view();
-    dkImageDescriptorInitialize(static_cast<DkImageDescriptor *>(texture->descriptor->cpu()),
-        &view, false, false);
+    // Slot writes target entries no in-flight frame references (slots free only after their
+    // Texture died, i.e. after every frame holding it retired); the per-frame upload barrier
+    // invalidates the descriptor cache before the first draw that selects the new entry.
+    texture->slot=imageDescriptors->slots.acquire();
+    if(texture->slot!=DescriptorSlots::None){
+        texture->pool=imageDescriptors;
+        dkImageDescriptorInitialize(imageDescriptors->entries()+texture->slot,&view,false,false);
+    }else{
+        ++privateDescriptorTextures;
+        texture->descriptor = std::make_shared<Buffer>(device, sizeof(DkImageDescriptor), allocationBudget,bufferPool);
+        dkImageDescriptorInitialize(static_cast<DkImageDescriptor *>(texture->descriptor->cpu()),
+            &view, false, false);
+    }
     auto staging = std::make_shared<Buffer>(device, bytes, allocationBudget,bufferPool);
     std::memcpy(staging->cpu(), rgba, bytes);
     uploads.push_back({texture, std::move(staging), w, h, levels});
@@ -170,6 +194,10 @@ void DekoBackend::beginFrame() {
             (void)gpuTimeWindow.add(*ns);
         }
         frame.gpuTimingPending=false;
+    }
+    if(frame.segmentsPending){
+        (void)segmentWindow.add(static_cast<const GpuReport *>(frame.segmentReports->cpu()),frame.segmentKinds.data(),frame.segmentCount);
+        frame.segmentsPending=false;
     }
     if(frame.gpuCountersPending){
         const auto *reports=static_cast<const GpuReport *>(frame.gpuReports->cpu());

@@ -105,6 +105,27 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(report['rejected']['duplicate'],1)
             self.assertEqual(report['summary']['weighted_fps'],10)
 
+    def test_per_frame_minimums_are_optional_validated_and_summarised(self):
+        legacy = benchmark.parse_status(status())
+        self.assertNotIn('worst_frame_ms', legacy)
+        self.assertEqual(benchmark.summarize([legacy])['minimum_basis'], 'window_minimum_only')
+        self.assertIsNone(benchmark.summarize([legacy])['per_frame'])
+        first = benchmark.parse_status(status(frame_samples=50, worst_frame_ms=180.5, low1_frame_ms=180.5, low1_fps=5.54))
+        second = benchmark.parse_status(status(end=15_000_000_000, frame_samples=49, worst_frame_ms=90.25, low1_frame_ms=88.0, low1_fps=11.364))
+        summary = benchmark.summarize([first, second])
+        self.assertEqual(summary['minimum_basis'], 'per_frame')
+        self.assertEqual(summary['per_frame']['windows_with_samples'], 2)
+        self.assertEqual(summary['per_frame']['frame_samples'], 99)
+        self.assertEqual(summary['per_frame']['worst_frame_ms'], 180.5)
+        self.assertEqual(summary['per_frame']['low1_fps_min'], 5.54)
+        self.assertEqual(summary['per_frame']['low1_frame_ms_max'], 180.5)
+        for broken in (dict(frame_samples=50, worst_frame_ms='nan', low1_frame_ms=1, low1_fps=1),
+                       dict(frame_samples='x', worst_frame_ms=10, low1_frame_ms=10, low1_fps=100),
+                       dict(frame_samples=50, worst_frame_ms=10, low1_frame_ms=20, low1_fps=50),
+                       dict(frame_samples=50, worst_frame_ms=10, low1_frame_ms=10)):
+            with self.subTest(broken=broken), self.assertRaises(ValueError):
+                benchmark.parse_status(status(**broken))
+
     def test_ftp_only_retrieves_bounded_status(self):
         with patch.object(benchmark.ftplib,'FTP') as factory:
             ftp=factory.return_value.__enter__.return_value

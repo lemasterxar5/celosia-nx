@@ -41,3 +41,5 @@ target_include_directories(celosia_game_aot PRIVATE
     "${CELOSIA_ROOT}/PS2Recomp/ps2xIOP/include")
 target_precompile_headers(celosia_game_aot PRIVATE "${CELOSIA_RUNTIME}/include/ps2_runtime_macros.h")
 set_target_properties(celosia_game_aot PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 32)
+include("${CMAKE_CURRENT_LIST_DIR}/../optimization.cmake")
+celosia_optimize_compile(celosia_game_aot)

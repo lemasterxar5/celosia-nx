@@ -19,6 +19,12 @@ public:
     // Empty jobs and nested execution on this worker reject explicitly. The
     // callback and its captures finish/destruct before the caller is released.
     void execute(std::function<void()> job);
+    // Asynchronous hand-over: returns once the worker owns the job. Every later
+    // execute/post/drain first waits for it and rethrows its error, so at most one
+    // job is in flight. Captures must own their data (nothing caller-backed).
+    void post(std::function<void()> job);
+    // Waits for a posted job (no-op without one); rethrows its error.
+    void drain();
     // Creator-only, synchronous and idempotent. Wakes the idle worker and joins
     // it; subsequent jobs reject. Destructor performs this if still needed.
     void shutdown();

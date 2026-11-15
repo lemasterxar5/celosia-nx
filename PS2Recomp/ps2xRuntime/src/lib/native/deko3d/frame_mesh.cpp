@@ -23,6 +23,7 @@ void DekoBackend::commitFrameMesh(uint64_t id, uint32_t count, uint32_t indexCou
         validateIndices(scratchIndices.data(), indexCount, count);
         auto mesh = std::make_shared<Mesh>();
         mesh->minAlpha=minimumVertexAlpha(scratchVertices.data(),count);
+        mesh->bounds=meshBounds(scratchVertices.data(),count);
         const auto bytes = vertexBytes(count);
         mesh->vertices = vertexStorage(bytes,mesh->vertexOffset,true);
         std::memcpy(static_cast<uint8_t *>(mesh->vertices->cpu())+mesh->vertexOffset, scratchVertices.data(), bytes);

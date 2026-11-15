@@ -2,7 +2,12 @@
 #include "render_progress.hpp"
 #include "late_mesh.hpp"
 #include "opaque_policy.hpp"
+#include "prepass_policy.hpp"
+// Optional present observer (platform/switch/hybrid/saltynx_fps.cpp: SaltyNX FPS counter block).
+extern "C" void celosia_frame_presented(void) __attribute__((weak));
+#include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <unistd.h>
 
 namespace native_renderer::detail::deko {
@@ -24,8 +29,22 @@ void DekoBackend::emitUploads(const std::vector<Upload> &pending) {
     dkCmdBufBarrier(commands, DkBarrier_Full,
         DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors | DkInvalidateFlags_Shader);
 }
-void DekoBackend::configureTargets(int slot) {
-    boundDepth=boundMask=boundBlend=boundClamp=-1;boundImages=0;boundOpaque=false;
+void DekoBackend::bindTexture(const Texture &texture,uint8_t clamp){
+    const bool shared=texture.slot!=DescriptorSlots::None;
+    const auto set=shared?imageDescriptors->storage->gpu():texture.descriptor->gpu();
+    if(boundImages!=set){
+        dkCmdBufBindImageDescriptorSet(commands,set,shared?ImageDescriptorSlots:1);
+        boundImages=set;boundHandleValid=false;++lastDescriptorSetBinds;
+    }
+    const auto handle=dkMakeTextureHandle(shared?texture.slot:0,clamp);
+    if(!boundHandleValid || boundHandle!=handle){
+        dkCmdBufBindTexture(commands,DkStage_Fragment,0,handle);
+        boundHandle=handle;boundHandleValid=true;++lastTextureHandleBinds;
+    }
+}
+void DekoBackend::configureTargets(int slot, bool clearToFog) {
+    boundDepth=boundMask=boundBlend=-1;boundImages=0;boundHandleValid=false;boundFragment=0;
+    lastDescriptorSetBinds=lastTextureHandleBinds=0;
     const auto colour = colors[slot]->view(), z = depth->view();
     dkCmdBufBindRenderTarget(commands, &colour, &z);
     const DkViewport viewport{0, 0, float(Width), float(Height), 0, 1};
@@ -37,7 +56,10 @@ void DekoBackend::configureTargets(int slot) {
     dkCmdBufBindRasterizerState(commands, &rasterizer);
     DkColorWriteState write;
     dkColorWriteStateDefaults(&write); dkCmdBufBindColorWriteState(commands, &write);
-    dkCmdBufClearColorFloat(commands, 0, DkColorMask_RGBA, 0, 0, 0, 1);
+    // The GS frame starts from a FOGCOL sprite under the sky (GL: the background pass clears to the
+    // fog colour, SOTC_BG_CLEAR_FOG). Frames without background layers keep the black clear.
+    if(clearToFog)dkCmdBufClearColorFloat(commands, 0, DkColorMask_RGBA, fog.colour[0], fog.colour[1], fog.colour[2], 1);
+    else dkCmdBufClearColorFloat(commands, 0, DkColorMask_RGBA, 0, 0, 0, 1);
     dkCmdBufClearDepthStencil(commands, true, 1, 0xFF, 0);
     const DkShader *shaders[]{&vertexShader->shader, &fragmentShader->shader};
     dkCmdBufBindShaders(commands, DkStageFlag_GraphicsMask, shaders, 2);
@@ -81,8 +103,16 @@ Material DekoBackend::materialFor(const Draw &draw, bool failurePass) const {
     }
     return result;
 }
-void DekoBackend::emitDraw(const Draw &draw, bool failurePass) {
+void DekoBackend::emitDraw(const Draw &draw, bool failurePass, bool farBackdrop) {
     const auto &s = draw.state;
+    if(!failurePass && unsigned(s.blend)<4){
+        if(s.background)++lastBackgroundBlend[unsigned(s.blend)];
+        else if(s.screen)++lastScreenBlend[unsigned(s.blend)];
+    }
+    if(diagSky && s.background){
+        const bool sub=s.blend==Blend::Subtract,add=s.blend==Blend::Additive;
+        if(diagSky==4 || (diagSky==1 && sub) || (diagSky==2 && add) || (diagSky==3 && !sub && !add))return;
+    }
     const bool opaque=canUseOpaqueFragment(s,draw.mesh->minAlpha,draw.texture->minAlpha,failurePass);
     if(opaque)++lastOpaqueDraws;else {
         ++lastGenericDraws;
@@ -92,16 +122,30 @@ void DekoBackend::emitDraw(const Draw &draw, bool failurePass) {
         else if(s.alphaTest)++lastGenericDisabledAlpha;
         else ++lastGenericOther;
     }
-    if(boundOpaque!=opaque){
-        const DkShader *shaders[]{&vertexShader->shader,opaque?&opaqueFragmentShader->shader:&fragmentShader->shader};
-        dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,shaders,2);boundOpaque=opaque;
+    auto key=pipelineKey(s,failurePass);
+    // Planned backdrops test (never write) against the pre-pass depth at the far plane.
+    if(farBackdrop){key.depth=1;++lastPrepassBackdrops;}
+    // Alpha-test failure pass (no depth write) of a draw whose passing pixels wrote depth: those
+    // pixels hold this draw's exact depth (same vertex shader and matrix), and the failure shader
+    // would discard them anyway. A strict Less test rejects them before shading instead of after.
+    // Overlay draws rely on equal depth over earlier geometry and keep Lequal.
+    if(failurePass && strictFailureDepth && !s.overlay && (key.depth&1) && !(key.depth&2) &&
+       (pipelineKey(s,false).depth&2)){key.depth|=4;++lastStrictFailureDraws;}
+    // Discarding shaders otherwise risk late depth testing. With depth writes off (and stencil
+    // disabled in normal draws) an early test rejects exactly the fragments the late test would.
+    const bool early=!opaque && (key.depth&1) && !(key.depth&2);
+    if(early)++lastEarlyDraws;
+    const int fragment=opaque?1:early?2:0;
+    if(boundFragment!=fragment){
+        const DkShader *selected=fragment==1?&opaqueFragmentShader->shader:fragment==2?&earlyFragmentShader->shader:&fragmentShader->shader;
+        const DkShader *shaders[]{&vertexShader->shader,selected};
+        dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,shaders,2);boundFragment=fragment;
     }
-    const auto key=pipelineKey(s,failurePass);
     if(boundDepth!=key.depth){
         DkDepthStencilState depthState;dkDepthStencilStateDefaults(&depthState);
         depthState.depthTestEnable=(key.depth&1)!=0;
         depthState.depthWriteEnable=(key.depth&2)!=0;
-        depthState.depthCompareOp=DkCompareOp_Lequal;
+        depthState.depthCompareOp=(key.depth&4)?DkCompareOp_Less:DkCompareOp_Lequal;
         dkCmdBufBindDepthStencilState(commands,&depthState);boundDepth=key.depth;
     }
     if(boundMask!=key.mask){
@@ -109,40 +153,64 @@ void DekoBackend::emitDraw(const Draw &draw, bool failurePass) {
         dkColorWriteStateSetMask(&write,0,key.mask);
         dkCmdBufBindColorWriteState(commands,&write);boundMask=key.mask;
     }
-    if(boundBlend!=int(s.blend)){
+    // Diagnosis mode 5 changes the blend op for background Subtract only: key it separately.
+    const int blendKey=int(s.blend)|((diagSky==5 && s.background)?8:0);
+    if(boundBlend!=blendKey){
         DkColorState color;dkColorStateDefaults(&color);
         color.blendEnableMask=s.blend!=Blend::Opaque;
         dkCmdBufBindColorState(commands,&color);
         DkBlendState blend;dkBlendStateDefaults(&blend);
         if(s.blend==Blend::Additive || s.blend==Blend::Subtract)blend.dstColorBlendFactor=DkBlendFactor_One;
-        if(s.blend==Blend::Subtract)blend.colorBlendOp=DkBlendOp_RevSub;
-        dkCmdBufBindBlendState(commands,0,&blend);boundBlend=int(s.blend);
+        if(s.blend==Blend::Subtract && !(diagSky==5 && s.background))blend.colorBlendOp=DkBlendOp_RevSub;
+        dkCmdBufBindBlendState(commands,0,&blend);boundBlend=blendKey;
     }
-    const auto material = materialFor(draw, failurePass);
+    auto material = materialFor(draw, failurePass);
+    material.alpha[3]=farBackdrop;
     dkCmdBufPushConstants(commands, uniforms->gpu(), 512, 0, sizeof(material), &material);
-    const auto images=draw.texture->descriptor->gpu();
-    if(boundImages!=images){dkCmdBufBindImageDescriptorSet(commands,images,1);boundImages=images;}
-    if(boundClamp!=int(s.clamp)){
-        dkCmdBufBindTexture(commands,DkStage_Fragment,0,dkMakeTextureHandle(0,s.clamp));boundClamp=int(s.clamp);
-    }
-    dkCmdBufBindVtxBuffer(commands, 0, draw.mesh->vertices->gpu()+draw.mesh->vertexOffset,
-        draw.mesh->count * sizeof(Vertex));
-    if (draw.mesh->indices) {
-        dkCmdBufBindIdxBuffer(commands, DkIdxFormat_Uint32, draw.mesh->indices->gpu()+draw.mesh->indexOffset);
-        dkCmdBufDrawIndexed(commands, DkPrimitive_Triangles, draw.mesh->indexCount, 1, 0, 0, 0);
+    bindTexture(*draw.texture,s.clamp);
+    submitGeometry(*draw.mesh);
+}
+void DekoBackend::submitGeometry(const Mesh &mesh) {
+    dkCmdBufBindVtxBuffer(commands, 0, mesh.vertices->gpu()+mesh.vertexOffset, mesh.count * sizeof(Vertex));
+    if (mesh.indices) {
+        dkCmdBufBindIdxBuffer(commands, DkIdxFormat_Uint32, mesh.indices->gpu()+mesh.indexOffset);
+        dkCmdBufDrawIndexed(commands, DkPrimitive_Triangles, mesh.indexCount, 1, 0, 0, 0);
     } else {
-        dkCmdBufDraw(commands, DkPrimitive_Triangles, draw.mesh->count, 1, 0, 0);
+        dkCmdBufDraw(commands, DkPrimitive_Triangles, mesh.count, 1, 0, 0);
     }
+}
+// Same vertex shader and clip matrix as the later colour draw, so its Lequal test sees
+// bit-identical depth. Colour writes are masked; blend state is irrelevant.
+void DekoBackend::emitDepthOnly(const Draw &draw) {
+    ++lastPrepassDraws;
+    if(boundFragment!=3){
+        const DkShader *shaders[]{&vertexShader->shader,&depthFragmentShader->shader};
+        dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,shaders,2);boundFragment=3;
+    }
+    if(boundDepth!=3){
+        DkDepthStencilState depthState;dkDepthStencilStateDefaults(&depthState);
+        depthState.depthTestEnable=true;depthState.depthWriteEnable=true;
+        depthState.depthCompareOp=DkCompareOp_Lequal;
+        dkCmdBufBindDepthStencilState(commands,&depthState);boundDepth=3;
+    }
+    if(boundMask!=0){
+        DkColorWriteState write;dkColorWriteStateDefaults(&write);
+        dkColorWriteStateSetMask(&write,0,0);
+        dkCmdBufBindColorWriteState(commands,&write);boundMask=0;
+    }
+    const auto material=materialFor(draw,false);
+    dkCmdBufPushConstants(commands,uniforms->gpu(),512,0,sizeof(material),&material);
+    submitGeometry(*draw.mesh);
 }
 void DekoBackend::restoreShadowState() {
     const DkShader *normalShaders[]{&vertexShader->shader,&fragmentShader->shader};
     dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,normalShaders,2);
-    boundOpaque=false;
+    boundFragment=0;
     DkRasterizerState rasterizer;dkRasterizerStateDefaults(&rasterizer);
     rasterizer.cullMode=DkFace_None;
     dkCmdBufBindRasterizerState(commands,&rasterizer);
     // emitDraw rebinds depth/stencil, colour mask, blend and image/sampler state.
-    boundDepth=boundMask=boundBlend=boundClamp=-1;boundImages=0;
+    boundDepth=boundMask=boundBlend=-1;boundImages=0;boundHandleValid=false;
 }
 void DekoBackend::emitShadowVolume(const Draw &draw) {
     ++lastShadowDraws;
@@ -166,8 +234,7 @@ void DekoBackend::emitShadowVolume(const Draw &draw) {
     Material material{};std::copy(draw.clip.begin(),draw.clip.end(),material.clip);
     material.params[0]=1;material.alpha[0]=-1;
     dkCmdBufPushConstants(commands,uniforms->gpu(),512,0,sizeof(material),&material);
-    dkCmdBufBindImageDescriptorSet(commands,dummyTexture->descriptor->gpu(),1);
-    dkCmdBufBindTexture(commands,DkStage_Fragment,0,dkMakeTextureHandle(0,0));
+    bindTexture(*dummyTexture,0);
     dkCmdBufBindVtxBuffer(commands,0,draw.mesh->vertices->gpu()+draw.mesh->vertexOffset,draw.mesh->count*sizeof(Vertex));
     if(draw.mesh->indices) {
         dkCmdBufBindIdxBuffer(commands,DkIdxFormat_Uint32,draw.mesh->indices->gpu()+draw.mesh->indexOffset);
@@ -176,9 +243,9 @@ void DekoBackend::emitShadowVolume(const Draw &draw) {
     restoreShadowState();
 }
 void DekoBackend::resolveShadows(float amount) {
-    if(boundOpaque){
+    if(boundFragment!=0){
         const DkShader *shaders[]{&vertexShader->shader,&fragmentShader->shader};
-        dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,shaders,2);boundOpaque=false;
+        dkCmdBufBindShaders(commands,DkStageFlag_GraphicsMask,shaders,2);boundFragment=0;
     }
     DkDepthStencilState state;dkDepthStencilStateDefaults(&state);
     state.depthTestEnable=false;state.depthWriteEnable=false;state.stencilTestEnable=true;
@@ -197,8 +264,7 @@ void DekoBackend::resolveShadows(float amount) {
     material.params[0]=1;material.alpha[0]=-1;material.debug[3]=1;
     // Keep shader alpha opaque: even amount=0 must clear the counted stencil.
     dkCmdBufPushConstants(commands,uniforms->gpu(),512,0,sizeof(material),&material);
-    dkCmdBufBindImageDescriptorSet(commands,dummyTexture->descriptor->gpu(),1);
-    dkCmdBufBindTexture(commands,DkStage_Fragment,0,dkMakeTextureHandle(0,0));
+    bindTexture(*dummyTexture,0);
     dkCmdBufBindVtxBuffer(commands,0,shadowTriangle->gpu(),3*sizeof(Vertex));
     dkCmdBufDraw(commands,DkPrimitive_Triangles,3,1,0,0);
     restoreShadowState();
@@ -215,9 +281,12 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
     frame.draws = std::move(draws); frame.uploads = std::move(uploads);
     resolvePendingMeshes(frame.draws,meshes);
     if(!held){
-        lastOpaqueDraws=lastGenericDraws=lastShadowDraws=0;
+        lastOpaqueDraws=lastGenericDraws=lastShadowDraws=lastEarlyDraws=lastPrepassDraws=lastPrepassBackdrops=lastStrictFailureDraws=0;
+        diagSky=diagSkyRequested && std::chrono::steady_clock::now()>=diagSkyFrom?diagSkyRequested:0;
         lastGenericAlphaModes.fill(0);
         lastGenericBackdrop=lastGenericFresnel=lastGenericDisabledAlpha=lastGenericOther=0;
+        std::fill(std::begin(lastBackgroundBlend),std::end(lastBackgroundBlend),0u);
+        std::fill(std::begin(lastScreenBlend),std::end(lastScreenBlend),0u);
         if(!frame.gpuReports)frame.gpuReports=std::make_shared<Buffer>(device,128,allocationBudget,bufferPool);
         std::memset(frame.gpuReports->cpu(),0,128);
         // Bottom-of-pipeline reports exclude work belonging to the preceding frame.
@@ -225,6 +294,12 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         frame.gpuTimingFrame=submittedFrames+1;frame.gpuTimingPending=true;
         frame.gpuCountersPending=(++presentedNativeFrames%30)==0;
         frame.gpuCounterFrame=frame.gpuCountersPending?frame.gpuTimingFrame:0;
+    }
+    segments.active=frame.gpuCountersPending;segments.begin();
+    if(segments.active){
+        if(!frame.segmentReports)frame.segmentReports=std::make_shared<Buffer>(device,MaxGpuSegments*16,allocationBudget,bufferPool);
+        std::memset(frame.segmentReports->cpu(),0,MaxGpuSegments*16);
+        segmentBase=frame.segmentReports->gpu();
     }
     const auto uploadStart=armTicksToNs(armGetSystemTick());
     markRender(RenderPhase::Uploads);
@@ -237,7 +312,10 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         markRender(RenderPhase::Acquire);
         slot = dkQueueAcquireImage(queue, swapchain);
         if (slot < 0 || slot >= int(Frames)) throw std::runtime_error("deko3d: acquire failed");
-        configureTargets(slot);
+        bool clearToFog=false;
+        if(backgroundClearFog)for(const auto &draw:frame.draws)if(draw.state.background){clearToFog=true;break;}
+        lastClearToFog=clearToFog;
+        configureTargets(slot,clearToFog);
         acquireNs=armTicksToNs(armGetSystemTick())-acquireStart;
         if(frame.gpuCountersPending){
             dkCmdBufReportCounter(commands,DkCounter_VertexShaderInvocations,frame.gpuReports->gpu()+32);
@@ -248,15 +326,48 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         markRender(RenderPhase::Record);
         std::stable_sort(frame.draws.begin(), frame.draws.end(),
             [](const Draw &a, const Draw &b) { return a.state.order < b.state.order; });
-        ShadowBatch shadows;
-        for (const auto &draw : frame.draws) {
-            if(shadows.resolveBefore(draw.state.order)){resolveShadows(shadows.amount);shadows.clear();}
-            if(draw.state.shadowVolume){emitShadowVolume(draw);shadows.add(draw.state.order,draw.state.shadow);continue;}
-            emitDraw(draw);
-            if (needsAlphaFailurePass(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha))
-                emitDraw(draw, true);
+        PrepassPlan prepass;
+        if(prepassEnabled && !diagSky){
+            prepass=planPrepass(frame.draws.size(),[&](std::size_t i)->const DrawState&{return frame.draws[i].state;},
+                [&](std::size_t i,uint8_t &va,uint8_t &ta){va=frame.draws[i].mesh->minAlpha;ta=frame.draws[i].texture->minAlpha;},prepassFlags);
+            if(prepass.active)
+                for(std::size_t i=prepass.first;i<prepass.barrier;++i)if(prepassFlags[i]){markSegment(GpuSegment::Prepass);emitDepthOnly(frame.draws[i]);}
         }
-        if(shadows.pending)resolveShadows(shadows.amount);
+        ShadowBatch shadows;
+        // Coverage attribution is CPU-only bookkeeping on counter-sampled frames; the GPU
+        // command stream is identical whether or not it runs.
+        CoverageSample coverage;const bool attributeCoverage=frame.gpuCountersPending;
+        if(attributeCoverage)coverage.frame=frame.gpuCounterFrame;
+        for (std::size_t drawIndex=0;drawIndex<frame.draws.size();++drawIndex) {
+            const auto &draw=frame.draws[drawIndex];
+            if(shadows.resolveBefore(draw.state.order)){markSegment(GpuSegment::Shadow);resolveShadows(shadows.amount);shadows.clear();}
+            const float area=attributeCoverage?screenCoverage(draw.clip.data(),draw.mesh->bounds,draw.state.screen):0;
+            if(attributeCoverage && area>=0.9f)++coverage.fullScreenDraws;
+            if(draw.state.shadowVolume){
+                markSegment(GpuSegment::Shadow);
+                emitShadowVolume(draw);shadows.add(draw.state.order,draw.state.shadow);
+                if(attributeCoverage)coverage.shadow+=area;
+                continue;
+            }
+            const bool failure=needsAlphaFailurePass(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha);
+            if(attributeCoverage){
+                if(draw.state.screen || draw.state.background)coverage.backdrop+=area;
+                else if(canUseOpaqueFragment(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha,false))coverage.opaque+=area;
+                else coverage.generic+=area;
+                if(failure)coverage.failure+=area;
+            }
+            markSegment(draw.state.background?GpuSegment::Backdrop:draw.state.screen?GpuSegment::Screen:
+                canUseOpaqueFragment(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha,false)?GpuSegment::Opaque:GpuSegment::Generic);
+            emitDraw(draw,false,prepass.farBackdrop(drawIndex,draw.state));
+            if (failure) {markSegment(GpuSegment::Failure);emitDraw(draw, true);}
+        }
+        if(attributeCoverage)lastCoverage=coverage;
+        if(shadows.pending){markSegment(GpuSegment::Shadow);resolveShadows(shadows.amount);}
+        if(const int slot=segments.close();slot>=0)
+            dkCmdBufReportCounter(commands,DkCounter_Timestamp,segmentBase+DkGpuAddr(slot)*16);
+        frame.segmentsPending=segments.active && segments.count>=2;
+        if(frame.segmentsPending){frame.segmentKinds=segments.kinds;frame.segmentCount=segments.count;}
+        segments.active=false;
         if(frame.gpuCountersPending){
             dkCmdBufReportCounter(commands,DkCounter_VertexShaderInvocations,frame.gpuReports->gpu()+48);
             dkCmdBufReportCounter(commands,DkCounter_FragmentShaderInvocations,frame.gpuReports->gpu()+80);
@@ -281,7 +392,8 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
     dkCmdBufSignalFence(commands, &frame.fence, true);
     dkQueueSubmitCommands(queue, dkCmdBufFinishList(commands));
     frame.pending = true;
-    if (!held) {markRender(RenderPhase::Present);dkQueuePresentImage(queue, swapchain, slot);latestSlot=slot;}
+    if (!held) {markRender(RenderPhase::Present);dkQueuePresentImage(queue, swapchain, slot);latestSlot=slot;
+        if(celosia_frame_presented)celosia_frame_presented();}
     markRender(RenderPhase::Flush);
     dkQueueFlush(queue);
     const auto submitEnd=armTicksToNs(armGetSystemTick());
@@ -297,21 +409,39 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         if(file){
             const bool written=std::fprintf(file,"native_width=1280\nnative_height=720\npresent_fps=%.3f\npresented_frames=%llu\ninterval_ns=%llu\nlast_draws=%zu\ngpu_bytes=%zu\n",
                 sample->fps,static_cast<unsigned long long>(sample->frames),static_cast<unsigned long long>(sample->elapsedNs),frame.draws.size(),allocationBudget->used())>0;
+            // Per-presentation minimums for this window (CPU submission cadence): worst gap and mean of the slowest 1%.
+            const bool lows=std::fprintf(file,"frame_samples=%u\nworst_frame_ms=%.3f\nlow1_frame_ms=%.3f\nlow1_fps=%.3f\n",
+                sample->intervalCount,sample->worstFrameNs/1000000.0,sample->low1FrameNs/1000000.0,sample->low1Fps())>0;
             const bool timings=std::fprintf(file,"sample_end_ns=%llu\ntotal_native_frames=%u\nlast_begin_wait_ms=%.3f\nlast_upload_ms=%.3f\nlast_acquire_ms=%.3f\nlast_record_ms=%.3f\nlast_submit_ms=%.3f\nlast_end_ms=%.3f\n",
                 static_cast<unsigned long long>(sampleEndNs),submittedFrames,lastBeginWaitNs/1000000.0,uploadNs/1000000.0,acquireNs/1000000.0,recordNs/1000000.0,
                 (submitEnd-submitStart)/1000000.0,(submitEnd-cpuStart)/1000000.0)>0;
+            {
+                std::fprintf(file,"gpu_segments=%s\ngpu_segment_frames=%llu\ngpu_segment_ms=",gpuSegmentNames,
+                    static_cast<unsigned long long>(segmentWindow.frames));
+                for(unsigned k=0;k<GpuSegmentCount;++k)std::fprintf(file,k?",%.3f":"%.3f",segmentWindow.averageMs(k));
+                std::fputc('\n',file);
+                segmentWindow.reset();
+            }
             const bool gpuTimings=std::fprintf(file,"gpu_timing_frame=%u\nlast_gpu_ms=%.3f\ngpu_samples=%llu\ngpu_average_ms=%.3f\ngpu_peak_ms=%.3f\n",
                 lastGpuTimingFrame,lastGpuNs/1000000.0,static_cast<unsigned long long>(gpuTimeWindow.count),gpuTimeWindow.averageNs()/1000000.0,gpuTimeWindow.peakNs/1000000.0)>0;
-            const bool counterStats=std::fprintf(file,"last_opaque_draws=%u\nlast_generic_draws=%u\nlast_shadow_draws=%u\ncounter_samples=%llu\ncounter_invalid_samples=%llu\ncounter_last_frame=%u\ncounter_avg_vertices=%.3f\ncounter_avg_fragments=%.3f\ncounter_avg_primitives=%.3f\ncounter_fragments_per_native_pixel_estimate=%.6f\ncounter_zero_policy=unproven_or_unsupported\n",
-                lastOpaqueDraws,lastGenericDraws,lastShadowDraws,static_cast<unsigned long long>(gpuCounterWindow.count),
+            const bool counterStats=std::fprintf(file,"last_opaque_draws=%u\nlast_generic_draws=%u\nlast_early_draws=%u\nlast_prepass_draws=%u\nlast_prepass_backdrops=%u\nprepass_enabled=%d\nlast_strict_failure_draws=%u\nlast_shadow_draws=%u\ncounter_samples=%llu\ncounter_invalid_samples=%llu\ncounter_last_frame=%u\ncounter_avg_vertices=%.3f\ncounter_avg_fragments=%.3f\ncounter_avg_primitives=%.3f\ncounter_fragments_per_native_pixel_estimate=%.6f\ncounter_zero_policy=unproven_or_unsupported\n",
+                lastOpaqueDraws,lastGenericDraws,lastEarlyDraws,lastPrepassDraws,lastPrepassBackdrops,int(prepassEnabled),lastStrictFailureDraws,lastShadowDraws,static_cast<unsigned long long>(gpuCounterWindow.count),
                 static_cast<unsigned long long>(gpuCounterWindow.rejected),lastGpuCounterFrame,gpuCounterWindow.averageVertices(),
                 gpuCounterWindow.averageFragments(),gpuCounterWindow.averagePrimitives(),gpuCounterWindow.fragmentInvocationsPerPixel(uint64_t(Width)*Height))>0;
             const bool alphaStats=std::fprintf(file,
                 "generic_backdrop_draws=%u\ngeneric_fresnel_draws=%u\ngeneric_disabled_alpha_draws=%u\ngeneric_other_draws=%u\ngeneric_alpha_modes=%u,%u,%u,%u,%u,%u,%u,%u\n",
                 lastGenericBackdrop,lastGenericFresnel,lastGenericDisabledAlpha,lastGenericOther,lastGenericAlphaModes[0],lastGenericAlphaModes[1],
                 lastGenericAlphaModes[2],lastGenericAlphaModes[3],lastGenericAlphaModes[4],lastGenericAlphaModes[5],lastGenericAlphaModes[6],lastGenericAlphaModes[7])>0;
+            const bool skyStats=std::fprintf(file,"background_blend=%u,%u,%u,%u\nscreen_blend=%u,%u,%u,%u\ndiag_sky=%d\nclear_to_fog=%d\n",
+                lastBackgroundBlend[0],lastBackgroundBlend[1],lastBackgroundBlend[2],lastBackgroundBlend[3],
+                lastScreenBlend[0],lastScreenBlend[1],lastScreenBlend[2],lastScreenBlend[3],diagSky,int(lastClearToFog))>0;
+            const bool descriptorStats=std::fprintf(file,"descriptor_set_binds=%u\ntexture_handle_binds=%u\ndescriptor_slots_in_use=%u\ndescriptor_private_textures=%u\n",
+                lastDescriptorSetBinds,lastTextureHandleBinds,imageDescriptors->slots.inUse(),privateDescriptorTextures)>0;
+            const bool coverageStats=std::fprintf(file,
+                "coverage_frame=%u\ncoverage_opaque=%.3f\ncoverage_generic=%.3f\ncoverage_failure=%.3f\ncoverage_backdrop=%.3f\ncoverage_shadow=%.3f\ncoverage_fullscreen_draws=%u\ncoverage_basis=projected_bounds_upper_bound_screen_multiples\n",
+                lastCoverage.frame,lastCoverage.opaque,lastCoverage.generic,lastCoverage.failure,lastCoverage.backdrop,lastCoverage.shadow,lastCoverage.fullScreenDraws)>0;
             const bool flushed=std::fflush(file)==0 && ::fsync(::fileno(file))==0;
-            if(std::fclose(file)!=0 || !written || !timings || !gpuTimings || !counterStats || !alphaStats || !flushed)std::fputs("[hardware] status write failed\n",stderr);
+            if(std::fclose(file)!=0 || !written || !lows || !timings || !gpuTimings || !counterStats || !alphaStats || !descriptorStats || !coverageStats || !flushed)std::fputs("[hardware] status write failed\n",stderr);
         }else std::fputs("[hardware] status file unavailable\n",stderr);
         gpuTimeWindow.reset();
         gpuCounterWindow.reset();

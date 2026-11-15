@@ -107,6 +107,21 @@ set(celosia_deko_library deko3d)
 if(CELOSIA_DEKO_DIAGNOSTICS)
     set(celosia_deko_library deko3dd)
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/../optimization.cmake")
+foreach(target IN ITEMS celosia_hybrid_runtime ps2_iop celosia_hybrid_overrides celosia_switch_game)
+    celosia_optimize_compile(${target})
+endforeach()
+if(CELOSIA_OPT_LINK)
+    target_link_options(celosia_switch_game PRIVATE ${CELOSIA_OPT_LINK})
+endif()
+# SaltyNX FPS counter block for overlays (no effect when SaltyNX is absent).
+target_sources(celosia_switch_game PRIVATE "${CELOSIA_RUNTIME}/platform/switch/hybrid/saltynx_fps.cpp")
+if(CELOSIA_PGO STREQUAL "GENERATE")
+    target_sources(celosia_switch_game PRIVATE "${CELOSIA_RUNTIME}/platform/switch/hybrid/pgo_dump.cpp")
+    set_source_files_properties("${CELOSIA_RUNTIME}/platform/switch/hybrid/pgo_dump.cpp" PROPERTIES
+        COMPILE_DEFINITIONS "CELOSIA_PGO_DIR=\"${CELOSIA_PGO_DIR}\"")
+    target_link_options(celosia_switch_game PRIVATE -Wl,--wrap=fopen)
+endif()
 target_link_libraries(celosia_switch_game PRIVATE -Wl,--start-group -Wl,--whole-archive
     celosia_hybrid_overrides "${CELOSIA_HYBRID_GAME_ARCHIVE}" -Wl,--no-whole-archive
     celosia_hybrid_runtime ps2_iop ${celosia_deko_library} nx m -Wl,--end-group)

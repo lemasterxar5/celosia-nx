@@ -31,3 +31,7 @@ sysbot.json
 .env
 .env.*
 /PS2Recomp/ps2xRuntime/vita/module/
+
+# Private local build bundle
+/private/
+/local-tools.json

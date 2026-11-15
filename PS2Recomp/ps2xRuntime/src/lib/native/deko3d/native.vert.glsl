@@ -14,7 +14,8 @@ layout(location=3) noperspective out float fogAmount;
 layout(location=4) out float nearCull;
 void main() {
     vec4 c=u.clip*vec4(position,1.0);
-    gl_Position=vec4(c.xy,c.w-0.1,c.w);
+    // alpha.w>0 pins planned backdrops to the far plane so they test against the depth pre-pass.
+    gl_Position=vec4(c.xy,u.alpha.w>0.0?c.w:c.w-0.1,c.w);
     uv=texcoord+u.params.yz;
     shade=colour/128.0;
     shade.a*=u.params.x;

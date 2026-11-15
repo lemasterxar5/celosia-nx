@@ -129,6 +129,82 @@ Review `tools/switch/build-hybrid-game.ps1` and `tools/switch/hybrid-runtime/CMa
 
 Use `CELOSIA_DEKO_DIAGNOSTICS` only when a matching diagnostic deko3d SDK build is installed. Diagnostic counters are sampled and should not be treated as an exhaustive per-frame capture.
 
+### Build the NRO (Windows / PowerShell)
+
+Run these commands from the repository root in PowerShell, with `cmake` and Ninja on `PATH`. The existing packaging script uses Windows SDK executable names (`uam.exe`, `nacptool.exe`, `elf2nro.exe`); the commands below describe that supported host environment, not a tested Linux packaging procedure.
+
+**Before starting:** obtain a complete, compatible private generated runner from your own SCUS-97472 game data and the upstream recompilation workflow. It must contain `ps2_recompiled_functions.h`, `register_functions.cpp` and the generated `.cpp` functions matching this runtime and its overrides. Merely extracting an ISO does not produce these files. The public snapshot omits the complete generator setup, module-capture inputs and generated output; it does not currently reproduce this private generation stage end to end. Do not substitute an unrelated generated archive or enable the separate native-only ABI for this hybrid target.
+
+1. Set your local dependency and private input paths. Replace the example directories with real absolute paths; do not commit their contents.
+
+   ```powershell
+   $sdk = 'C:/devkitPro'
+   $sse = 'C:/deps/sse2neon'          # v1.9.1; contains sse2neon.h
+   $runner = 'C:/private/celosia/generated' # matching complete generated runner
+   $env:DEVKITPRO = $sdk
+   $compiler = "$sdk/devkitA64/bin/aarch64-none-elf-g++.exe"
+   $aotBuild = "$PWD/build/aot"
+   $runtimeBuild = "$PWD/build/switch"
+   $package = "$PWD/build/package"
+   $cross = @(
+       '-G', 'Ninja',
+       '-DCMAKE_SYSTEM_NAME=Generic',
+       '-DCMAKE_SYSTEM_PROCESSOR=aarch64',
+       '-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY',
+       "-DCMAKE_CXX_COMPILER=$compiler",
+       '-DCMAKE_BUILD_TYPE=Release'
+   )
+   ```
+
+2. Build the private native game archive. `CELOSIA_AOT_NATIVE_ONLY=OFF` selects the ABI used by the current hybrid game build. Start with a small parallel job count because the complete translation is large.
+
+   ```powershell
+   cmake -S tools/switch/aot -B $aotBuild @cross `
+       "-DCELOSIA_RUNNER_DIR=$runner" `
+       "-DCELOSIA_SSE2NEON_DIR=$sse" `
+       -DCELOSIA_AOT_NATIVE_ONLY=OFF
+   if ($LASTEXITCODE) { throw 'AOT configuration failed' }
+   cmake --build $aotBuild --target celosia_game_aot --parallel 2
+   if ($LASTEXITCODE) { throw 'AOT compilation failed' }
+   ```
+
+   The expected output is `build/aot/libcelosia_game_aot.a`. If you already have a compatible archive, skip this step and point the next configuration at it.
+
+3. Configure the Switch runtime and its game executable. The normal SDK path uses `deko3d`; diagnostics require the separately installed `deko3dd` library. Keep relocation-audit mode disabled when producing a playable package.
+
+   ```powershell
+   cmake -S tools/switch/hybrid-runtime -B $runtimeBuild @cross `
+       "-DCELOSIA_DEVKITPRO=$sdk" `
+       "-DCELOSIA_SSE2NEON_DIR=$sse" `
+       "-DCELOSIA_HYBRID_GAME_ARCHIVE=$aotBuild/libcelosia_game_aot.a" `
+       "-DCELOSIA_HYBRID_GAME_HEADERS=$runner" `
+       -DCELOSIA_DEKO_DIAGNOSTICS=OFF `
+       -DCELOSIA_HYBRID_RELOCATION_AUDIT=OFF
+   if ($LASTEXITCODE) { throw 'Switch configuration failed' }
+   ```
+
+4. Build and package using the supplied script. It builds `celosia_switch_game.elf`, compiles all five deko3d shaders with `uam`, generates NACP metadata, embeds the shader RomFS and invokes `elf2nro`.
+
+   ```powershell
+   ./tools/switch/build-hybrid-game.ps1 `
+       -CMake (Get-Command cmake).Source `
+       -BuildDirectory $runtimeBuild `
+       -OutputDirectory $package `
+       -DevkitPro $sdk -Jobs 2
+   if (-not $?) { throw 'NRO build or packaging failed' }
+   Get-FileHash "$package/celosia_switch_game.nro" -Algorithm SHA256
+   ```
+
+   The final NRO is **`build/package/celosia_switch_game.nro`**. The package directory also contains the ELF, `control.nacp`, shader staging files and `build.log`. The NRO embeds the shaders, **not the original game data**. `-PackageOnly` may be used to repackage an already successfully linked ELF; it does not compile changed C++ source. An ELF configured with relocation-audit mode is deliberately rejected by the packaging script.
+
+5. For local execution, the current application expects its working directory at **`sdmc:/switch/celosia-native-boot`** and loads the original game ELF at **`sdmc:/switch/celosia-native-boot/assets/SCUS_974.72`**. Place the NRO at the path configured in your existing homebrew forwarder and preserve the matching private extracted game-data layout. The original game ELF alone is not sufficient to play. This snapshot does not include a complete game-data deployment package or create/install a forwarder. Use the working forwarder setup rather than assuming an applet launch has enough memory.
+
+   The optional `tools/switch/prepare-disc.mjs` tool can inspect/extract your local disc, but its default extraction only selects recompilation inputs; it does not generate native game code or prepare a complete playable SD installation. Do not publish extracted or generated game material.
+
+**Troubleshooting:** missing `switch.h`, `sse2neon.h` or `zlib.h` indicates an SDK/dependency path problem. Missing `ps2_recompiled_functions.h` means the private runner is absent or incorrectly selected. Undefined game functions or duplicate overrides require a compatible complete translation, not placeholder stubs. Relocation/link failures must be resolved with matching Switch compiler/SDK inputs; do not turn on audit mode to disguise a failed playable link. No clock changes are made by these build commands.
+
+These commands are derived from the checked-in CMake targets and packaging script. Both the AOT and hybrid-runtime CMake configurations were freshly checked against the local SDK and private inputs; configuration and generation succeeded. This documentation update did not rebuild or run a new NRO. Host tests were verified for the published snapshot; a clean end-to-end playable rebuild using only public inputs remains blocked by the missing private generation stage described above.
+
 ## Credits and licensing
 
 Based on the supplied **Celosia** source snapshot and its macOS/Vita implementations. The supplied ZIP did not identify an exact upstream commit, so none is asserted here. See the [Celosia project progress site](https://henrykun55.github.io/celosia/) and [PS2Recomp](https://github.com/ran-j/PS2Recomp) for the upstream projects.

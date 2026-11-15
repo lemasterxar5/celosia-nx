@@ -1,8 +1,8 @@
 # colosia nx
 
-Experimental Nintendo Switch port of **Shadow of the Colossus**, based on the supplied Celosia and PS2Recomp sources. This repository preserves the current development progress through the **v47 hardware build**. It is a source snapshot, not a release or a finished game port.
+Experimental Nintendo Switch port of **Shadow of the Colossus**, based on the supplied Celosia and PS2Recomp sources. This repository preserves the current development progress through the **v60 hardware build**. It is a source snapshot, not a release or a finished game port.
 
-The project targets **native 1280 × 720 rendering at 60 FPS with stock clocks**. That performance target has **not** been reached. The permitted GPU ceiling for this project is **387 MHz**; the hardware measurements below were taken at **307.2 MHz**, without writing clock settings.
+The project targets **native 1280 × 720 rendering at 60 FPS with stock clocks**. That performance target has **not** been reached. The permitted GPU ceiling for this project is **387 MHz**; v43–v47 measurements used **307.2 MHz**; v57–v60 used **384 MHz** (set by the console's per-title clock profile, verified in the on-screen overlay).
 
 ## What is included
 
@@ -47,6 +47,11 @@ The following have been observed during development; they do not establish full-
 | Telemetry | Corrected elapsed application time, separated CPU and GPU timing, used the GPU timestamp scale of 625/384 ns, and read completed timestamp queries after their owning fences. |
 | v45: opaque policy | Added conservative texture/vertex alpha metadata so proven opaque draws can use a fragment shader without discard. Unknown and translucent cases retain the generic path. This change alone did not produce a meaningful measured gain. |
 | v46/v47: diagnostics | Added sampled vertex/fragment/primitive counters and opaque/generic/shadow draw counts, including alpha-mode statistics. |
+| v52: depth pre-pass | Depth-only pre-pass for opaque/alpha-tested geometry, then colour with early depth tests. A/B on the same build: GPU −9.2 ms stationary, −12.3 ms moving; fragments 20.3M→12.9M per sampled frame. |
+| v54: GPU segments | GPU time by draw category on sampled frames (pre-pass, backdrop, opaque, generic, alpha-fail, shadow, screen) in `hardware-status.txt`. |
+| v59: sky clear | Frames with background (sky) layers clear to the fog colour, as the GL renderer does; reduced the purple cloud tint in the checked view. |
+| v60: async frame submission | The game thread hands each frame's batch to the render worker without waiting (at most one frame in flight; GPU fences unchanged). The wait fell from ~11 ms to ~0.5 ms per frame. `CELOSIA_DIAG_SYNC_RENDER=1` restores the old behaviour. |
+| Tools | Frame-time log (`CELOSIA_DIAG_FRAME_LOG=1`), optional LTO/PGO (not adopted: worse moving minimums), SaltyNX NX-FPS bridge (not yet working on hardware: the SaltySD port is busy). |
 | v47: alpha pass policy | Added conservative proofs for passing alpha comparisons and skipping an empty alpha-fail pass. Generic handling remains when the proof is insufficient. The build ran on hardware, but its benchmark was interrupted before collecting the intended complete sample. |
 
 ## Hardware performance evidence
@@ -68,9 +73,22 @@ The matched shrine comparison showed approximately **4.8%** more presentations p
 
 **v47 preliminary observation, not a completed benchmark:** one accepted window contained 124 presentations in 5.04014 seconds, or **24.60 FPS**. The collection attempt then failed on a transient FTP `450` response while a status file was being written. One window is insufficient to establish a repeatable improvement; no completed v47 result is claimed. A later status sample reported about 40.7 ms of GPU time and roughly 20.3 million fragment invocations per sampled frame in that shrine view, indicating substantial GPU workload remains.
 
+### v57–v60 (shrine route, 1280 × 720, CPU 1020 / GPU 384 / memory 1331 MHz)
+
+Static view and scripted movement; "window min" is the slowest ~5 s window, plus worst frame and 1% low.
+
+| Build | Static: window min / avg / worst / 1% low | Moving: window min / avg / worst / 1% low |
+| --- | --- | --- |
+| v57 | 27.27 / 27.70 / 64.0 ms / 17.45 | 25.04 / 25.09 / 89.1 ms / 14.24 |
+| v59 | 26.39 / 26.82 / 101.9 ms / 13.07 | 24.95 / 26.34 / 102.0 ms / 10.81 |
+| v60 | 33.87 / 34.31 / 53.0 ms / 20.57 | 30.87 / 35.26 / 112.3 ms / 11.41 |
+
+At 384 MHz the GPU needs ~21.8 ms per static frame. After v60 the game thread spends ~19.5 ms in game code and ~9 ms in render hooks per frame. Both limits, and 45–65 ms spikes, are above the 16.7 ms needed for 60 FPS.
+
 ## Current limitations and next work
 
-- **720p/60 FPS is still a goal.** Current evidence is well below 60 FPS at the measured clocks.
+- **720p/60 FPS is still a goal.** v60 averages ~34 FPS; minimums are far lower. Next: game-thread time, render hooks, GPU alpha-fail pass (~7–11 ms), and spikes.
+- The SaltyNX/Status Monitor FPS counter is not yet working.
 - Reduce GPU fragment work, redundant generic/alpha passes and overdraw while preserving visibility and shadows.
 - Move appropriate skinning work to the GPU; current mesh skinning still consumes CPU time.
 - Validate sky behavior, shadows, transparency and resource reuse across more areas, camera positions and long sessions.

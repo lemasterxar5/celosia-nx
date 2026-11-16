@@ -1,4 +1,4 @@
-# colosia nx
+# celosia nx
 
 Experimental Nintendo Switch port of **Shadow of the Colossus**, based on the supplied Celosia and PS2Recomp sources. This repository preserves the current development progress through the **v60 hardware build**. It is a source snapshot, not a release or a finished game port.
 

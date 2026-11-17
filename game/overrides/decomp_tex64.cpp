@@ -54,6 +54,7 @@
 // the written bytes between the hand-over and the join is counted with its
 // reader (a missing join site). "[tex64] verify:" every 600 frames.
 #include "sotc_decomp.h"
+#include "sotc_spawn.h"
 #include "runtime/ps2_diag.h"
 
 #include "ps2_runtime.h"
@@ -276,7 +277,7 @@ namespace decomp_tex64
         if (g_started)
             return;
         g_started = true;
-        std::thread(loop).detach();
+        sotc_spawn::detached(loop);
     }
 
     void report()

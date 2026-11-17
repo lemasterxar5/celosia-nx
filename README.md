@@ -1,8 +1,8 @@
 # celosia nx
 
-Experimental Nintendo Switch port of **Shadow of the Colossus**, based on the supplied Celosia and PS2Recomp sources. This repository preserves the current development progress through the **v60 hardware build**. It is a source snapshot, not a release or a finished game port.
+Experimental Nintendo Switch port of **Shadow of the Colossus**, named after and based on the **Celosia** project and the PS2Recomp sources. This repository preserves the current development progress through the **v125 sources** (v124 is the latest build measured on hardware; v125 was built but not yet measured when this snapshot was taken). It is a source snapshot, not a release or a finished game port.
 
-The project targets **native 1280 × 720 rendering at 60 FPS with stock clocks**. That performance target has **not** been reached. The permitted GPU ceiling for this project is **387 MHz**; v43–v47 measurements used **307.2 MHz**; v57–v60 used **384 MHz** (set by the console's per-title clock profile, verified in the on-screen overlay).
+The project targets **native 1280 × 720 rendering at a 60 FPS minimum** (every frame, not an average), with the CPU and GPU each under 14 ms per frame. That target has **not** been reached yet. Clocks are never raised to hide performance problems: the permitted GPU ceiling is **387 MHz**; v43–v47 measurements used **307.2 MHz**; v57 onward used **384 MHz** with the CPU at **1020 MHz** and memory at **1331 MHz** (the console's per-title clock profile, verified in the on-screen overlay). Progress comes from rewriting the heaviest CPU and GPU paths natively with the same output.
 
 ## What is included
 
@@ -52,6 +52,15 @@ The following have been observed during development; they do not establish full-
 | v59: sky clear | Frames with background (sky) layers clear to the fog colour, as the GL renderer does; reduced the purple cloud tint in the checked view. |
 | v60: async frame submission | The game thread hands each frame's batch to the render worker without waiting (at most one frame in flight; GPU fences unchanged). The wait fell from ~11 ms to ~0.5 ms per frame. `CELOSIA_DIAG_SYNC_RENDER=1` restores the old behaviour. |
 | Tools | Frame-time log (`CELOSIA_DIAG_FRAME_LOG=1`), optional LTO/PGO (not adopted: worse moving minimums), SaltyNX NX-FPS bridge (not yet working on hardware: the SaltySD port is busy). |
+| v85–v89 | The game's GS bloom chain ported to deko3d; texture-cost telemetry; CD and model-hook workers on by default; an optional 30 FPS cap. |
+| v98: save states | Emulator-style full save states (the whole game state, not a position) on the SD card, usable after closing and reopening the game; memory-card saves are never touched. Verified on hardware: save, close, reopen, load, keep playing. |
+| v104–v116: lean shaders | The generic and opaque scene shaders replicate the whole GS feature set in one program. 256 compiled variants now hold only the paths each draw's state turns on (alpha test, background fade, mips, zero-add discard, early tests, near cull, untextured, opaque): same arithmetic, same picture. Measured per full-screen pass: 0.23 ms instead of 0.76–0.87 ms. Opening-cinematic GPU 24.3 → 20.2 ms. |
+| v106–v111 | Status/benchmark files written by a libnx background thread (std::thread terminates on this target); texture and large mesh storage from pooled 4 MiB pages instead of one GPU allocation per resource; recycled strip storage in the model builder. |
+| v120: one-channel masks | The bloom and soft-shadow masks hold one channel (every reader takes `.r`): the same values in a quarter of the bytes. Shadow resolve 3.6 → 1.5 ms. |
+| v121: background alpha merge | A background draw's FB_ONLY alpha test in the main pass writes passing and failing pixels alike (no depth writes either half), so it is drawn once without the test, in primitive order as on the GS. Alpha-fail pass 3.1 → 1.5 ms in the opening cinematic. |
+| v122: render command queue | The game thread hands the render worker typed command records in storage kept between frames, instead of one heap-allocated `std::function` per draw and two copies of every per-frame mesh. Largest gameplay gain so far (altar 45.7 → 52.4 FPS). |
+| v123–v125: render thread | Draw/upload lists keep their storage between frames; only the fragment stage is rebound between shader variants; the frame's draw sort moves each draw once (key sort) instead of `stable_sort` moving ~300-byte draws n log n times (2 ms of the 4.2 ms record time at ~1000 draws). Per-window render-thread timing in the present log. |
+| v117/v118 (not adopted) | Enabling the desktop/Vita offload workers on the Switch made gameplay worse (the three application cores are already busy); they stay off. |
 | v47: alpha pass policy | Added conservative proofs for passing alpha comparisons and skipping an empty alpha-fail pass. Generic handling remains when the proof is insufficient. The build ran on hardware, but its benchmark was interrupted before collecting the intended complete sample. |
 
 ## Hardware performance evidence
@@ -85,15 +94,29 @@ Static view and scripted movement; "window min" is the slowest ~5 s window, plus
 
 At 384 MHz the GPU needs ~21.8 ms per static frame. After v60 the game thread spends ~19.5 ms in game code and ~9 ms in render hooks per frame. Both limits, and 45–65 ms spikes, are above the 16.7 ms needed for 60 FPS.
 
+### v116–v124 (1280 × 720, CPU 1020 / GPU 384 / memory 1331 MHz)
+
+Gameplay route (static altar view, then scripted movement) and the opening cinematic used as a benchmark (start to title menu). "Shown at 60" is the share of cinematic frames presented within one 60 Hz refresh.
+
+| Build | Altar avg / window min FPS | Moving avg / window min FPS | Gameplay GPU (altar / moving) | Cinematic GPU avg | Cinematic frames shown at 60 |
+| --- | --- | --- | --- | --- | --- |
+| v116 | 44.1 / 43.9 | 37.9 / 29.0 | 17.0 / 18.8 ms | 20.2 ms | 45.4 % |
+| v120 | 45.4 / 44.3 | 42.6 / 35.7 | 13.1 / 12.1 ms | 17.8 ms | 49.9 % |
+| v121 | 45.7 / 45.3 | 40.9 / 37.1 | 13.1 / 14.5 ms | 15.2 ms | 63.2 % |
+| v122 | 52.4 / 51.9 | 47.6 / 40.7 | 13.1 / 13.9 ms | 15.1 ms | 68.5 % |
+| v124 | 53.6 / 52.6 | 52.0 / 48.2 | 13.1 / 11.9 ms | 15.3 ms | 68.1 % |
+
+Gameplay GPU time is now under the 14 ms goal; gameplay is limited by the CPU (the game thread and the render thread's command recording). Loading spikes at scene changes (100–150 ms in the cinematic) are still present.
+
 ## Current limitations and next work
 
-- **720p/60 FPS is still a goal.** v60 averages ~34 FPS; minimums are far lower. Next: game-thread time, render hooks, GPU alpha-fail pass (~7–11 ms), and spikes.
+- **720p/60 FPS minimum is still a goal.** v124 averages ~52–54 FPS in the tested gameplay route; the cinematic presents ~68 % of its frames at 60. Next: the render thread's recording and draw handling, the heaviest game-thread functions (scripts and AI are left as they are unless the rewrite is provably identical), the cinematic's haze layers and loading spikes; then retraining PGO on the final code.
 - The SaltyNX/Status Monitor FPS counter is not yet working.
 - Reduce GPU fragment work, redundant generic/alpha passes and overdraw while preserving visibility and shadows.
 - Move appropriate skinning work to the GPU; current mesh skinning still consumes CPU time.
 - Validate sky behavior, shadows, transparency and resource reuse across more areas, camera positions and long sessions.
 - Complete a repeatable v47 benchmark. The collector currently records an incomplete attempt when the transient FTP status-file error occurs; bounded retry still needs implementation.
-- Soft shadow filtering and several advanced upstream effects, including parts of post-processing/reflection/refraction, are absent or disabled on this target.
+- Several advanced upstream effects, including parts of post-processing/reflection/refraction, are absent or disabled on this target (soft shadows and the GS bloom are implemented).
 - The Switch target does not provide the upstream FFmpeg decoder (`PS2X_HAS_FFMPEG=0`). Do not assume complete movie compatibility from the tested startup sequence.
 - Colossus encounters, full progression, all saves and whole-game stability have not been comprehensively validated.
 
@@ -126,7 +149,7 @@ ctest --test-dir build/host-tests --output-on-failure
 python -m unittest discover -s tools/switch/hardware -p 'test_*.py'
 ```
 
-Validation of the v60 sources passed **17/17 host CTest targets** and **32/32 Python tests** (`tools/switch/hardware`). The native executor test (asynchronous post/drain included) is built separately from `PS2Recomp/ps2xRuntime/platform/switch/tests/native_executor_test.cpp` and passed 1,070 checks (1,076 with `CELOSIA_EXECUTOR_TEST_WAIT_FAILURE`).
+These host tests were last run on the v60 sources and have not been re-run for this snapshot. Validation of the v60 sources passed **17/17 host CTest targets** and **32/32 Python tests** (`tools/switch/hardware`). The native executor test (asynchronous post/drain included) is built separately from `PS2Recomp/ps2xRuntime/platform/switch/tests/native_executor_test.cpp` and passed 1,070 checks (1,076 with `CELOSIA_EXECUTOR_TEST_WAIT_FAILURE`).
 
 The alpha-policy regression executable evaluated **17,044,151 checks**, including comparison against shader float behavior. These tests cover selected policies, ownership, timing and tools; no project-wide coverage percentage or whole-game correctness is claimed.
 
@@ -201,7 +224,7 @@ Run these commands from the repository root in PowerShell, with `cmake` and Ninj
    if ($LASTEXITCODE) { throw 'Switch configuration failed' }
    ```
 
-4. Build and package using the supplied script. It builds `celosia_switch_game.elf`, compiles all five deko3d shaders with `uam`, generates NACP metadata, embeds the shader RomFS and invokes `elf2nro`.
+4. Build and package using the supplied script. It builds `celosia_switch_game.elf`, compiles the deko3d shaders with `uam` (including the 256 lean scene-shader variants generated from `lean.frag.glsl`), generates NACP metadata, embeds the shader RomFS and invokes `elf2nro`.
 
    ```powershell
    ./tools/switch/build-hybrid-game.ps1 `
@@ -225,6 +248,6 @@ These commands are derived from the checked-in CMake targets and packaging scrip
 
 ## Credits and licensing
 
-Based on the supplied **Celosia** source snapshot and its macOS/Vita implementations. The supplied ZIP did not identify an exact upstream commit, so none is asserted here. See the [Celosia project progress site](https://henrykun55.github.io/celosia/) and [PS2Recomp](https://github.com/ran-j/PS2Recomp) for the upstream projects.
+The project is named after and based on the supplied **Celosia** source snapshot and its macOS/Vita implementations. The supplied ZIP did not identify an exact upstream commit, so none is asserted here. See the [Celosia project progress site](https://henrykun55.github.io/celosia/) and [PS2Recomp](https://github.com/ran-j/PS2Recomp) for the upstream projects.
 
 Existing GPL-3.0 license texts and source notices are retained in `LICENSE` and `PS2Recomp/LICENSE`. External dependencies retain their own licenses and must be obtained separately. This repository does not contain or grant rights to the original game's assets. It is an unofficial development project and is not affiliated with Sony or the original developers.

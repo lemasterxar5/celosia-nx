@@ -1,4 +1,5 @@
 #include <tuple>
+#include "sotc_spawn.h"
 // Shadow of the Colossus: models drawn by the native renderer
 // (runtime/native_renderer.h) straight from the game's own model data, read
 // at modelDisp (docs/native_renderer_map.md). SOTC_NATIVE=1 shows that
@@ -57,6 +58,12 @@ namespace char104 // round 104 (decomp_char104.cpp)
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <stdexcept>
+#if defined(__SWITCH__)
+#include <pthread.h>
+#include "../../PS2Recomp/ps2xRuntime/platform/switch/hybrid/live_settings.hpp"
+extern "C" void celosia_menu_frame();
+#endif
 #include <mutex>
 #include <map>
 #include <memory>
@@ -338,7 +345,7 @@ namespace sotc_native
     // Skin: w = bone count, x/y/z = bone index + weight (the fraction; one
     // bone: full weight); the bone is palette matrix n (VU1 qwords 4n..4n+3).
     template <typename Mem>
-    void readBatchesFrom(const Mem &m, uint32_t addr, uint32_t size, std::vector<Strip> &out)
+    void readBatchesFrom(const Mem &m, uint32_t addr, uint32_t size, std::vector<Strip> &out, std::vector<Strip> *spare = nullptr)
     {
         const uint32_t end = addr + size;
         uint32_t p = addr;
@@ -391,7 +398,14 @@ namespace sotc_native
             {
                 if (positions)
                 {
-                    Strip strip(count);
+                    // v110: a spare strip's room reused when given (every vertex is assigned whole below).
+                    Strip strip;
+                    if (spare && !spare->empty())
+                    {
+                        strip = std::move(spare->back());
+                        spare->pop_back();
+                    }
+                    strip.resize(count);
                     for (uint32_t i = 0; i < count; ++i)
                     {
                         BatchVertex &v = strip[i];
@@ -492,7 +506,12 @@ namespace sotc_native
     template <typename Place>
     void triangulate(const std::vector<Strip> &strips, Place place, std::vector<native_renderer::Vertex> &out, bool secondTexture = false)
     {
-        std::vector<native_renderer::Vertex> placed;
+        // v110: the room for every triangle at once and the placed strip's buffer kept (same output).
+        size_t triangles = 0;
+        for (const Strip &strip : strips)
+            triangles += strip.size() > 2u ? strip.size() - 2u : 0u;
+        out.reserve(out.size() + triangles * 3u);
+        thread_local std::vector<native_renderer::Vertex> placed;
         for (const Strip &strip : strips)
         {
             placed.resize(strip.size());
@@ -899,7 +918,55 @@ namespace sotc_native
 
     bool decodeTextureReference(uint32_t header, std::vector<uint8_t> &rgba, uint32_t &decodedOut);
 
+    // Texture cost (development measurement; CELOSIA_DIAG_TEX_COST=0 off): the game thread's time in
+    // decodedTexture (lookup, hash, synchronous decode), the worker's decode time and the upload
+    // (backend staging copy), per frame; printed per 120 frames and for frames over 4 ms.
+    struct TexCost
+    {
+        std::atomic<uint64_t> gameUs{0}, decodeUs{0}, uploadUs{0}, misses{0}, uploads{0}, bytes{0};
+    };
+    TexCost g_texCost;
+    bool texCostOn()
+    {
+        static const bool on = !std::getenv("CELOSIA_DIAG_TEX_COST") || std::atoi(std::getenv("CELOSIA_DIAG_TEX_COST")) != 0;
+        return on;
+    }
+    uint64_t decodedTextureImpl(uint32_t header);
     uint64_t decodedTexture(uint32_t header)
+    {
+        if (!texCostOn())
+            return decodedTextureImpl(header);
+        const uint64_t start = native_renderer::nowUs();
+        const uint64_t key = decodedTextureImpl(header);
+        g_texCost.gameUs.fetch_add(native_renderer::nowUs() - start, std::memory_order_relaxed);
+        return key;
+    }
+    void texCostFrameEnd()
+    {
+        if (!texCostOn())
+            return;
+        static uint64_t frames = 0, game = 0, decode = 0, upload = 0, misses = 0, uploads = 0, bytes = 0, worstFrame = 0, spikes = 0;
+        const uint64_t g = g_texCost.gameUs.exchange(0, std::memory_order_relaxed), d = g_texCost.decodeUs.exchange(0, std::memory_order_relaxed),
+                       u = g_texCost.uploadUs.exchange(0, std::memory_order_relaxed), m = g_texCost.misses.exchange(0, std::memory_order_relaxed),
+                       n = g_texCost.uploads.exchange(0, std::memory_order_relaxed), b = g_texCost.bytes.exchange(0, std::memory_order_relaxed);
+        ++frames;
+        game += g, decode += d, upload += u, misses += m, uploads += n, bytes += b;
+        worstFrame = std::max(worstFrame, g + u);
+        if (g + u >= 4000u && spikes < 200u)
+        {
+            ++spikes;
+            std::fprintf(stderr, "[tex-spike] game_us=%llu upload_us=%llu worker_decode_us=%llu misses=%llu uploads=%llu kb=%llu\n", (unsigned long long)g,
+                         (unsigned long long)u, (unsigned long long)d, (unsigned long long)m, (unsigned long long)n, (unsigned long long)(b / 1024u));
+        }
+        if (frames == 120u)
+        {
+            std::fprintf(stderr, "[tex-cost] frames=120 game_ms=%.2f upload_ms=%.2f worker_decode_ms=%.2f worst_frame_ms=%.2f misses=%llu uploads=%llu mb=%.2f\n",
+                         game / 1000.0, upload / 1000.0, decode / 1000.0, worstFrame / 1000.0, (unsigned long long)misses, (unsigned long long)uploads,
+                         bytes / 1048576.0);
+            frames = game = decode = upload = misses = uploads = bytes = worstFrame = 0;
+        }
+    }
+    uint64_t decodedTextureImpl(uint32_t header)
     {
         SOTC_READ_SITE(6);
         if (!header || word(header) != 0x324F544Eu) // "NTO2"
@@ -1036,6 +1103,8 @@ namespace sotc_native
         auto src = std::make_shared<TexSource>();
         if (!texSource(header, *src))
             return 0; // no room: asked for again at the next draw
+        if (texCostOn())
+            g_texCost.misses.fetch_add(1, std::memory_order_relaxed);
         // SOTC_TEX_DECODE_CHECK=1 (debugging): every texture also decoded by
         // the earlier per-pixel code, and the two compared.
         static const bool decodeCheck = ps2_diag::env("SOTC_TEX_DECODE_CHECK") != nullptr;
@@ -1077,12 +1146,25 @@ namespace sotc_native
                     std::fclose(f);
                 }
             }
+            const uint64_t uploadStart = texCostOn() ? native_renderer::nowUs() : 0u;
             native_renderer::uploadTexture(key, width, height, rgba.data(), decoded);
+            if (uploadStart)
+            {
+                g_texCost.uploadUs.fetch_add(native_renderer::nowUs() - uploadStart, std::memory_order_relaxed);
+                g_texCost.uploads.fetch_add(1, std::memory_order_relaxed);
+                g_texCost.bytes.fetch_add(static_cast<uint64_t>(width) * height * 4u, std::memory_order_relaxed);
+            }
         };
         // On the worker: decoded there, uploaded at the next frame's start.
         auto out = std::make_shared<std::pair<std::vector<uint8_t>, uint32_t>>();
         auto ok = std::make_shared<bool>(false);
-        if (!changedInPlace && native_renderer::buildAsync({key}, [src, out, ok] { *ok = decodeTexture(*src, out->first, out->second); },
+        if (!changedInPlace && native_renderer::buildAsync({key}, [src, out, ok]
+                                        {
+                                            const uint64_t t = texCostOn() ? native_renderer::nowUs() : 0u;
+                                            *ok = decodeTexture(*src, out->first, out->second);
+                                            if (t)
+                                                g_texCost.decodeUs.fetch_add(native_renderer::nowUs() - t, std::memory_order_relaxed);
+                                        },
                                         [out, ok, finish]
                                         {
                                             if (*ok)
@@ -3754,6 +3836,9 @@ namespace sotc_native
         applied = want;
         at = g_frame;
     }
+#if defined(__SWITCH__)
+    void quickPosition();
+#endif
     void endFrame()
     {
         if (g_frame == 0)
@@ -3873,6 +3958,10 @@ namespace sotc_native
         // Without 3D this frame (loading, menus over black) the bloom mask would
         // take the empty screen for sky and glow all over it.
         native_renderer::setBloom(g_bloomRan && g_modelDraws ? bloomParams() : native_renderer::Bloom{});
+        texCostFrameEnd();
+#if defined(__SWITCH__)
+        celosia_menu_frame();
+#endif
         g_modelDraws = 0;
         g_bloomRan = false;
         // Drawn larger than the PS2's 512 x 448 (F10 / SOTC_RENDER_SCALE): the
@@ -3886,6 +3975,112 @@ namespace sotc_native
         const bool wantNative = both ? shownTune.bothShowNative : shownTune.showNative;
         native_renderer::setShown(wantNative && !shownTune.forceEmulated && g_frameDraws != 0);
     }
+
+#if defined(__SWITCH__)
+    // The menu's quick positions (v90; not a full save state): Wander's position (the player
+    // object's +0x170, as the input recorder's state lines read it) kept in three slots for this
+    // session and written back on load, between two logic frames (the native frame's end).
+    void quickPosition()
+    {
+        // v91: +0x170 alone is rewritten from elsewhere each frame; every place in the player
+        // object's first 4 KB holding the same x y z (a matrix row, the previous position...) is
+        // found at save time and all of them are written back.
+        struct Slot { bool used = false; float pos[3]{}; uint32_t player = 0; uint32_t offsets[16]{}; int count = 0; };
+        static Slot slots[3];
+        auto &live = celosia::live::settings();
+        // v92: after a load, where the player ends up (every 5 frames for 60).
+        static int follow = 0;
+        static uint32_t followPlayer = 0;
+        if (follow > 0 && g_ram && followPlayer)
+        {
+            if (follow % 5 == 0)
+                std::fprintf(stderr, "[quickpos] after %d: %.3f %.3f %.3f\n", 60 - follow, real(followPlayer + 0x170u), real(followPlayer + 0x174u),
+                             real(followPlayer + 0x178u));
+            --follow;
+        }
+        const int save = live.saveRequest.exchange(0), load = live.loadRequest.exchange(0);
+        if (!save && !load)
+            return;
+        const uint32_t index = word(0x01465900u) & 0xFFFFu;
+        const uint32_t player = index ? word(0x0021B900u + index * 24u) : 0u;
+        if (!g_ram || !player || player >= 0x2000000u - 0x200u)
+        {
+            live.stateResult = -1; // no player object (menus, cutscenes)
+            return;
+        }
+        if (save >= 1 && save <= 3)
+        {
+            Slot &s = slots[save - 1];
+            for (int j = 0; j < 3; ++j)
+                s.pos[j] = real(player + 0x170u + j * 4u);
+            s.player = player;
+            s.used = true;
+            s.count = 0;
+            char found[256];
+            int at = 0;
+            found[0] = 0;
+            for (uint32_t o = 0; o + 12u <= 0x1000u && s.count < 16; o += 4u)
+            {
+                bool same = true;
+                for (int j = 0; j < 3 && same; ++j)
+                    same = std::fabs(real(player + o + j * 4u) - s.pos[j]) < 0.01f;
+                if (same)
+                {
+                    s.offsets[s.count++] = o;
+                    at += std::snprintf(found + at, sizeof(found) - size_t(at), " %x", o);
+                    if (at >= int(sizeof(found)) - 8)
+                        break;
+                }
+            }
+            std::fprintf(stderr, "[quickpos] copies at%s\n", found);
+            std::fprintf(stderr, "[quickpos] save %d player %x at %.3f %.3f %.3f\n", save, player, s.pos[0], s.pos[1], s.pos[2]);
+            live.stateResult = 1;
+        }
+        else if (load >= 1 && load <= 3)
+        {
+            const Slot &s = slots[load - 1];
+            if (!s.used)
+            {
+                live.stateResult = -2; // empty slot
+                return;
+            }
+            uint8_t *ram = const_cast<uint8_t *>(g_ram);
+            if (s.player != player)
+            {
+                live.stateResult = -3; // another player object (a new area or a reload)
+                return;
+            }
+            {
+                float cur[3];
+                std::memcpy(cur, ram + player + 0x170u, sizeof(cur));
+                char found[512];
+                int at = 0, n = 0;
+                found[0] = 0;
+                for (uint32_t a = 0x100000u; a + 12u <= 0x2000000u && n < 32; a += 4u)
+                {
+                    if (a >= player && a < player + 0x1000u)
+                        continue;
+                    float v[3];
+                    std::memcpy(v, ram + a, sizeof(v));
+                    if (std::fabs(v[0] - cur[0]) < 0.001f && std::fabs(v[1] - cur[1]) < 0.001f && std::fabs(v[2] - cur[2]) < 0.001f)
+                    {
+                        ++n;
+                        if (at < int(sizeof(found)) - 12)
+                            at += std::snprintf(found + at, sizeof(found) - size_t(at), " %x", a);
+                    }
+                }
+                std::fprintf(stderr, "[quickpos] from %.3f %.3f %.3f, %d outside copies:%s\n", cur[0], cur[1], cur[2], n, found);
+            }
+            follow = 60;
+            followPlayer = player;
+            for (int k = 0; k < s.count; ++k)
+                (void)k; // v93: no writes until the real position state is known (v90-v92 failed)
+
+            std::fprintf(stderr, "[quickpos] load %d player %x to %.3f %.3f %.3f\n", load, player, s.pos[0], s.pos[1], s.pos[2]);
+            live.stateResult = -4; // v93: loading is disabled (it did not work)
+        }
+    }
+#endif
 
     void getCameraContextHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -5487,7 +5682,23 @@ namespace sotc_native
             const unsigned int stackDefault = _pthread_stack_default_user;
             _pthread_stack_default_user = 512u * 1024u; // the packet builds' strips / skinned packets
 #endif
+#if defined(__SWITCH__)
+            {
+                // As the Vita: 512 KB for the packet builds' strips / skinned packets (the default
+                // pthread stack is smaller); the loop places itself (threads::place, core 2).
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setstacksize(&attr, 512u * 1024u);
+                pthread_t worker;
+                const int created = pthread_create(&worker, &attr, [](void *) -> void * { loop(); return nullptr; }, nullptr);
+                pthread_attr_destroy(&attr);
+                if (created != 0)
+                    throw std::runtime_error("hook worker thread creation failed");
+                pthread_detach(worker);
+            }
+#else
             std::thread(loop).detach();
+#endif
 #if defined(__vita__)
             _pthread_stack_default_user = stackDefault;
 #endif
@@ -10180,7 +10391,7 @@ namespace sotc_native
             {
                 g_started = true;
                 sotc_decomp::g_clipJoin = [] { join(kJClip); };
-                std::thread(loop).detach();
+                sotc_spawn::detached(loop);
             }
             if ((g_jobs || g_verifyJobs) && sotc_native::g_frame % 600u == 0u)
             {
@@ -11183,8 +11394,14 @@ namespace sotc_native
             else if (needsBuild)
             {
                 SOTC_PROF_SCOPE(kHookBuild);
+                // v110: the last packet's strips kept as spare room (an area change builds ~1 900 packets
+                // in one frame; each strip was an allocation and a free).
+                static std::vector<Strip> spareStrips;
+                for (Strip &old : strips)
+                    if (spareStrips.size() < 512u)
+                        spareStrips.push_back(std::move(old));
                 strips.clear();
-                readBatches(data, size, strips);
+                readBatchesFrom(GuestMem{}, data, size, strips, &spareStrips);
                 if (skinned(strips) && lit(strips))
                     g_litPackets.insert(id);
                 if (skinned(strips))
@@ -12133,4 +12350,17 @@ void installSotcNative(PS2Runtime &runtime)
 #endif
 #endif
 extern "C" __attribute__((used)) const unsigned char sotc_vita_elf_room[SOTC_VITA_ELF_ROOM] = {1};
+#endif
+
+#if defined(__SWITCH__)
+// Save states (v94, save_states.cpp): after a load every guest address can hold something else;
+// the native hooks' memos by address sample again (as after a heap move) and the model plan
+// cache starts empty. Textures are keyed by content and stay.
+extern "C" void celosia_native_after_state_load()
+{
+    if (sotc_decomp::g_beforeGuestMove)
+        sotc_decomp::g_beforeGuestMove();
+    ++sotc_decomp::g_guestMoveSerial;
+    sotc_native::planCache97Clear();
+}
 #endif

@@ -2,7 +2,7 @@
 layout(location=0) in vec3 position;
 layout(std140,binding=0) uniform Material {
     mat4 clip, directions, colours;
-    vec4 params, fog, fogColour, lod, alpha, debug;
+    vec4 params, fog, fogColour, lod, alpha, debug, bgFog;
 } u;
 void main() {
     vec4 c=u.clip*vec4(position,1.0);

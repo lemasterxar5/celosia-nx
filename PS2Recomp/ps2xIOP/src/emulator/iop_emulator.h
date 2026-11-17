@@ -25,6 +25,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // Save states (v94): the whole IOP (memory, SPU2, kernel, drivers, timers, RPC, the sound
+        // driver) as bytes. safeForState: not inside IOP code. loadState checks that the same
+        // modules are loaded at the same addresses (they are not reloaded).
+        [[nodiscard]] bool safeForState(std::string &why) const;
+        [[nodiscard]] std::vector<uint8_t> saveState() const;
+        bool loadState(const uint8_t *data, size_t size, std::string &error);
         // Interleaved stereo 48 kHz frames produced by the SPU2 (any thread).
         size_t readAudio(int16_t *destination, size_t frames) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);

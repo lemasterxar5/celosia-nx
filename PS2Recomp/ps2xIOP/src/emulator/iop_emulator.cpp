@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstdlib>
 #include "iop_emulator.h"
+#include "../../../ps2xRuntime/include/runtime/state_stream.h"
 #include <cstring>
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -823,6 +824,153 @@ namespace ps2x::iop::detail
     IopEmulator::IopEmulator(IopHost &host)
         : m_impl(std::make_unique<Impl>(host))
     {
+    }
+
+    bool IopEmulator::safeForState(std::string &why) const
+    {
+        const Impl &d = *m_impl;
+        if (d.activeCpu || d.callDepth != 0u || d.servicingDmaInterrupts || d.servicingGuestCallbacks)
+        {
+            why = "the IOP is running code";
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> IopEmulator::saveState() const
+    {
+        Impl &d = *m_impl;
+        ps2state::StateWriter out;
+        out.tag("IOPS");
+        out.u32(1u);
+        // The modules, checked at load.
+        out.u32(static_cast<uint32_t>(d.modules.size()));
+        for (const auto &[id, m] : d.modules)
+        {
+            out.i32(id);
+            out.u32(static_cast<uint32_t>(m.name.size()));
+            out.raw(m.name.data(), m.name.size());
+            out.u32(m.base);
+            out.u32(m.size);
+        }
+        out.flag(d.sg2Loaded.load(std::memory_order_relaxed));
+        out.flag(d.cpuHalted);
+        d.memory.saveState(out);
+        d.kernel.saveState(out);
+        out.blob(d.cdvd.saveStateBytes());
+        d.rpc.saveState(out);
+        d.intrman.saveState(out);
+        d.timrman.saveState(out);
+        d.ioman.saveState(out);
+        d.imports.saveState(out);
+        d.sg2.saveState(out);
+        out.u32(static_cast<uint32_t>(d.pendingDmaInterrupts.size()));
+        for (const auto &[k, v] : d.pendingDmaInterrupts)
+        {
+            out.i32(k);
+            out.u64(v);
+        }
+        out.u32(static_cast<uint32_t>(d.pendingGuestCallbacks.size()));
+        for (const auto &[k, v] : d.pendingGuestCallbacks)
+        {
+            out.u64(k);
+            out.pod(v);
+        }
+        out.u32(d.nextModuleId);
+        out.u32(d.moduleCursor);
+        out.u64(d.totalCycles);
+        out.u64(d.idleUntil);
+        out.u64(d.totalInstructions);
+        out.u64(d.eeCycleCarry);
+        out.pod(d.secrMcCommandHandler);
+        out.pod(d.secrMcDevIdHandler);
+        out.pod(d.checkKelfPathCallback);
+        out.tag("IOPE");
+        return std::move(out.bytes);
+    }
+
+    bool IopEmulator::loadState(const uint8_t *data, size_t size, std::string &error)
+    {
+        Impl &d = *m_impl;
+        ps2state::StateReader in(data, size);
+        in.tag("IOPS");
+        if (in.u32() != 1u)
+            in.fail("IOP state version");
+        const uint32_t moduleCount = in.u32();
+        if (in.ok() && moduleCount != d.modules.size())
+            in.fail("the IOP has other modules loaded (" + std::to_string(d.modules.size()) + " now, " + std::to_string(moduleCount) + " saved)");
+        for (uint32_t i = 0; i < moduleCount && in.ok(); ++i)
+        {
+            const int id = in.i32();
+            const uint32_t len = in.u32();
+            std::string name(len < 4096u ? len : 0u, char(0));
+            if (len >= 4096u)
+                in.fail("bad module name");
+            in.raw(name.data(), name.size());
+            const uint32_t base = in.u32(), msize = in.u32();
+            auto it = d.modules.find(id);
+            if (in.ok() && (it == d.modules.end() || it->second.name != name || it->second.base != base || it->second.size != msize))
+                in.fail("module " + name + " is not loaded where it was");
+        }
+        if (!in.ok())
+        {
+            error = in.error();
+            return false;
+        }
+        d.sg2Loaded = in.flag();
+        d.cpuHalted = in.flag();
+        d.memory.loadState(in);
+        d.kernel.loadState(in);
+        {
+            std::vector<uint8_t> cdvd;
+            in.blob(cdvd, 4096u);
+            if (in.ok() && !d.cdvd.loadStateBytes(cdvd.data(), cdvd.size()))
+                in.fail("CDVD state");
+        }
+        d.rpc.loadState(in);
+        d.intrman.loadState(in);
+        d.timrman.loadState(in);
+        d.ioman.loadState(in);
+        d.imports.loadState(in);
+        d.sg2.loadState(in);
+        d.pendingDmaInterrupts.clear();
+        {
+            const uint32_t n = in.u32();
+            if (n > 4096u)
+                in.fail("bad DMA interrupt count");
+            for (uint32_t i = 0; i < n && in.ok(); ++i)
+            {
+                const int k = in.i32();
+                d.pendingDmaInterrupts[k] = in.u64();
+            }
+        }
+        d.pendingGuestCallbacks.clear();
+        {
+            const uint32_t n = in.u32();
+            if (n > 65536u)
+                in.fail("bad IOP callback count");
+            for (uint32_t i = 0; i < n && in.ok(); ++i)
+            {
+                const uint64_t k = in.u64();
+                d.pendingGuestCallbacks.emplace(k, in.pod<Impl::ScheduledGuestCallback>());
+            }
+        }
+        d.nextModuleId = in.u32();
+        d.moduleCursor = in.u32();
+        d.totalCycles = in.u64();
+        d.idleUntil = in.u64();
+        d.totalInstructions = in.u64();
+        d.eeCycleCarry = in.u64();
+        d.secrMcCommandHandler = in.pod<Impl::GuestCallback>();
+        d.secrMcDevIdHandler = in.pod<Impl::GuestCallback>();
+        d.checkKelfPathCallback = in.pod<Impl::GuestCallback>();
+        in.tag("IOPE");
+        d.activeCpu = nullptr;
+        d.callDepth = 0u;
+        d.servicingDmaInterrupts = d.servicingGuestCallbacks = false;
+        if (!in.ok())
+            error = in.error();
+        return in.ok();
     }
 
     IopEmulator::~IopEmulator() = default;

@@ -6,6 +6,20 @@ using detail::deko::pipelineKey;
 int main(){
     unsigned checks=0;auto check=[&](bool value){++checks;if(!value)throw std::runtime_error("Pipeline regression");};
     DrawState d;auto key=pipelineKey(d,false);check(key.depth==3&&key.mask==15);
+    {
+        using detail::deko::alphaTestWithoutEffect;
+        DrawState a;a.alphaTest=0x140b;check(!alphaTestWithoutEffect(a)); // Normal writes depth
+        a.blend=Blend::Additive;check(alphaTestWithoutEffect(a));
+        a.writeDepth=true;check(!alphaTestWithoutEffect(a));
+        a.writeDepth=false;a.alphaTest=0x240b;check(!alphaTestWithoutEffect(a)); // ZB_ONLY discards
+        a.alphaTest=0x340b;check(!alphaTestWithoutEffect(a));                    // RGB_ONLY keeps alpha
+        a.alphaTest=0x040b;check(!alphaTestWithoutEffect(a));                    // KEEP discards
+        a.alphaTest=0x140a;check(!alphaTestWithoutEffect(a));                    // test disabled
+        a.alphaTest=0x140b;a.background=true;check(!alphaTestWithoutEffect(a));
+        a.background=false;a.shadowVolume=true;check(!alphaTestWithoutEffect(a));
+        DrawState n;n.alphaTest=0x140b;n.noDepthWrite=true;check(alphaTestWithoutEffect(n));
+        n.noDepthWrite=false;n.overlay=true;check(alphaTestWithoutEffect(n));
+    }
     d.screen=true;check(pipelineKey(d,false).depth==0);
     d.screenDepthTest=true;check(pipelineKey(d,false).depth==1);
     d={};d.blend=Blend::Additive;check(pipelineKey(d,false).depth==1);

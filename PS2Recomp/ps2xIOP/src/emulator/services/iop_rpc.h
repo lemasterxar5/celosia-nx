@@ -1,5 +1,9 @@
 #pragma once
 
+#include <type_traits>
+#include <vector>
+#include <string>
+#include <map>
 #include "ps2x/iop/iop_types.h"
 
 #include <cstddef>
@@ -54,6 +58,31 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+
+        // Save states (v94).
+        template <typename W>
+        void saveState(W &out) const
+        {
+            std::map<uint32_t, RpcServer> sorted(m_servers.begin(), m_servers.end());
+            out.u32(static_cast<uint32_t>(sorted.size()));
+            for (const auto &kv : sorted) { out.pod(kv.first); out.pod(kv.second); }
+            out.u32(m_nextDmaId); out.flag(m_sifInitialized);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            {
+                m_servers.clear();
+                const uint32_t n = in.u32();
+                if (n > 65536u) { in.fail("bad IOP table"); return false; }
+                for (uint32_t i = 0; i < n && in.ok(); ++i) {
+                    const auto key = in.template pod<typename std::decay_t<decltype(m_servers)>::key_type>();
+                    m_servers[key] = in.template pod<typename std::decay_t<decltype(m_servers)>::mapped_type>();
+                }
+            }
+            m_nextDmaId = in.u32(); m_sifInitialized = in.flag();
+            return in.ok();
+        }
 
     private:
         struct RpcServer

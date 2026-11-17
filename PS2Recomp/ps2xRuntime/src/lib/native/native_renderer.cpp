@@ -1,6 +1,14 @@
 // The native renderer's front: picks a backend (native_backend.h) the first
 // time it is used. macOS: Metal, or OpenGL with SOTC_NATIVE_GL=1 (to check
 // the GL path against Metal); the Vita: OpenGL (vitaGL); Switch: direct deko3d.
+#if defined(__SWITCH__)
+extern "C" {
+#include <switch.h>
+}
+#endif
+#include <atomic>
+// Switch helper-thread placement flags (bit 0 stay put, bit 1 log), set once by main.cpp.
+std::atomic<int> celosia_thread_flags{0};
 #include "native_backend.h"
 #include "runtime/ps2_diag.h"
 #include "runtime/native_tuning.h"
@@ -1619,7 +1627,35 @@ namespace native_renderer
             return at;
         }
 #else
+#if defined(__SWITCH__)
+        // Switch: game (core 0, placed by its own thread) and render (core 1) keep their cores; the
+        // helper threads (hook worker, disc reader, lane, log, ...) go to core 2, the third
+        // application core, when the process mask allows it. Priority is left as created.
+        void place(Kind kind)
+        {
+            if (kind == kGame || kind == kRender || kind == kMain)
+                return;
+            // No getenv/stdio here: helper threads call this first thing, while other threads write the
+            // log (stderr on the SD card is not safe to share). main.cpp sets the flags before any thread.
+            const int flags = celosia_thread_flags.load(std::memory_order_acquire);
+            if (flags & 1)
+                return; // CELOSIA_DIAG_NO_CORE2: stay where created
+            // v118: the offload workers (tex64, the guest worker, the lane) on core (flags >> 4) & 3 when set
+            // (CELOSIA_DIAG_OFFLOAD_CORE; default 1, the render core): core 2 already runs the main thread,
+            // the hook worker and the disc reader near saturation (v117: the altar 44 -> 36 FPS there).
+            int core = 2;
+            if ((kind == kOffload || kind == kGuest || kind == kLane) && (flags & 0x40))
+                core = (flags >> 4) & 3;
+            u64 allowed = 0;
+            if (R_FAILED(svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || !(allowed & (1ull << core)))
+                return;
+            const Result moved = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
+            if (flags & 2) // CELOSIA_DIAG_THREAD_LOG
+                std::fprintf(stderr, "[thread] kind %d to core 2 result=0x%x\n", static_cast<int>(kind), moved);
+        }
+#else
         void place(Kind) {}
+#endif
         void setKindPriority(Kind, int) {}
         void sample() {}
         int line(char *out, size_t room, double, bool, bool)

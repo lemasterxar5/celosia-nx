@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ps2_runtime.h"
+#include "runtime/state_stream.h"
+#include <string>
 
 #include <array>
 #include <atomic>
@@ -79,6 +81,17 @@ struct EeWaitState
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
     std::function<void(R5900Context &)> completion;
+    // Save states: what `completion` does, as data (EeResumeKind), so a blocked thread can be
+    // written to a file and rebuilt after a restart. A completion without a kind cannot be saved.
+    uint8_t resumeKind = 0;
+    uint32_t resumeArg = 0;
+};
+
+enum EeResumeKind : uint8_t
+{
+    kResumeNone = 0,     // no completion
+    kResumeSetPc = 1,    // context.pc = resumeArg (PS2Runtime::eeWaitVSyncTicks)
+    kResumeReturn0 = 2,  // v0 = 0, pc = ra (DelayThread's override)
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -122,6 +135,9 @@ struct GuestThread
     uint32_t tlsBase = 0;
     EeWaitState wait{};
     std::function<void(R5900Context &)> resumeCompletion;
+    // v96: what resumeCompletion is, so a ready thread woken from a wait can be saved (EeResumeKind).
+    uint8_t resumeCompletionKind = 0;
+    uint32_t resumeCompletionArg = 0;
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -328,6 +344,20 @@ public:
     int rotateReadyQueue(int priority, bool interruptSafe);
     int releaseWait(int id, bool interruptSafe);
     void transferIfRequested(bool interruptSafe);
+    // Save states (state_stream.h). safeForState: nothing running and every wait rebuildable
+    // (why: the reason when not). The executor thread only.
+    [[nodiscard]] bool safeForState(std::string &why) const;
+    void saveState(ps2state::StateWriter &out) const;
+    bool loadState(ps2state::StateReader &in);
+    // A completion rebuilt from its kind (loadState; also the call sites that set kinds).
+    static std::function<void(R5900Context &)> resumeFor(uint8_t kind, uint32_t arg);
+    // Called on the executor thread each time the scheduler goes idle (no thread running, no
+    // invocation queued): the one place a save state is taken or loaded. Set by the platform.
+    // Returns true when it changed the machine (the loop then re-reads its state).
+    static inline bool (*s_idleHook)(PS2Runtime &runtime) = nullptr;
+    // True while a save state is asked for (v95): a game's idle thread that never blocks (SotC's
+    // polls a message box) then sleeps in a DelayThread-style wait, so the scheduler goes idle.
+    static inline bool (*s_stateWanted)() = nullptr;
 
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
@@ -391,13 +421,14 @@ public:
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
-    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {},
+                                uint8_t resumeKind = 0, uint32_t resumeArg = 0);
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
     // Block the current thread for a span of time (libkernel's DelayThread on
     // the host): woken by a deadline on the EE clock / host clock.
-    [[noreturn]] void delayCurrent(uint32_t microseconds, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void delayCurrent(uint32_t microseconds, std::function<void(R5900Context &)> completion = {}, uint8_t resumeKind = 0);
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;

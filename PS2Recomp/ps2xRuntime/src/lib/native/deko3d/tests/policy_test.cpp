@@ -30,6 +30,11 @@ int main() {
             check(std::abs(screenCoverage(scaled,bounds)-1.0f)<1e-6f, "oversized box clamps to the whole screen");
             float offscreen[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 5,0,0,1};
             check(screenCoverage(offscreen,bounds)==0.0f, "box entirely outside the viewport covers nothing");
+            // w = z + 10 (row 3 of the column-major matrix): the box spans z 0..0 -> greatest w 10.
+            float depthClip[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0,10};
+            check(std::abs(maxClipW(depthClip,bounds)-10.0f)<1e-6f, "greatest clip w at a corner");
+            MeshBounds none;
+            check(std::isinf(maxClipW(depthClip,none)), "invalid bounds give no fog conclusion");
             float behind[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,-1};
             check(screenCoverage(behind,bounds)==0.0f, "box behind the camera covers nothing");
             float straddle[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0,0.25f};
@@ -140,8 +145,13 @@ int main() {
         Fog f;
         validateFog(f);
         f.vertexFog = true; f.scale = 2; validateFog(f);
-        f.enabled = true;
-        rejects([&] { validateFog(f); }, "zFog composite cannot silently disappear");
+        f.enabled = true; f.start = 100; f.width = 400; f.steps = 8; validateFog(f);
+        f.width = 0;
+        rejects([&] { validateFog(f); }, "empty zFog ramp rejected");
+        f.width = 400; f.steps = -1;
+        rejects([&] { validateFog(f); }, "negative zFog steps rejected");
+        f.steps = 8; f.start = std::numeric_limits<float>::infinity();
+        rejects([&] { validateFog(f); }, "non-finite zFog start rejected");
         f = {}; f.skyNear = -1;
         rejects([&] { validateFog(f); }, "negative near cut rejected");
         f = {}; f.colour[0] = std::numeric_limits<float>::quiet_NaN();

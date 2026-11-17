@@ -156,6 +156,7 @@ namespace ps2x::iop::detail
     class IopCdvd::Impl
     {
     public:
+        friend class IopCdvd;
         struct Callback
         {
             uint32_t address = 0u;
@@ -742,6 +743,62 @@ namespace ps2x::iop::detail
     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
     {
         return m_impl->dispatchImport(ordinal, cpu);
+    }
+
+    namespace
+    {
+        struct CdvdStateBlob
+        {
+            uint32_t version = 1u;
+            uint32_t callbackAddress = 0u, callbackGp = 0u;
+            uint8_t hasCompletion = 0u;
+            IopCdvd::CompletionCallback completion{};
+            uint8_t initialized = 0u;
+            uint32_t mediaMode = 0u, currentLsn = 0u, lastError = 0u, streamFlag = 0u, lastReadTimeout = 0u;
+            int32_t interruptEventFlagId = 0;
+        };
+    }
+
+    std::vector<uint8_t> IopCdvd::saveStateBytes() const
+    {
+        CdvdStateBlob b;
+        b.callbackAddress = m_impl->callback.address;
+        b.callbackGp = m_impl->callback.gp;
+        b.hasCompletion = m_impl->completionCallback.has_value() ? 1u : 0u;
+        if (m_impl->completionCallback)
+            b.completion = *m_impl->completionCallback;
+        b.initialized = m_impl->initialized ? 1u : 0u;
+        b.mediaMode = m_impl->mediaMode;
+        b.currentLsn = m_impl->currentLsn;
+        b.lastError = m_impl->lastError;
+        b.streamFlag = m_impl->streamFlag;
+        b.lastReadTimeout = m_impl->lastReadTimeout;
+        b.interruptEventFlagId = m_impl->interruptEventFlagId;
+        const auto *p = reinterpret_cast<const uint8_t *>(&b);
+        return std::vector<uint8_t>(p, p + sizeof(b));
+    }
+
+    bool IopCdvd::loadStateBytes(const uint8_t *data, size_t size)
+    {
+        CdvdStateBlob b;
+        if (!data || size != sizeof(b))
+            return false;
+        std::memcpy(&b, data, sizeof(b));
+        if (b.version != 1u)
+            return false;
+        m_impl->callback.address = b.callbackAddress;
+        m_impl->callback.gp = b.callbackGp;
+        m_impl->completionCallback.reset();
+        if (b.hasCompletion)
+            m_impl->completionCallback = b.completion;
+        m_impl->initialized = b.initialized != 0u;
+        m_impl->mediaMode = b.mediaMode;
+        m_impl->currentLsn = b.currentLsn;
+        m_impl->lastError = b.lastError;
+        m_impl->streamFlag = b.streamFlag;
+        m_impl->lastReadTimeout = b.lastReadTimeout;
+        m_impl->interruptEventFlagId = b.interruptEventFlagId;
+        return true;
     }
 
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept

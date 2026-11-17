@@ -34,8 +34,26 @@ foreach($family in @('native','shadow')){foreach($stage in @('vert','frag')){
 }
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_opaque.frag.dksh') (Join-Path $backend 'opaque.frag.glsl')
 if($LASTEXITCODE){throw 'Switch opaque shader compilation failed'}
+# Lean variants (v105/v116): bit 0 alpha test, 1 background fade, 2 mips, 3 zero-add discard, 4 early tests,
+# 5 near cull, 6 untextured, 7 opaque (no discards).
+$lean=Get-Content -LiteralPath (Join-Path $backend 'lean.frag.glsl')
+if($lean[0] -notmatch '^#version'){throw 'lean.frag.glsl must start with #version'}
+$leanNames=@('LEAN_ALPHA','LEAN_BGFOG','LEAN_MIP','LEAN_ZEROADD','LEAN_EARLY','LEAN_NEARCULL','LEAN_UNTEXTURED','LEAN_OPAQUE')
+for($v=0;$v -lt 256;++$v){
+    $defines=@();for($b=0;$b -lt 8;++$b){if($v -band (1 -shl $b)){$defines+="#define $($leanNames[$b]) 1"}}
+    $variantSource=Join-Path $shaderDir ('lean{0:D3}.frag.glsl' -f $v)
+    Set-Content -LiteralPath $variantSource -Encoding ascii -Value (@($lean[0])+$defines+$lean[1..($lean.Count-1)])
+    & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir ('celosia_lean{0:D3}.frag.dksh' -f $v)) $variantSource
+    if($LASTEXITCODE){throw "Switch lean shader variant $v compilation failed"}
+    Remove-Item -LiteralPath $variantSource
+}
+Remove-Item -LiteralPath (Join-Path $shaderDir 'celosia_lean.frag.dksh') -ErrorAction SilentlyContinue
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_depth.frag.dksh') (Join-Path $backend 'depth.frag.glsl')
 if($LASTEXITCODE){throw 'Switch depth pre-pass shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_sky.frag.dksh') (Join-Path $backend 'sky.frag.glsl')
+if($LASTEXITCODE){throw 'Switch background image shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_bloom.frag.dksh') (Join-Path $backend 'bloom.frag.glsl')
+if($LASTEXITCODE){throw 'Switch bloom shader compilation failed'}
 # Early-depth-test variant of the generic shader, generated from the same source.
 $earlySource=Join-Path $shaderDir 'native_early.frag.glsl'
 $generic=Get-Content -LiteralPath (Join-Path $backend 'native.frag.glsl')

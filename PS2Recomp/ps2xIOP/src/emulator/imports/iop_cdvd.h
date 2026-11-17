@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -35,6 +36,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+        // Save states (v94): the drive's guest-visible state as bytes (the disc image's index and
+        // host handle stay as they are).
+        [[nodiscard]] std::vector<uint8_t> saveStateBytes() const;
+        bool loadStateBytes(const uint8_t *data, size_t size);
 
     private:
         class Impl;

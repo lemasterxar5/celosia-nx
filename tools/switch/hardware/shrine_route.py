@@ -122,6 +122,12 @@ class SceneClassifier:
         from PIL import Image, ImageChops, ImageStat
         self.Image, self.ImageChops, self.ImageStat = Image, ImageChops, ImageStat
         self.menu = self._small(Image.open(menu_reference))
+        # The menu's option text alone (v89: the sky / bloom settings and the FPS counter change the
+        # rest of the picture): 0-1 on the title menu, >= 55 elsewhere in the v88/v89 captures.
+        self.menuText = self._text(Image.open(menu_reference))
+
+    def _text(self, image):
+        return image.convert('L').crop((30, 530, 330, 640)).resize((60, 22))
 
     def _small(self, image):
         return image.convert('L').crop((0, 0, 1280, 660)).resize((64, 33))
@@ -132,7 +138,8 @@ class SceneClassifier:
         top = self.ImageStat.Stat(image.convert('L').crop((0, 8, 1280, 92)))
         diff = self.ImageStat.Stat(self.ImageChops.difference(self._small(image), self.menu)).mean[0]
         mean, sd = top.mean[0], top.stddev[0]
-        if diff < 25:
+        textDiff = self.ImageStat.Stat(self.ImageChops.difference(self._text(image), self.menuText)).mean[0]
+        if diff < 25 or textDiff < 15:
             kind = 'menu'
         elif mean < 3 and sd < 2:
             kind = 'cinematic'

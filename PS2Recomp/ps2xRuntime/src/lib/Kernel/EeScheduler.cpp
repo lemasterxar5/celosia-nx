@@ -226,6 +226,8 @@ void EeScheduler::run()
 
         if (m_currentThreadId == 0)
         {
+            if (s_idleHook && s_idleHook(m_runtime))
+                continue;
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
@@ -262,6 +264,7 @@ void EeScheduler::run()
         {
             auto completion = std::move(running->resumeCompletion);
             running->resumeCompletion = {};
+            running->resumeCompletionKind = 0u;
             try
             {
                 const ThrowScope noReturn(*this);
@@ -1593,12 +1596,13 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
     return previous;
 }
 
-[[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion)
+[[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion,
+                                         uint8_t resumeKind, uint32_t resumeArg)
 {
-    blockCurrent(EeWaitState{
-        EeWaitReason::VSync,
-        EeVSyncWait{afterTick, fixedResult},
-        std::move(completion)});
+    EeWaitState wait{EeWaitReason::VSync, EeVSyncWait{afterTick, fixedResult}, std::move(completion)};
+    wait.resumeKind = resumeKind;
+    wait.resumeArg = resumeArg;
+    blockCurrent(std::move(wait));
 }
 
 void EeScheduler::completeVSync(uint64_t tick)
@@ -1665,14 +1669,16 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     blockCurrent(std::move(wait));
 }
 
-[[noreturn]] void EeScheduler::delayCurrent(uint32_t microseconds, std::function<void(R5900Context &)> completion)
+[[noreturn]] void EeScheduler::delayCurrent(uint32_t microseconds, std::function<void(R5900Context &)> completion, uint8_t resumeKind)
 {
     constexpr uint32_t kDelayWaitType = 0x44454C59u; // 'DELY'
     const uint64_t token = m_nextDelayToken++;
     const uint64_t cycles = std::max<uint64_t>(1u, static_cast<uint64_t>(microseconds) * kEeClockHz / 1000000u);
     scheduleEvent(eeNow() + cycles, std::chrono::steady_clock::now() + std::chrono::microseconds(microseconds),
                   EeEvent{EeEventType::ExternalWake, kDelayWaitType, token});
-    waitExternal(EeWaitReason::External, kDelayWaitType, token, std::move(completion));
+    EeWaitState wait{EeWaitReason::External, EeExternalWait{kDelayWaitType, token}, std::move(completion)};
+    wait.resumeKind = resumeKind;
+    blockCurrent(std::move(wait));
 }
 
 GuestThread *EeScheduler::thread(int id)
@@ -2006,6 +2012,7 @@ void EeScheduler::makeDormant(GuestThread &item)
     item.status = EeThreadStatus::Dormant;
     item.wait = {};
     item.resumeCompletion = {};
+    item.resumeCompletionKind = 0u;
     item.suspendCount = 0;
     item.wakeupCount = 0;
     item.invocations.clear();
@@ -2145,6 +2152,8 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
         std::cerr << std::endl;
     }
     auto completion = std::move(item.wait.completion);
+    item.resumeCompletionKind = completion ? item.wait.resumeKind : 0u;
+    item.resumeCompletionArg = item.wait.resumeArg;
     item.wait = {};
     setReturnS32(&item.activeContext(), result);
     item.resumeCompletion = std::move(completion);

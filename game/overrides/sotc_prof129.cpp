@@ -51,6 +51,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#if defined(__SWITCH__)
+#include <pthread.h>
+#include "runtime/native_renderer.h"
+#endif
 
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
@@ -386,6 +390,24 @@ namespace prof129
         // A plain pthread like the runtime's other threads (32 KB stack, the
         // default priority); run() moves it to cores 1-2.
         std::fprintf(stderr, "[prof129] on: every %u us, a window every %u s\n", g_us, g_secs);
+#if defined(__SWITCH__)
+        // libnx has no thread detach (pthread_detach answers ENOSYS, so std::thread::detach throws and
+        // the process terminates at boot): a plain pthread as the hook worker's, never joined. It goes
+        // to the helpers' core (2), off the game thread's core 0 where it would only run when the game yields.
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 128u * 1024u);
+        pthread_t sampler;
+        const int created = pthread_create(&sampler, &attr, [](void *) -> void *
+                                           {
+                                               native_renderer::threads::place(native_renderer::threads::kWorker);
+                                               run();
+                                               return nullptr; }, nullptr);
+        pthread_attr_destroy(&attr);
+        if (created != 0)
+            std::fprintf(stderr, "[prof129] sampler thread creation failed (%d): profiler off\n", created);
+#else
         std::thread([]() { run(); }).detach();
+#endif
     }
 }

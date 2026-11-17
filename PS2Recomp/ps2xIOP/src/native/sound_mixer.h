@@ -108,6 +108,44 @@ namespace ps2x::iop::detail
         void pushInputBlock(int core, const uint8_t *block);
         void clearInput(int core) { m_cores[core].input.clear(); }
         void setInputRefill(std::function<void(int core)> refill) { m_inputRefill = std::move(refill); }
+        // Save states (v94): sound RAM, voices, cores (the auto-DMA input queue apart), the clock;
+        // the output ring is emptied at load. Under the mixer lock (the audio thread reads it).
+        template <typename W>
+        void saveState(W &out)
+        {
+            std::lock_guard<std::mutex> guard(m_lock);
+            out.raw(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+            out.pod(m_voices);
+            for (const Core &c : m_cores)
+            {
+                out.raw(&c, offsetof(Core, input));
+                out.u32(static_cast<uint32_t>(c.input.size()));
+                for (const auto &frame : c.input) out.pod(frame);
+                out.raw(reinterpret_cast<const uint8_t *>(&c) + offsetof(Core, revWrapped), sizeof(Core) - offsetof(Core, revWrapped));
+            }
+            out.pod(m_cycle); out.pod(m_cycleValid); out.pod(m_revOverlap); out.pod(m_flush90);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            std::lock_guard<std::mutex> guard(m_lock);
+            in.raw(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+            m_voices = in.template pod<decltype(m_voices)>();
+            for (Core &c : m_cores)
+            {
+                in.raw(&c, offsetof(Core, input));
+                const uint32_t n = in.u32();
+                if (n > (1u << 20)) { in.fail("bad mixer input size"); return false; }
+                c.input.clear();
+                for (uint32_t i = 0; i < n && in.ok(); ++i) c.input.push_back(in.template pod<std::array<int16_t, 2>>());
+                in.raw(reinterpret_cast<uint8_t *>(&c) + offsetof(Core, revWrapped), sizeof(Core) - offsetof(Core, revWrapped));
+            }
+            m_cycle = in.template pod<uint64_t>(); m_cycleValid = in.template pod<bool>();
+            m_revOverlap = in.template pod<bool>(); m_flush90 = in.template pod<bool>();
+            m_ringRead.store(m_ringWrite.load(std::memory_order_acquire), std::memory_order_release);
+            m_outputStarted = false;
+            return in.ok();
+        }
 
         void advanceTo(uint64_t iopCycle);
         // Interleaved stereo frames for the host audio device (any thread).

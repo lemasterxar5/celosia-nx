@@ -28,6 +28,7 @@ inline uint32_t alignSize(size_t n, uint32_t alignment) {
     return (static_cast<uint32_t>(n) + alignment - 1) & ~(alignment - 1);
 }
 struct BufferBlock {
+    static inline uint32_t created=0; // v109: dedicated memblocks made (slow-frame breakdown)
     Unique<DkMemBlock, dkMemBlockDestroy> memory;
     uint32_t bytes;
     std::shared_ptr<AllocationBudget> budget;
@@ -38,7 +39,7 @@ struct BufferBlock {
             throw std::runtime_error("deko3d: aggregate resource budget exceeded (512 MiB)");
         DkMemBlockMaker maker;
         dkMemBlockMakerDefaults(&maker, device, bytes); maker.flags = flags;
-        memory.reset(dkMemBlockCreate(&maker));
+        memory.reset(dkMemBlockCreate(&maker));++created;
         if (!memory.value) {
             budget->release(bytes);
             throw std::runtime_error("deko3d: memory allocation failed");
@@ -63,6 +64,14 @@ struct Buffer {
     }
     Buffer(DkDevice device,size_t size,std::shared_ptr<AllocationBudget> budget,const std::shared_ptr<BufferPool> &pool)
         :Buffer(device,size,std::move(budget),DefaultFlags,pool){}
+    // v108: a range of a pooled page (textures and their staging; a dedicated memblock per
+    // resource cost ~0.8 ms of the render thread each at scene changes).
+    Buffer(std::shared_ptr<BufferPool::Lease> range,size_t size)
+        :block(range->resource),lease(std::move(range)),bytes(alignSize(size,DK_MEMBLOCK_ALIGNMENT)){offset=lease->offset;}
+    static std::shared_ptr<Buffer> pooled(const std::shared_ptr<BufferPool> &pool,size_t size){
+        if(!pool || !size || size>BufferPool::PageBytes)return {};
+        try{return std::make_shared<Buffer>(pool->acquire(size),size);}catch(const std::exception &){return {};}
+    }
     DkMemBlock handle()const{return block->memory;}
     void *cpu()const{return static_cast<uint8_t *>(block->cpu())+offset;}
     DkGpuAddr gpu()const{return block->gpu()+offset;}
@@ -72,7 +81,7 @@ struct Image {
     DkImage image{};
     Image(DkDevice device, uint32_t width, uint32_t height,
           DkImageFormat format, uint32_t flags, std::shared_ptr<AllocationBudget> budget,
-          uint32_t levels = 1) {
+          uint32_t levels = 1, const std::shared_ptr<BufferPool> &pool = {}) {
         DkImageLayoutMaker maker;
         dkImageLayoutMakerDefaults(&maker, device);
         maker.format = format; maker.flags = flags;
@@ -80,8 +89,14 @@ struct Image {
         maker.mipLevels = levels;
         DkImageLayout layout;
         dkImageLayoutInitialize(&layout, &maker);
-        storage = std::make_shared<Buffer>(device, dkImageLayoutGetSize(&layout), std::move(budget),
+        // Compressed render targets can require more than the memblock alignment.
+        const uint32_t alignment=dkImageLayoutGetAlignment(&layout);
+        // v108: sampled images from a pooled page when the layout's alignment fits a page slot.
+        if(pool && alignment<=BufferPool::SlotBytes)storage=Buffer::pooled(pool,dkImageLayoutGetSize(&layout));
+        if(!storage)storage = std::make_shared<Buffer>(device, dkImageLayoutGetSize(&layout), std::move(budget),
             DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+        if(alignment && storage->gpu()%alignment)
+            throw std::runtime_error("deko3d: image storage misaligned for its layout");
         // Dedicated allocations start at zero, satisfying every image offset alignment.
         dkImageInitialize(&image, &layout, storage->handle(), storage->offset);
     }

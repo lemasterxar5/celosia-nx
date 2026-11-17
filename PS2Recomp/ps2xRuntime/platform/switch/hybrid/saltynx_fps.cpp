@@ -1,18 +1,27 @@
 // SaltyNX FPS counter support for this homebrew forwarder.
 //
-// SaltyNX deliberately does not inject its core into homebrew titles (saltysd_proc hijack.c skips
-// program ids above 0x01FFFFFFFFFFFFFF or with bits 0x1F00 set, which includes this forwarder), and
-// its NX-FPS counter hooks NVN / EGL / Vulkan present imports that a statically linked deko3d
-// program does not have. Overlays (Status Monitor, FPSLocker) read the counter from SaltyNX's
-// shared memory page, finding the NX-FPS block by its magic.
+// SaltyNX does not inject its core (and NX-FPS) into this process, and NX-FPS hooks NVN / EGL /
+// Vulkan presents that a statically linked deko3d program does not have. Overlays (Status Monitor,
+// FPSLocker) read the counter from SaltyNX's 0x1000-byte shared page, finding the NX-FPS block by
+// its magic, and treat the game as running when pluginActive comes back true within 100 ms after
+// they clear it.
 //
-// This file uses SaltyNX's own service, the same way its core and the overlays do: it connects to
-// the "SaltySD" named port, asks for a block of the shared page (command 6,
-// CheckIfSharedMemoryAvailable) and its handle (command 7, GetSharedMemoryHandle), ends the
-// session at once (the port takes one session; overlays need it), maps the page and publishes the
-// NX-FPS block from the renderer's real presents. Nothing is written if SaltyNX is not running.
-// No game, renderer or clock behaviour depends on it.
+// This file talks to SaltyNX's own "SaltySD" service like its core and the overlays do: command 7
+// (GetSharedMemoryHandle) to map the page, command 6 (CheckIfSharedMemoryAvailable) to reserve a
+// block only if no NX-FPS block is present yet, then command 0 (EndSession) at once, because the
+// port takes a single session. A publisher thread writes the counter from the renderer's real
+// presents. Nothing is written if SaltyNX is not running; no game, renderer or clock behaviour
+// depends on it.
+//
+// svcConnectToNamedPort fails with LimitReached (0x10801) when this process has used up its own
+// session resource limit (applications have few sessions and the runtime already holds many). Before
+// connecting, the session limit is checked; if it is full, the limit is raised when the syscall is
+// available, and otherwise (only for the first attempt, made from main() before the runtime starts
+// any thread) the sm session is released for the duration of the connection and restored after.
+// The same technique is used by other deko3d Switch ports (e.g. NaGaa95's NetherSX2_nx saltynx.cpp).
 #include <switch.h>
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,7 +30,7 @@
 
 namespace {
 // Field order of SaltyNX's NxFpsSharedBlock (NX-FPS-Common.hpp), packed. Overlays read up to
-// expectedSetBuffers (174 bytes); the core's block is 310 bytes with its performance counters.
+// expectedSetBuffers (174 bytes); the core reserves 310 bytes with its performance counters.
 struct __attribute__((packed)) NxFpsBlock {
     uint32_t magic;
     uint8_t fps;
@@ -38,106 +47,159 @@ struct __attribute__((packed)) NxFpsBlock {
     uint8_t fpsLockedDocked;
     uint64_t frameNumber;
     int8_t expectedSetBuffers;
-    uint8_t perfCounters[136];
 };
-static_assert(offsetof(NxFpsBlock, expectedSetBuffers) == 173, "NX-FPS overlay layout");
-static_assert(sizeof(NxFpsBlock) == 310, "NX-FPS core layout");
+static_assert(offsetof(NxFpsBlock, fpsTicks) == 15, "NX-FPS overlay layout");
+static_assert(offsetof(NxFpsBlock, renderCalls) == 60, "NX-FPS overlay layout");
+static_assert(offsetof(NxFpsBlock, frameNumber) == 165, "NX-FPS overlay layout");
+static_assert(sizeof(NxFpsBlock) == 174, "NX-FPS overlay layout");
 constexpr uint32_t NxFpsMagic = 0x465053;
-constexpr uint64_t TickFrequency = 19200000;
+constexpr uint64_t ReserveBytes = 310; // the core's full block size
+constexpr size_t PageBytes = 0x1000;
+constexpr uint8_t ApiDeko3d = 0;          // NX-FPS api field: 0 = unknown/other
 
 SharedMemory page{};
-std::atomic<NxFpsBlock *> block{nullptr};
-Thread connectThread;
-alignas(0x1000) unsigned char connectStack[0x10000];
+uint8_t *pageBase = nullptr;
+volatile NxFpsBlock *block = nullptr;     // owned by the publisher thread after start
+Thread publisherThread;
+alignas(0x1000) unsigned char publisherStack[0x8000];
+int logLines = 0;
+
+// Present history, written by the render thread (celosia_frame_presented).
+std::atomic<uint64_t> presents{0}, lastPresentTick{0};
+std::array<std::atomic<uint32_t>, 10> presentTicks{};
 
 void log(const char *text, Result rc) {
+    if (logLines >= 40) return;
+    ++logLines;
     if (FILE *f = std::fopen("sdmc:/switch/celosia-native-boot/saltynx-fps.txt", "a")) {
         std::fprintf(f, "%s rc=0x%x\n", text, rc);
         std::fclose(f);
     }
 }
 
-void connect(void *) {
-    log("thread started", 0);
+volatile NxFpsBlock *findBlock() {
+    if (!pageBase) return nullptr;
+    for (size_t offset = 0; offset + sizeof(NxFpsBlock) <= PageBytes; offset += 4) {
+        uint32_t value;
+        std::memcpy(&value, pageBase + offset, sizeof(value));
+        if (value == NxFpsMagic) return reinterpret_cast<volatile NxFpsBlock *>(pageBase + offset);
+    }
+    return nullptr;
+}
+
+// True when the caller must release sm around the connection (no free session and no way to raise
+// the limit). Only the early attempt may do that.
+bool sessionsFull() {
+    uint64_t raw = 0;
+    if (R_FAILED(svcGetInfo(&raw, InfoType_ResourceLimit, INVALID_HANDLE, 0)) || !raw) return false;
+    const Handle limit = Handle(raw);
+    s64 current = 0, maximum = 0;
+    bool full = R_SUCCEEDED(svcGetResourceLimitCurrentValue(&current, limit, LimitableResource_Sessions)) &&
+        R_SUCCEEDED(svcGetResourceLimitLimitValue(&maximum, limit, LimitableResource_Sessions)) && current >= maximum;
+    if (full && envIsSyscallHinted(0x7E)) {
+        const Result rc = svcSetResourceLimitLimitValue(limit, LimitableResource_Sessions, maximum + 4);
+        log("session limit full; raising it", rc);
+        if (R_SUCCEEDED(rc)) full = false;
+    }
+    svcCloseHandle(limit);
+    return full;
+}
+
+bool attach(bool early) {
+    if (pageBase && (block = findBlock())) return true;
+    const bool releaseSm = sessionsFull() && early;
+    if (releaseSm) smExit();
     Handle port = INVALID_HANDLE;
-    Result rc = 0;
-    // The port takes a single session (svcManageNamedPort(..., "SaltySD", 1)): while SaltyNX or an
-    // overlay holds it, connecting fails with kernel LimitReached (0x10801). Keep retrying in the
-    // background (every 250 ms, up to 2 minutes); nothing in the game waits for this thread.
-    int attempt = 0;
-    Result first = 0;
-    for (; attempt < 480; ++attempt) {
-        rc = svcConnectToNamedPort(&port, "SaltySD");
-        if (R_SUCCEEDED(rc)) break;
-        if (!first) {first = rc; log("saltysd port busy or missing, retrying", rc);}
-        if (R_VALUE(rc) != MAKERESULT(Module_Kernel, 132) && attempt >= 40) break; // missing port: give up after 10 s
-        svcSleepThread(250'000'000ULL);
+    Result rc = svcConnectToNamedPort(&port, "SaltySD");
+    if (R_SUCCEEDED(rc)) {
+        Service service{};
+        serviceCreate(&service, port);
+        if (!pageBase) {
+            Handle memory = INVALID_HANDLE;
+            const Result handleRc = serviceDispatch(&service, 7, .in_send_pid = true,
+                .out_handle_attrs = {SfOutHandleAttr_HipcCopy}, .out_handles = &memory);
+            if (R_SUCCEEDED(handleRc) && memory != INVALID_HANDLE) {
+                shmemLoadRemote(&page, memory, PageBytes, Perm_Rw);
+                const Result mapRc = shmemMap(&page);
+                if (R_SUCCEEDED(mapRc)) pageBase = static_cast<uint8_t *>(shmemGetAddr(&page));
+                else {shmemClose(&page); log("shared memory map failed", mapRc);}
+            } else log("shared memory handle refused", handleRc);
+        }
+        block = findBlock();
+        if (pageBase && !block) {
+            uint64_t offset = ~0ULL;
+            const Result reserveRc = serviceDispatchInOut(&service, 6, ReserveBytes, offset, .in_send_pid = true);
+            if (R_SUCCEEDED(reserveRc) && offset <= PageBytes - ReserveBytes && offset % 4 == 0) {
+                std::memset(pageBase + offset, 0, ReserveBytes);
+                block = reinterpret_cast<volatile NxFpsBlock *>(pageBase + offset);
+                block->currentRefreshRate = 60;
+                block->magic = NxFpsMagic;
+            } else log("shared block reservation refused", reserveRc);
+        }
+        const uint64_t zero = 0;
+        serviceDispatchIn(&service, 0, zero, .in_send_pid = true); // EndSession: free the port for overlays
+        svcCloseHandle(port);
     }
-    if (R_FAILED(rc)) {log("saltysd port not reachable, giving up", rc); return;}
-    {
-        char text[64];
-        std::snprintf(text, sizeof(text), "port connected after %d retries", attempt);
-        log(text, 0);
-    }
-    Service service;
-    serviceCreate(&service, port);
-    uint64_t offset = ~0ULL;
-    const uint64_t size = sizeof(NxFpsBlock);
-    rc = serviceDispatchInOut(&service, 6, size, offset, .in_send_pid = true);
-    log("block request answered", rc);
-    Handle memory = INVALID_HANDLE;
-    Result handleRc = 0;
-    if (R_SUCCEEDED(rc) && offset + size <= 0x1000)
-        handleRc = serviceDispatch(&service, 7, .in_send_pid = true,
-            .out_handle_attrs = {SfOutHandleAttr_HipcCopy}, .out_handles = &memory);
-    log("handle request answered", handleRc);
-    // EndSession (command 0), then release the port for the overlays.
-    serviceDispatch(&service, 0, .in_send_pid = true);
-    svcCloseHandle(port);
-    if (R_FAILED(rc) || offset + size > 0x1000) {log("shared block reservation refused", rc); return;}
-    if (R_FAILED(handleRc) || memory == INVALID_HANDLE) {log("shared memory handle refused", handleRc); return;}
-    shmemLoadRemote(&page, memory, 0x1000, Perm_Rw);
-    rc = shmemMap(&page);
-    if (R_FAILED(rc)) {log("shared memory map failed", rc); return;}
-    auto *published = reinterpret_cast<NxFpsBlock *>(static_cast<uint8_t *>(shmemGetAddr(&page)) + offset);
-    std::memset(published, 0, sizeof(NxFpsBlock));
-    published->currentRefreshRate = 60;
-    published->magic = NxFpsMagic;
-    block.store(published, std::memory_order_release);
-    log("NX-FPS block published", 0);
+    if (releaseSm) smInitialize();
+    if (block) log(early ? "NX-FPS block published (early)" : "NX-FPS block published", 0);
+    else if (early) log("saltysd not reachable yet, retrying in background", rc);
+    return block != nullptr;
 }
 
+void publish() {
+    if (!block || block->magic != NxFpsMagic) return;
+    const uint64_t frequency = armGetSystemTickFreq();
+    const uint64_t last = lastPresentTick.load(std::memory_order_relaxed);
+    const bool recent = last && armGetSystemTick() - last < frequency;
+    uint64_t sum = 0;
+    unsigned count = 0;
+    for (const auto &sample : presentTicks)
+        if (const auto ticks = sample.load(std::memory_order_relaxed)) {sum += ticks; ++count;}
+    const float average = recent && sum ? float(double(frequency) * count / double(sum)) : 0.0f;
+    const uint32_t rounded = average > 0 ? uint32_t(average + 0.5f) : 0;
+    const uint32_t fallback = rounded ? uint32_t(frequency / rounded) : uint32_t(frequency);
+    for (unsigned i = 0; i < presentTicks.size(); ++i) {
+        const auto ticks = presentTicks[i].load(std::memory_order_relaxed);
+        block->fpsTicks[i] = recent && ticks ? ticks : fallback;
+    }
+    block->fps = uint8_t(std::min(rounded, 255u));
+    block->fpsAverage = average;
+    block->api = ApiDeko3d;
+    block->frameNumber = presents.load(std::memory_order_acquire);
+    for (unsigned i = 0; i < 8; ++i) block->renderCalls[i].calls = block->viewportCalls[i].calls = 0;
+    block->renderCalls[0].width = block->viewportCalls[0].width = 1280;
+    block->renderCalls[0].height = block->viewportCalls[0].height = 720;
+    block->renderCalls[0].calls = block->viewportCalls[0].calls = uint16_t(std::clamp(rounded, 1u, 65534u));
+    // Overlays clear this and expect it back within 100 ms while the game runs.
+    block->pluginActive = recent;
 }
 
-// Started from main() once the SD card and runtime are up.
+void publisher(void *) {
+    unsigned attempts = 0;
+    for (;;) {
+        if ((!block || block->magic != NxFpsMagic) && attempts++ % 20 == 0) attach(false); // about once a second
+        publish();
+        svcSleepThread(50'000'000ULL);
+    }
+}
+}
+
+// Called from main() once the SD card is up and before the runtime starts its threads.
 extern "C" void celosia_saltynx_start(void) {
-    const Result rc = threadCreate(&connectThread, connect, nullptr, connectStack, sizeof(connectStack), 0x2C, -2);
-    log("thread create", rc);
-    if (R_SUCCEEDED(rc)) threadStart(&connectThread);
+    attach(true);
+    const Result rc = threadCreate(&publisherThread, publisher, nullptr, publisherStack, sizeof(publisherStack), 0x3B, -2);
+    if (R_SUCCEEDED(rc)) threadStart(&publisherThread);
+    else log("publisher thread create failed", rc);
 }
 
 // Called by the deko3d backend once per presented image (render.cpp, weak reference).
 extern "C" void celosia_frame_presented(void) {
-    NxFpsBlock *b = block.load(std::memory_order_acquire);
-    if (!b) return;
-    static uint64_t previous = 0, windowStart = 0, average = 0;
-    static uint32_t windowFrames = 0, tick = 0;
     const uint64_t now = armGetSystemTick();
-    if (previous) {
+    const uint64_t previous = lastPresentTick.exchange(now, std::memory_order_relaxed);
+    const uint64_t index = presents.fetch_add(1, std::memory_order_acq_rel);
+    if (previous && now > previous) {
         const uint64_t delta = now - previous;
-        b->fpsTicks[tick] = uint32_t(delta > 0xFFFFFFFFu ? 0xFFFFFFFFu : delta);
-        tick = (tick + 1) % 10;
-        average = average ? (9 * average + delta) / 10 : delta;
-        b->fpsAverage = float(TickFrequency) / float(average);
-    } else windowStart = now;
-    previous = now;
-    ++windowFrames;
-    // Presents in the last second, as NX-FPS counts them.
-    if (now - windowStart >= TickFrequency) {
-        b->fps = uint8_t(windowFrames > 255 ? 255 : windowFrames);
-        windowFrames = 0;
-        windowStart = now;
+        if (delta >= armGetSystemTickFreq()) for (auto &ticks : presentTicks) ticks.store(0, std::memory_order_relaxed);
+        else presentTicks[index % presentTicks.size()].store(uint32_t(delta), std::memory_order_relaxed);
     }
-    ++b->frameNumber;
-    b->pluginActive = true;
 }

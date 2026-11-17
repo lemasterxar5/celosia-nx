@@ -42,6 +42,50 @@ namespace ps2x::iop::detail
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] SoundMixer &mixer() { return m_mixer; }
 
+        // Save states (v94): the sound driver (streams, their queued refills, effects, PCM, the
+        // volumes it keeps) and its mixer.
+        template <typename W>
+        void saveState(W &out)
+        {
+            m_mixer.saveState(out);
+            out.pod(m_eea); out.pod(m_coreVolumes); out.pod(m_voiceVolumes); out.pod(m_reply); out.pod(m_streams);
+            out.pod(m_streamOps); out.pod(m_opWrite); out.pod(m_opRead); out.pod(m_pendingAdvance); out.pod(m_effects);
+            out.pod(m_transfer); out.pod(m_ioFailed); out.pod(m_pcmBuffer); out.pod(m_pcmSize); out.pod(m_pcmPosition);
+            out.pod(m_pcmFirst); out.pod(m_pcmOn); out.pod(m_pcmVolL); out.pod(m_pcmVolR);
+            for (const auto &m : m_sourceHash)
+            {
+                out.u32(static_cast<uint32_t>(m.size()));
+                for (const auto &kv : m) { out.u32(kv.first); out.u64(kv.second); }
+            }
+            out.u32(static_cast<uint32_t>(m_pcmHash.size()));
+            for (uint64_t h : m_pcmHash) out.u64(h);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            if (!m_mixer.loadState(in)) return false;
+            m_eea = in.template pod<decltype(m_eea)>();
+            in.raw(m_coreVolumes, sizeof(m_coreVolumes)); in.raw(m_voiceVolumes, sizeof(m_voiceVolumes));
+            m_reply = in.template pod<decltype(m_reply)>(); m_streams = in.template pod<decltype(m_streams)>();
+            m_streamOps = in.template pod<decltype(m_streamOps)>(); m_opWrite = in.u32(); m_opRead = in.u32();
+            m_pendingAdvance = in.u32(); m_effects = in.template pod<decltype(m_effects)>(); m_transfer = in.template pod<int>();
+            m_ioFailed = in.template pod<bool>(); m_pcmBuffer = in.u32(); m_pcmSize = in.u32(); m_pcmPosition = in.u32();
+            m_pcmFirst = in.template pod<bool>(); m_pcmOn = in.template pod<bool>();
+            m_pcmVolL = in.template pod<uint16_t>(); m_pcmVolR = in.template pod<uint16_t>();
+            for (auto &m : m_sourceHash)
+            {
+                m.clear();
+                const uint32_t n = in.u32();
+                if (n > (1u << 20)) { in.fail("bad SG2 hash size"); return false; }
+                for (uint32_t i = 0; i < n && in.ok(); ++i) { const uint32_t k = in.u32(); m[k] = in.u64(); }
+            }
+            const uint32_t n = in.u32();
+            if (n > (1u << 22)) { in.fail("bad PCM hash size"); return false; }
+            m_pcmHash.assign(n, 0);
+            for (uint32_t i = 0; i < n && in.ok(); ++i) m_pcmHash[i] = in.u64();
+            return in.ok();
+        }
+
     private:
         // A voice streamed from IOP memory through a double buffer in sound
         // RAM (driver table 0x7218, 0x24 bytes per voice).

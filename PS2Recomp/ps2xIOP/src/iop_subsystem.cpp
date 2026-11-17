@@ -204,6 +204,21 @@ namespace ps2x::iop
         m_impl->emulator.runEeCycles(eeCycles);
     }
 
+    bool IopSubsystem::safeForState(std::string &why) const
+    {
+        return m_impl->emulator.safeForState(why);
+    }
+
+    std::vector<uint8_t> IopSubsystem::saveState() const
+    {
+        return m_impl->emulator.saveState();
+    }
+
+    bool IopSubsystem::loadState(const uint8_t *data, size_t size, std::string &error)
+    {
+        return m_impl->emulator.loadState(data, size, error);
+    }
+
     size_t IopSubsystem::readAudio(int16_t *destination, size_t frames) noexcept
     {
         return m_impl->emulator.readAudio(destination, frames);

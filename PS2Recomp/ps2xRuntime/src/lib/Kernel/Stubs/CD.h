@@ -7,8 +7,14 @@
 #include <string>
 #include <vector>
 
+namespace ps2state { class StateWriter; class StateReader; }
+
 namespace ps2_stubs
 {
+    // Save states (v94, CD.cpp).
+    bool cdSafeForState(std::string &why);
+    void cdSaveState(ps2state::StateWriter &out);
+    bool cdLoadState(ps2state::StateReader &in);
 
     struct CdDebugFileEntry
     {

@@ -10,6 +10,7 @@
 #include <stdexcept>
 void mixSwitchSounds(int16_t *,size_t);
 void clearSwitchSounds();
+void celosiaMenuInput(uint64_t &buttons,std::array<float,4> &sticks);
 
 namespace {
 struct InputState {
@@ -76,6 +77,8 @@ void pollSwitchInput()
     if(!input.connected)return;
     const auto left=padGetStickPos(&input.pad,0),right=padGetStickPos(&input.pad,1);
     input.sticks={axis(left.x,false),axis(left.y,true),axis(right.x,false),axis(right.y,true)};
+    // The in-game menu (Minus + Plus): while open the game sees no input.
+    celosiaMenuInput(input.buttons,input.sticks);
 }
 bool IsKeyDown(int){return false;}
 bool IsKeyPressed(int){return false;}

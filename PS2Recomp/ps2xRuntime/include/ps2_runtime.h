@@ -565,6 +565,14 @@ public:
     inline const PS2Vfs &vfs() const { return m_vfs; }
     inline ps2x::iop::IopSubsystem *iopSubsystem() { return m_iopSubsystem.get(); }
 
+    // Save states (v94, ps2_runtime_state.cpp): the whole machine (EE scheduler and threads,
+    // memory, GS, VU0/VU1, the IOP, the disc drive, the guest heap) as bytes. Only at a safe point:
+    // machineSafeForState says why not. A failed load after the header checks leaves the machine
+    // unusable (the caller ends the game rather than run on half a state).
+    [[nodiscard]] bool machineSafeForState(std::string &why);
+    [[nodiscard]] bool saveMachineState(std::vector<uint8_t> &out, std::string &why);
+    [[nodiscard]] bool loadMachineState(const uint8_t *data, size_t size, std::string &error);
+
 private:
     struct GuestHeapBlock
     {

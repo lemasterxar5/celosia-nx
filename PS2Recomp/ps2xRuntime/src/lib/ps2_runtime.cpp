@@ -2830,10 +2830,7 @@ bool PS2Runtime::eeCheckpointSlow() noexcept
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
     m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
                              0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+                             EeScheduler::resumeFor(kResumeSetPc, resumePc), kResumeSetPc, resumePc);
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)

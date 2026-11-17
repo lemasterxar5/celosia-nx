@@ -1,5 +1,6 @@
 #pragma once
 
+#include <type_traits>
 #include <ostream>
 
 #include "iop_cpu.h"
@@ -71,6 +72,39 @@ namespace ps2x::iop::detail
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
         // Diagnostics: threads (state, pc, what they wait on), event flags, semaphores.
         void describe(std::ostream &out) const;
+        // Save states (v94): threads (their saved CPU state), semaphores, event flags, ids.
+        template <typename W>
+        void saveState(W &out) const
+        {
+            out.u32(static_cast<uint32_t>(m_threads.size()));
+            for (const auto &kv : m_threads) { out.pod(kv.first); out.pod(kv.second); }
+            out.u32(static_cast<uint32_t>(m_semaphores.size()));
+            for (const auto &kv : m_semaphores) { out.pod(kv.first); out.pod(kv.second); }
+            out.u32(static_cast<uint32_t>(m_eventFlags.size()));
+            for (const auto &kv : m_eventFlags) { out.pod(kv.first); out.pod(kv.second); }
+            out.u32(m_nextThreadId); out.u32(m_nextSemaphoreId); out.u32(m_nextEventFlagId);
+            out.pod(m_currentThread ? m_currentThread->id : 0);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            auto readMap = [&](auto &target) {
+                using Map = std::decay_t<decltype(target)>;
+                target.clear();
+                const uint32_t n = in.u32();
+                if (n > 4096u) { in.fail("bad IOP kernel table"); return; }
+                for (uint32_t i = 0; i < n && in.ok(); ++i) {
+                    const int key = in.template pod<int>();
+                    target.emplace(key, in.template pod<typename Map::mapped_type>());
+                }
+            };
+            readMap(m_threads); readMap(m_semaphores); readMap(m_eventFlags);
+            m_nextThreadId = in.u32(); m_nextSemaphoreId = in.u32(); m_nextEventFlagId = in.u32();
+            const int current = in.template pod<int>();
+            auto it = m_threads.find(current);
+            m_currentThread = (current && it != m_threads.end()) ? &it->second : nullptr;
+            return in.ok();
+        }
 
     private:
         struct Semaphore

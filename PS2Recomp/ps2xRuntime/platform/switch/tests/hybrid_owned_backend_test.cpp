@@ -63,7 +63,7 @@ int main()
     backend->draw(1,identity,sky);
     native_renderer::DrawState world;world.fogged=true;
     backend->draw(1,identity,world);
-    native_renderer::Fog depthFog;depthFog.enabled=true;
+    native_renderer::Fog depthFog;depthFog.enabled=true;depthFog.width=0; // an empty zFog ramp
     rejected=false;try{backend->setFog(depthFog);}catch(const std::invalid_argument &){rejected=true;}check(rejected);
     backend->endFrame(1280,720);
     backend->beginFrame();backend->uploadMesh(3,vertices.data(),3,true);

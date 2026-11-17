@@ -48,6 +48,37 @@ public:
     explicit VU1Interpreter(Unit unit = Unit::VU1);
 
     void reset();
+    // Save states (v94): the unit's registers and pipelines; caches of decoded / recompiled
+    // microcode are rebuilt after a load.
+    template <typename W>
+    void saveState(W &out) const
+    {
+        out.pod(m_state); out.pod(m_flagPipeline); out.pod(m_fdiv); out.pod(m_efu); out.pod(m_storePipeline);
+        out.pod(m_vfWritePipeline); out.pod(m_viWritePipeline); out.pod(m_accWritePipeline); out.pod(m_xgkick);
+        out.pod(m_vfReady); out.pod(m_viReady); out.pod(m_accReady); out.pod(m_vfLatestWrite); out.pod(m_viLatestWrite);
+        out.pod(m_accLatestWrite); out.pod(m_cycle); out.pod(m_nextWriteSequence); out.pod(m_efuResourceReady);
+        out.pod(m_workingClip); out.pod(m_viBranchBackupValue); out.pod(m_viBranchBackupReg); out.pod(m_viBranchBackupValid);
+        out.pod(m_nextCommitCycle); out.pod(m_pendingHaltD); out.pod(m_pendingHaltT); out.pod(m_xgkickDue);
+    }
+    template <typename R>
+    void loadState(R &in)
+    {
+        m_state = in.template pod<decltype(m_state)>(); m_flagPipeline = in.template pod<decltype(m_flagPipeline)>();
+        m_fdiv = in.template pod<decltype(m_fdiv)>(); m_efu = in.template pod<decltype(m_efu)>();
+        m_storePipeline = in.template pod<decltype(m_storePipeline)>(); m_vfWritePipeline = in.template pod<decltype(m_vfWritePipeline)>();
+        m_viWritePipeline = in.template pod<decltype(m_viWritePipeline)>(); m_accWritePipeline = in.template pod<decltype(m_accWritePipeline)>();
+        m_xgkick = in.template pod<decltype(m_xgkick)>(); m_vfReady = in.template pod<decltype(m_vfReady)>();
+        m_viReady = in.template pod<decltype(m_viReady)>(); m_accReady = in.template pod<decltype(m_accReady)>();
+        m_vfLatestWrite = in.template pod<decltype(m_vfLatestWrite)>(); m_viLatestWrite = in.template pod<decltype(m_viLatestWrite)>();
+        m_accLatestWrite = in.template pod<decltype(m_accLatestWrite)>(); m_cycle = in.template pod<uint64_t>();
+        m_nextWriteSequence = in.template pod<uint64_t>(); m_efuResourceReady = in.template pod<uint64_t>();
+        m_workingClip = in.template pod<uint32_t>(); m_viBranchBackupValue = in.template pod<int32_t>();
+        m_viBranchBackupReg = in.template pod<uint8_t>(); m_viBranchBackupValid = in.template pod<bool>();
+        m_nextCommitCycle = in.template pod<uint64_t>(); m_pendingHaltD = in.template pod<bool>(); m_pendingHaltT = in.template pod<bool>();
+        m_xgkickDue = in.template pod<uint64_t>();
+        m_decodedCodeCacheValid = false; m_flagScanValid = false; m_recGeneration = ~0ull; m_recFn = nullptr;
+        m_stopRequested = false;
+    }
 
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,

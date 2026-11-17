@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -77,6 +78,44 @@ namespace ps2x::iop::detail
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
+        // Save states (v94): IOP RAM and its ownership map, scratchpad, hardware registers, the
+        // kernel heap, the interrupt controller, a DMA start in progress, and the SPU2.
+        template <typename W>
+        void saveState(W &out) const
+        {
+            out.raw(m_ram.data(), m_ram.size());
+            out.raw(m_owned.data(), m_owned.size());
+            out.raw(m_scratch.data(), m_scratch.size());
+            std::vector<std::pair<uint32_t, uint32_t>> hw(m_hardware.begin(), m_hardware.end());
+            std::sort(hw.begin(), hw.end());
+            out.u32(static_cast<uint32_t>(hw.size()));
+            for (const auto &kv : hw) { out.u32(kv.first); out.u32(kv.second); }
+            out.u32(static_cast<uint32_t>(m_allocations.size()));
+            for (const auto &al : m_allocations) out.pod(al);
+            out.u32(m_heapCursor); out.u32(m_interruptStatus); out.u32(m_interruptMask); out.u32(m_interruptControl);
+            out.flag(m_dmaStart.has_value());
+            if (m_dmaStart) out.pod(*m_dmaStart);
+            m_spu2.saveState(out);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            in.raw(m_ram.data(), m_ram.size());
+            in.raw(m_owned.data(), m_owned.size());
+            in.raw(m_scratch.data(), m_scratch.size());
+            uint32_t n = in.u32();
+            if (n > (1u << 20)) { in.fail("bad IOP register count"); return false; }
+            m_hardware.clear();
+            for (uint32_t i = 0; i < n && in.ok(); ++i) { const uint32_t k = in.u32(); m_hardware[k] = in.u32(); }
+            n = in.u32();
+            if (n > (1u << 20)) { in.fail("bad IOP allocation count"); return false; }
+            m_allocations.clear();
+            for (uint32_t i = 0; i < n && in.ok(); ++i) m_allocations.push_back(in.template pod<Allocation>());
+            m_heapCursor = in.u32(); m_interruptStatus = in.u32(); m_interruptMask = in.u32(); m_interruptControl = in.u32();
+            m_dmaStart.reset();
+            if (in.flag()) m_dmaStart = in.template pod<DmaStart>();
+            return m_spu2.loadState(in) && in.ok();
+        }
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;

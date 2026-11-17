@@ -4,6 +4,7 @@
 #include "runtime/native_tuning.h"
 #include "thread_placement.hpp"
 #include <switch.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -21,6 +22,7 @@ namespace {constexpr const char *Root="sdmc:/switch/celosia-native-boot";}
 extern "C" {u32 __nx_nv_transfermem_size=32u*1024u*1024u;}
 void prepareSwitchDiagnostics();
 extern "C" void celosia_saltynx_start(void); // saltynx_fps.cpp
+extern std::atomic<int> celosia_thread_flags; // native_renderer.cpp: helper-thread placement
 void recordSwitchTermination();
 static void recordHardwareClocks()
 {
@@ -162,6 +164,39 @@ int main()
             const char *slow=std::getenv("CELOSIA_DIAG_FRAME_SLOW_MS");
             setenv("SOTC_FRAME_SLOW_MS",slow?slow:"60",1);
         }
+        // Hardware A/B switches for the helper threads (default off = v60 behaviour). Helper threads go to
+        // core 2 (native_renderer::threads::place). CELOSIA_DIAG_CD_ASYNC=1: disc reads on the reader
+        // thread (sceCdSync waits, guest copy on the EE executor); CELOSIA_DIAG_CD_READAHEAD=1 adds the
+        // stream read-ahead; CELOSIA_DIAG_HOOK_ASYNC=1: model hooks (packets, skinning) on the hook worker.
+        auto diagOn=[](const char *key){const char *v=std::getenv(key);return v && std::atoi(v)!=0;};
+        // v85: CD_ASYNC and HOOK_ASYNC are on unless set to 0 (every measured build since v61 ran with
+        // both; without them the model hooks run on the game thread and it saturates in battles).
+        auto diagDefaultOn=[](const char *key){const char *v=std::getenv(key);return !v || std::atoi(v)!=0;};
+        if(diagDefaultOn("CELOSIA_DIAG_CD_ASYNC"))setenv("PS2X_CD_ASYNC","1",1);
+        if(diagOn("CELOSIA_DIAG_CD_READAHEAD"))setenv("PS2X_CD_READAHEAD","1",1);
+        if(diagDefaultOn("CELOSIA_DIAG_HOOK_ASYNC"))setenv("SOTC_HOOK_ASYNC","1",1);
+        // v117: the offload workers start through sotc_spawn (a Switch-safe detached thread); off unless set:
+        // CELOSIA_DIAG_TEX64=1 texReset's loop, CELOSIA_DIAG_MDS_LANE=1 modelDispState's lane,
+        // CELOSIA_DIAG_WORKER91=1 the particle / wind module's guest code on the guest worker.
+        if(diagOn("CELOSIA_DIAG_TEX64"))setenv("SOTC_TEX64","1",1);
+        if(diagOn("CELOSIA_DIAG_MDS_LANE"))setenv("SOTC_MDS_LANE","1",1);
+        if(diagOn("CELOSIA_DIAG_WORKER91"))setenv("SOTC_WORKER91","1",1);
+        if(diagOn("CELOSIA_DIAG_CD_TRACE"))setenv("PS2X_CD_TRACE","1",1);
+        {
+            const char *oc=std::getenv("CELOSIA_DIAG_OFFLOAD_CORE");
+            const int offloadCore=oc?std::atoi(oc):1;
+            celosia_thread_flags.store((diagOn("CELOSIA_DIAG_NO_CORE2")?1:0)|(diagOn("CELOSIA_DIAG_THREAD_LOG")?2:0)|
+                                       (offloadCore>=0 && offloadCore<=2?0x40|(offloadCore<<4):0));
+        }
+        // The main thread runs the host loop (vblank pacing, frame setup). With its inherited mask (all
+        // application cores) the kernel may put it on a different core from run to run; suspected cause of
+        // the same build running the altar at 35-38 instead of 44-45 FPS (core 2 load 62 % vs 96 %).
+        // It joins the helper threads on core 2. CELOSIA_DIAG_MAIN_CORE=-1 keeps the inherited mask.
+        {
+            int mainCore=2;
+            if(const char *value=std::getenv("CELOSIA_DIAG_MAIN_CORE"))mainCore=std::atoi(value);
+            celosia::native::placeSwitchThread("main-placed",mainCore);
+        }
         requestGpuClock(std::getenv("CELOSIA_DIAG_GPU_HZ"));
         celosia_saltynx_start();
         auto runtime=std::make_unique<PS2Runtime>();
@@ -169,7 +204,7 @@ int main()
         // Development profile: keep native scene geometry/materials and vertex
         // fog, while the remaining deko post-processing passes are implemented.
         auto &graphics=native_renderer::tuning();
-        graphics.zFog=false;graphics.bloom=false;graphics.glow=false;
+        graphics.zFog=std::getenv("CELOSIA_DIAG_NO_ZFOG")==nullptr;graphics.bloom=std::getenv("CELOSIA_DIAG_NO_BLOOM")==nullptr;graphics.glow=false;
         graphics.depthOfField=false;graphics.screenBlur=false;graphics.feedback=false;
         graphics.reflections=false;graphics.refraction=false;graphics.heatHaze=false;
         graphics.shadows=true;graphics.bodyShadows=true;

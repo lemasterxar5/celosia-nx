@@ -5,7 +5,7 @@ layout(location=2) in vec2 texcoord;
 layout(location=3) in vec4 colour;
 layout(std140,binding=0) uniform Material {
     mat4 clip, directions, colours;
-    vec4 params, fog, fogColour, lod, alpha, debug;
+    vec4 params, fog, fogColour, lod, alpha, debug, bgFog;
 } u;
 layout(location=0) out vec2 uv;
 layout(location=1) out vec4 shade;

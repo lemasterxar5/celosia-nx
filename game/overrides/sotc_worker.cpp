@@ -45,6 +45,7 @@
 // Not as the PS2: the job's guest calls charge no EE cycles to the game's
 // clock; its random numbers are its own stream.
 #include "sotc_worker.h"
+#include "sotc_spawn.h"
 #include "runtime/ps2_diag.h"
 #include "sotc_decomp.h"
 
@@ -926,7 +927,7 @@ namespace sotc_worker
             const unsigned int stackDefault = _pthread_stack_default_user;
             _pthread_stack_default_user = kHostStack;
 #endif
-            std::thread(loop).detach();
+            sotc_spawn::detached(loop, kHostStack);
 #if defined(__vita__)
             _pthread_stack_default_user = stackDefault;
 #endif

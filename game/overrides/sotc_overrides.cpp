@@ -521,7 +521,13 @@ namespace
         if (runtime->transferPending())
             return; // a thread switch below (round 52): nothing more here
         if (idlePoll)
+        {
+            // v95 save states: the idle thread never blocks, so the scheduler is never idle; while a
+            // state is asked for it sleeps 2 ms in a saveable wait (the poll's result, 0, is dropped).
+            if (EeScheduler::s_stateWanted && EeScheduler::s_stateWanted())
+                runtime->eeScheduler().delayCurrent(2000u, EeScheduler::resumeFor(kResumeReturn0, 0), kResumeReturn0);
             runtime->eeScheduler().idleWait();
+        }
     }
 
     // SotC's frame loop: the main thread blocks sending to queue 0x26d9a8;
@@ -906,12 +912,7 @@ namespace
         void delayThread(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
         {
             // libkernel's DelayThread (an alarm on T2, then SleepThread): a timed wait on the host.
-            runtime->eeScheduler().delayCurrent(GPR_U32(ctx, 4), [](R5900Context &resume)
-            {
-                R5900Context *r = &resume;
-                SET_GPR_U64(r, 2, 0u);
-                r->pc = GPR_U32(r, 31);
-            });
+            runtime->eeScheduler().delayCurrent(GPR_U32(ctx, 4), EeScheduler::resumeFor(kResumeReturn0, 0), kResumeReturn0);
         }
         void timerSystemTime(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
         {

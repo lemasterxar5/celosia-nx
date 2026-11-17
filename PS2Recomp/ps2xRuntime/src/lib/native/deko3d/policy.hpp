@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <atomic>
 #include <stdexcept>
 
@@ -68,6 +69,19 @@ inline MeshBounds meshBounds(const Vertex *vertices, uint32_t count) {
     b.valid = std::isfinite(b.lo[0]) && std::isfinite(b.lo[1]) && std::isfinite(b.lo[2]) &&
               std::isfinite(b.hi[0]) && std::isfinite(b.hi[1]) && std::isfinite(b.hi[2]);
     return b;
+}
+// Greatest clip w (the shaders' view depth) over the bounds: w is linear in position, so its
+// maximum over the box is at a corner. Invalid bounds give +infinity (no conclusion).
+inline float maxClipW(const float clip[16], const MeshBounds &b) {
+    if (!b.valid) return std::numeric_limits<float>::infinity();
+    float result = -std::numeric_limits<float>::infinity();
+    for (unsigned corner = 0; corner < 8; ++corner) {
+        const float p[3]{corner & 1 ? b.hi[0] : b.lo[0], corner & 2 ? b.hi[1] : b.lo[1], corner & 4 ? b.hi[2] : b.lo[2]};
+        const float w = clip[3]*p[0] + clip[7]*p[1] + clip[11]*p[2] + clip[15];
+        if (!std::isfinite(w)) return std::numeric_limits<float>::infinity();
+        result = std::max(result, w);
+    }
+    return result;
 }
 // Upper-bound fraction of the screen a draw can touch: the clipped NDC bounding box of the
 // bounds' eight corners under the column-major clip matrix (c = clip * (p,1), x/w, y/w).
@@ -148,7 +162,10 @@ inline void validateDraw(const DrawState &d, bool depthFogDisabled = false) {
         if (!std::isfinite(value)) throw std::invalid_argument("deko3d: non-finite light matrix");
 }
 inline void validateFog(const Fog &f) {
-    if (f.enabled) throw std::invalid_argument("deko3d: zFog composite not implemented");
+    // zFog (enabled): fogged draws and the world before the fog's layer fade to the background
+    // image (render.cpp); start/width/steps must describe a usable ramp.
+    if (f.enabled && (!std::isfinite(f.start) || !std::isfinite(f.width) || f.width <= 0 || f.steps < 0 || f.steps > 128))
+        throw std::invalid_argument("deko3d: invalid zFog ramp");
     if (!std::isfinite(f.base) || !std::isfinite(f.scale) || !std::isfinite(f.skyNear) ||
         f.skyNear < 0)
         throw std::invalid_argument("deko3d: invalid vertex fog");

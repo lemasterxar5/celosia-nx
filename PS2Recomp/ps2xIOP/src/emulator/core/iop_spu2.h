@@ -44,6 +44,46 @@ namespace ps2x::iop::detail
 
         // Interleaved stereo frames for the host audio device (any thread).
         size_t readOutput(int16_t *destination, size_t frames) noexcept;
+        // Save states (v94): sound RAM, registers, both cores (voices, envelopes, reverb, the
+        // auto-DMA input), the IRQ and the clock. The output ring is not state: emptied at load.
+        template <typename W>
+        void saveState(W &out) const
+        {
+            out.raw(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+            out.pod(m_regs);
+            for (const Core &c : m_cores)
+            {
+                out.raw(&c, offsetof(Core, input));
+                out.u32(static_cast<uint32_t>(c.input.size()));
+                for (const auto &frame : c.input)
+                    out.pod(frame);
+            }
+            out.pod(m_irqInfo); out.pod(m_irqPending); out.pod(m_cycle); out.pod(m_cycleValid);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            in.raw(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+            m_regs = in.template pod<decltype(m_regs)>();
+            for (Core &c : m_cores)
+            {
+                in.raw(&c, offsetof(Core, input));
+                const uint32_t n = in.u32();
+                if (n > (1u << 20))
+                {
+                    in.fail("bad SPU2 input size");
+                    return false;
+                }
+                c.input.clear();
+                for (uint32_t i = 0; i < n && in.ok(); ++i)
+                    c.input.push_back(in.template pod<std::array<int16_t, 2>>());
+            }
+            m_irqInfo = in.template pod<uint16_t>(); m_irqPending = in.template pod<bool>();
+            m_cycle = in.template pod<uint64_t>(); m_cycleValid = in.template pod<bool>();
+            m_ringRead.store(m_ringWrite.load(std::memory_order_acquire), std::memory_order_release);
+            m_outputStarted = false;
+            return in.ok();
+        }
 
     private:
         enum class Phase : uint8_t

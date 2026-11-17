@@ -1,5 +1,9 @@
 #pragma once
 
+#include <type_traits>
+#include <vector>
+#include <string>
+#include <map>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +21,19 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+
+        // Save states (v94).
+        template <typename W>
+        void saveState(W &out) const
+        {
+            out.pod(m_timers); out.pod(m_holdMode); out.pod(m_servicing);
+        }
+        template <typename R>
+        bool loadState(R &in)
+        {
+            m_timers = in.template pod<decltype(m_timers)>(); m_holdMode = in.u32(); m_servicing = in.template pod<bool>();
+            return in.ok();
+        }
 
     private:
         struct Callback

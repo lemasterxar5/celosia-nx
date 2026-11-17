@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <array>
 #include <functional>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <atomic>
@@ -28,6 +29,7 @@
 
 class GS;
 
+namespace ps2state { class StateWriter; class StateReader; }
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
@@ -310,6 +312,12 @@ public:
     // Runs fn after the VIF1/GIF work queued so far, on the VU1 worker
     // (inline when the worker is not in use), without waiting for it.
     void runInVu1Order(std::function<void()> fn);
+    // Save states (ps2_memory_state.cpp): drainForState waits for the VU1 worker and applies the
+    // DMA worker's walk; then quiet() says whether nothing is in flight.
+    void drainForState();
+    [[nodiscard]] bool quietForState(std::string &why) const;
+    void saveState(ps2state::StateWriter &out) const;
+    bool loadState(ps2state::StateReader &in);
     // Work another thread does for the VU1 worker (GIF packets): syncVu1()
     // also waits for it.
     void mtvuWorkAdded() { m_mtvuOutstanding.fetch_add(1, std::memory_order_acq_rel); }

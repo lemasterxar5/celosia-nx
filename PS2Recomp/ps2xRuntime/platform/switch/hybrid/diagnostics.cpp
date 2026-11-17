@@ -64,13 +64,27 @@ void windowEvent(const char *operation,NWindow *window,void *caller)
 }
 }
 void recordSwitchTermination(){
-    char message[384];const char *reason="no active C++ exception";
+    char message[1024];const char *reason="no active C++ exception";
     try{if(auto error=std::current_exception())std::rethrow_exception(error);}
     catch(const std::exception &error){reason=error.what();}
     catch(...){reason="unknown C++ exception";}
     const int count=std::snprintf(message,sizeof(message),"TERMINATE: %s caller-offset=0x%llx\n",reason,
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0))-reinterpret_cast<uintptr_t>(_start)));
-    if(count>0)switchFaultRecord(message,std::min(static_cast<size_t>(count),sizeof(message)-1));
+    // v86: the terminating thread's frame-record chain (offsets from _start), to name the caller of
+    // std::terminate from the shipped ELF.
+    size_t used=count>0?std::min(static_cast<size_t>(count),sizeof(message)-1):0;
+    auto frame=reinterpret_cast<uintptr_t>(__builtin_frame_address(0));MemoryInfo memory{};u32 page=0;
+    if(used && R_SUCCEEDED(svcQueryMemory(&memory,&page,frame)) && (memory.perm&Perm_R)) {
+        const auto end=memory.addr+memory.size;
+        for(unsigned index=0;index<24 && !(frame&15) && frame>=memory.addr && frame<=end && end-frame>=16 && sizeof(message)-used>40;++index) {
+            const auto *record=reinterpret_cast<const uintptr_t *>(frame);
+            const int size=std::snprintf(message+used,sizeof(message)-used,"bt[%u]=0x%llx\n",index,
+                static_cast<unsigned long long>(record[1]-reinterpret_cast<uintptr_t>(_start)));
+            if(size>0)used+=static_cast<size_t>(size);
+            const auto next=record[0];if(next<=frame)break;frame=next;
+        }
+    }
+    if(used)switchFaultRecord(message,std::min(used,sizeof(message)-1));
     windowEvent("terminate",nullptr,__builtin_return_address(0));
 }
 namespace {

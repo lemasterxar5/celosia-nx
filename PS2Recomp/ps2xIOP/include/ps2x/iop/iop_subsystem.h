@@ -29,6 +29,10 @@ namespace ps2x::iop
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // Save states (v94): the emulated IOP's whole state (see IopEmulator).
+        [[nodiscard]] bool safeForState(std::string &why) const;
+        [[nodiscard]] std::vector<uint8_t> saveState() const;
+        bool loadState(const uint8_t *data, size_t size, std::string &error);
         // Interleaved stereo 48 kHz frames produced by the SPU2 (any thread).
         size_t readAudio(int16_t *destination, size_t frames) noexcept;
         // CPU-free service facade only. These calls do not construct or

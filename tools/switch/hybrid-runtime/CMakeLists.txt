@@ -37,7 +37,7 @@ add_subdirectory("${CELOSIA_ROOT}/PS2Recomp/ps2xIOP" secondary-services)
 set(runtime_sources
     game_overrides.cpp gs/ps2_gif_arbiter.cpp ps2_audio.cpp ps2_audio_vag.cpp
     gs/ps2_gs_memory.cpp gs/gs_frontend.cpp gs/gs_cpu_backend.cpp
-    gs/gs_async_backend.cpp gs/gs_hw_backend.cpp ps2_iop_host.cpp ps2_memory.cpp
+    gs/gs_async_backend.cpp gs/gs_hw_backend.cpp ps2_iop_host.cpp ps2_memory.cpp ps2_memory_state.cpp ps2_runtime_state.cpp
     ps2_pad.cpp host_menu.cpp ps2_rom_device.cpp ps2_vfs.cpp ps2_runtime.cpp
     ps2_macro_selftest.cpp ps2_vif1_interpreter.cpp vu/ps2_vu1_core.cpp
     vu/ps2_vu1_upper.cpp vu/ps2_vu1_lower.cpp vu/ps2_vu1_rec.cpp games_database.cpp
@@ -50,6 +50,8 @@ target_sources(celosia_hybrid_runtime PRIVATE
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/raylib_window.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/raylib_input_audio.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/raylib_sounds.cpp"
+    "${CELOSIA_RUNTIME}/platform/switch/hybrid/switch_menu.cpp"
+    "${CELOSIA_RUNTIME}/platform/switch/hybrid/save_states.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/native_audio_output.cpp")
 target_sources(celosia_hybrid_runtime PRIVATE "${CELOSIA_RUNTIME}/platform/switch/native_faults.cpp")
 target_sources(celosia_hybrid_runtime PRIVATE "${CELOSIA_RUNTIME}/platform/switch/hybrid/diagnostics.cpp")
@@ -124,4 +126,4 @@ if(CELOSIA_PGO STREQUAL "GENERATE")
 endif()
 target_link_libraries(celosia_switch_game PRIVATE -Wl,--start-group -Wl,--whole-archive
     celosia_hybrid_overrides "${CELOSIA_HYBRID_GAME_ARCHIVE}" -Wl,--no-whole-archive
-    celosia_hybrid_runtime ps2_iop ${celosia_deko_library} nx m -Wl,--end-group)
+    celosia_hybrid_runtime ps2_iop ${celosia_deko_library} "${CELOSIA_DEVKITPRO}/portlibs/switch/lib/libzstd.a" nx m -Wl,--end-group)

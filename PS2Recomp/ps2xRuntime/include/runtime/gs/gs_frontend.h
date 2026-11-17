@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <type_traits>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -131,6 +132,21 @@ public:
                        const float nearPlane[4]);
     // Hands the packets the VU1 worker collected to the GIF worker.
     void flushGifWork();
+    // Save states (v94): the GS registers after the GIF worker drained (flushGifWork).
+    template <typename W>
+    void saveState(W &out)
+    {
+        flushGifWork();
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        out.raw(&m_ctx, sizeof(m_ctx)); out.pod(m_prim); out.pod(m_primRegister); out.pod(m_prmodeRegister); out.pod(m_curR); out.pod(m_curG); out.pod(m_curB); out.pod(m_curA); out.pod(m_curQ); out.pod(m_curS); out.pod(m_curT); out.pod(m_curU); out.pod(m_curV); out.pod(m_curFog); out.pod(m_fogR); out.pod(m_fogG); out.pod(m_fogB); out.pod(m_prmodecont); out.pod(m_pabe); out.pod(m_scanmsk); out.pod(m_dimx); out.pod(m_dthe); out.pod(m_colclamp); out.pod(m_texa); out.pod(m_texclut); out.pod(m_bitbltbuf); out.pod(m_trxpos); out.pod(m_trxreg); out.pod(m_trxdir); out.raw(&m_vtxQueue, sizeof(m_vtxQueue)); out.pod(m_vtxCount); out.pod(m_vtxIndex);
+    }
+    template <typename R>
+    void loadState(R &in)
+    {
+        flushGifWork();
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        in.raw(&m_ctx, sizeof(m_ctx)); m_prim = in.template pod<std::remove_reference_t<decltype(m_prim)>>(); m_primRegister = in.template pod<std::remove_reference_t<decltype(m_primRegister)>>(); m_prmodeRegister = in.template pod<std::remove_reference_t<decltype(m_prmodeRegister)>>(); m_curR = in.template pod<std::remove_reference_t<decltype(m_curR)>>(); m_curG = in.template pod<std::remove_reference_t<decltype(m_curG)>>(); m_curB = in.template pod<std::remove_reference_t<decltype(m_curB)>>(); m_curA = in.template pod<std::remove_reference_t<decltype(m_curA)>>(); m_curQ = in.template pod<std::remove_reference_t<decltype(m_curQ)>>(); m_curS = in.template pod<std::remove_reference_t<decltype(m_curS)>>(); m_curT = in.template pod<std::remove_reference_t<decltype(m_curT)>>(); m_curU = in.template pod<std::remove_reference_t<decltype(m_curU)>>(); m_curV = in.template pod<std::remove_reference_t<decltype(m_curV)>>(); m_curFog = in.template pod<std::remove_reference_t<decltype(m_curFog)>>(); m_fogR = in.template pod<std::remove_reference_t<decltype(m_fogR)>>(); m_fogG = in.template pod<std::remove_reference_t<decltype(m_fogG)>>(); m_fogB = in.template pod<std::remove_reference_t<decltype(m_fogB)>>(); m_prmodecont = in.template pod<std::remove_reference_t<decltype(m_prmodecont)>>(); m_pabe = in.template pod<std::remove_reference_t<decltype(m_pabe)>>(); m_scanmsk = in.template pod<std::remove_reference_t<decltype(m_scanmsk)>>(); m_dimx = in.template pod<std::remove_reference_t<decltype(m_dimx)>>(); m_dthe = in.template pod<std::remove_reference_t<decltype(m_dthe)>>(); m_colclamp = in.template pod<std::remove_reference_t<decltype(m_colclamp)>>(); m_texa = in.template pod<std::remove_reference_t<decltype(m_texa)>>(); m_texclut = in.template pod<std::remove_reference_t<decltype(m_texclut)>>(); m_bitbltbuf = in.template pod<std::remove_reference_t<decltype(m_bitbltbuf)>>(); m_trxpos = in.template pod<std::remove_reference_t<decltype(m_trxpos)>>(); m_trxreg = in.template pod<std::remove_reference_t<decltype(m_trxreg)>>(); m_trxdir = in.template pod<std::remove_reference_t<decltype(m_trxdir)>>(); in.raw(&m_vtxQueue, sizeof(m_vtxQueue)); m_vtxCount = in.template pod<std::remove_reference_t<decltype(m_vtxCount)>>(); m_vtxIndex = in.template pod<std::remove_reference_t<decltype(m_vtxIndex)>>();
+    }
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,

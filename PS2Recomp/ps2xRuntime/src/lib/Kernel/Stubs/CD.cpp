@@ -1,5 +1,9 @@
+#include "runtime/state_stream.h"
 #include "Common.h"
 #include "runtime/ps2_diag.h"
+#if defined(__SWITCH__)
+#include <pthread.h>
+#endif
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
@@ -217,6 +221,18 @@ namespace ps2_stubs
         namespace cd_async
         {
             constexpr uint32_t kCdReadWaitType = 0x43445244u; // 'CDRD'
+            bool g_readLog = false; // SOTC_CD_AHEAD100_LOG, resolved before the reader starts
+            // PS2X_CD_TRACE=1 (diagnosis): each step of an asynchronous read, flushed at once.
+            bool traceOn()
+            {
+                static const bool on = []
+                {
+                    const char *env = std::getenv("PS2X_CD_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                return on;
+            }
+#define CD_TRACE(...) do { if (cd_async::traceOn()) { std::fprintf(stderr, "[cdtrace] " __VA_ARGS__); std::fflush(stderr); } } while (0)
             struct State
             {
                 std::mutex mutex;
@@ -547,13 +563,18 @@ namespace ps2_stubs
 
             void workerLoop()
             {
+                CD_TRACE("worker start\n");
                 native_renderer::threads::place(native_renderer::threads::kLoader);
+                CD_TRACE("worker placed, locking\n");
                 State &s = state();
                 std::unique_lock lock(s.mutex);
+                CD_TRACE("worker locked\n");
                 while (true)
                 {
+                    CD_TRACE("worker waits\n");
                     s.cv.wait(lock, [&s] { return s.queued; });
                     s.queued = false;
+                    CD_TRACE("worker took token %llu bytes %zu iop %d\n", (unsigned long long)s.token, s.bytes, s.toIop ? 1 : 0);
                     const std::filesystem::path path = s.path;
                     const uint64_t offset = s.offset;
                     const size_t bytes = s.bytes;
@@ -589,7 +610,9 @@ namespace ps2_stubs
                     else
                     {
                         ahead().workerReading.store(true, std::memory_order_release);
+                        CD_TRACE("worker reads %s at %llu\n", path.filename().string().c_str(), (unsigned long long)offset);
                         ok = readHostRange(path, offset, dst, bytes);
+                        CD_TRACE("worker read done ok %d\n", ok ? 1 : 0);
                         ahead().workerReading.store(false, std::memory_order_release);
                         if (!toIop)
                             g_eeMisses.fetch_add(1, std::memory_order_relaxed);
@@ -598,7 +621,7 @@ namespace ps2_stubs
                         aheadQueue(key, offset + bytes, bytes);
                     {
                         // SOTC_CD_AHEAD100_LOG=1 (measuring): each EE read's file, place, size and outcome.
-                        static const bool readLog = ps2_diag::env("SOTC_CD_AHEAD100_LOG") && std::atoi(ps2_diag::env("SOTC_CD_AHEAD100_LOG")) != 0;
+                        const bool readLog = g_readLog; // set in submit (no getenv on this thread)
                         if (readLog && !toIop)
                             std::fprintf(stderr, "[cd100r] %s %llu %u %s\n", path.filename().string().c_str(), (unsigned long long)offset, static_cast<unsigned>(bytes), eeHit ? "copied" : "read");
                     }
@@ -640,8 +663,10 @@ namespace ps2_stubs
                     s.doneUs = ps2x::iop::audio_stats::nowUs();
                     s.hostDone = true;
                     s.cv.notify_all();
+                    CD_TRACE("worker posts wake token %llu\n", (unsigned long long)token);
                     if (s.runtime)
                         s.runtime->eeScheduler().postEvent(EeEvent{EeEventType::ExternalWake, kCdReadWaitType, token});
+                    CD_TRACE("worker posted\n");
                 }
             }
             // The executor: wait for the worker (if it is still reading) and
@@ -652,7 +677,9 @@ namespace ps2_stubs
                 std::unique_lock lock(s.mutex);
                 if (!s.pending)
                     return;
+                CD_TRACE("finish waits hostDone %d\n", s.hostDone ? 1 : 0);
                 s.cv.wait(lock, [&s] { return s.hostDone; });
+                CD_TRACE("finish copies\n");
                 ps2x::iop::audio_stats::cdPendingSinceUs.store(0, std::memory_order_relaxed);
                 {
                     // audio_stats: request -> data in guest memory, and the
@@ -706,13 +733,45 @@ namespace ps2_stubs
                 uint64_t offset = 0;
                 if (!runtime || !resolveCdSectors(lbn, sectors, path, offset))
                     return false;
+                CD_TRACE("submit enter lbn %u bytes %zu\n", lbn, bytes);
                 finish();
+                CD_TRACE("submit finished previous\n");
                 State &s = state();
                 std::lock_guard lock(s.mutex);
+                CD_TRACE("submit locked\n");
                 if (!s.started)
                 {
                     s.started = true;
-                    std::thread([] { workerLoop(); }).detach();
+                    // Settings read with getenv are resolved here, on the EE thread, so the reader
+                    // thread never touches the environment (shared, not safe beside other threads).
+                    (void)aheadEnabled();
+                    (void)aheadEnabledEe();
+                    g_readLog = ps2_diag::env("SOTC_CD_AHEAD100_LOG") && std::atoi(ps2_diag::env("SOTC_CD_AHEAD100_LOG")) != 0;
+                    CD_TRACE("submit creating worker\n");
+#if defined(__SWITCH__)
+                    {
+                        // As the hook worker: a pthread with an explicit stack, detached at once
+                        // (std::thread + detach stalled the creating EE thread on Switch).
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+                        pthread_attr_setstacksize(&attr, 256u * 1024u);
+                        pthread_t worker;
+                        const int created = pthread_create(&worker, &attr, [](void *) -> void * { workerLoop(); return nullptr; }, nullptr);
+                        pthread_attr_destroy(&attr);
+                        if (created != 0)
+                        {
+                            s.started = false;
+                            return false; // the caller reads inline
+                        }
+                        CD_TRACE("submit created worker\n");
+                        pthread_detach(worker);
+                    }
+#else
+                    std::thread worker([] { workerLoop(); });
+                    CD_TRACE("submit created worker\n");
+                    worker.detach();
+#endif
+                    CD_TRACE("submit detached worker\n");
                 }
                 s.path = std::move(path);
                 s.offset = offset;
@@ -732,6 +791,7 @@ namespace ps2_stubs
                 s.queued = true;
                 ++s.token;
                 s.cv.notify_all();
+                CD_TRACE("submit token %llu bytes %zu iop %d\n", (unsigned long long)s.token, bytes, toIop ? 1 : 0);
                 return true;
             }
             uint64_t token()
@@ -920,6 +980,7 @@ namespace ps2_stubs
         const uint32_t mode = getRegU32(ctx, 4);
         if (cd_async::pending())
         {
+            CD_TRACE("sync mode %u busy %d\n", mode, cd_async::busy() ? 1 : 0);
             if (cd_async::busy())
             {
                 if ((mode & 1u) != 0u)
@@ -1651,5 +1712,48 @@ namespace ps2_stubs
             *status = 0;
         }
         setReturnS32(ctx, 1);
+    }
+
+    // Save states (v94): the drive as the EE libraries see it (init, mode, last error, the
+    // streaming position and the stream's timing). Not saved: the read-ahead caches (the disc
+    // does not change) and an asynchronous read, which must have finished (cdSafeForState).
+    bool cdSafeForState(std::string &why)
+    {
+        if (cd_async::pending())
+        {
+            why = "a disc read is in flight";
+            return false;
+        }
+        return true;
+    }
+
+    void cdSaveState(ps2state::StateWriter &out)
+    {
+        out.tag("CDEE");
+        out.u32(1u);
+        out.flag(g_cdInitialized);
+        out.i32(g_lastCdError);
+        out.u32(g_cdMode);
+        out.u32(g_cdStreamingLbn);
+        out.u32(g_cdStreamingEndLbn);
+        out.pod(g_cdStreamTiming);
+    }
+
+    bool cdLoadState(ps2state::StateReader &in)
+    {
+        if (!in.tag("CDEE"))
+            return false;
+        if (in.u32() != 1u)
+        {
+            in.fail("CD state version");
+            return false;
+        }
+        g_cdInitialized = in.flag();
+        g_lastCdError = in.i32();
+        g_cdMode = in.u32();
+        g_cdStreamingLbn = in.u32();
+        g_cdStreamingEndLbn = in.u32();
+        g_cdStreamTiming = in.pod<CdStreamTimingState>();
+        return in.ok();
     }
 }

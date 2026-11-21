@@ -23,7 +23,7 @@ static void deviceMessage(void *, const char *context, DkResult result, const ch
 }
 DekoBackend::DekoBackend() {
     // Explicit local diagnostic opt-in; normal presentation has no readback.
-    if(auto *file=std::fopen("sdmc:/switch/celosia-native-boot/capture-frame.txt","r")) {
+    if(auto *file=std::fopen("sdmc:/switch/celosia_nx/capture-frame.txt","r")) {
         unsigned requested=0,interval=0;
         const int fields=std::fscanf(file,"%u %u",&requested,&interval);
         if(fields>=1 && requested>0 && requested<=1000000) {
@@ -44,27 +44,40 @@ DekoBackend::DekoBackend() {
             return std::make_shared<BufferBlock>(gpu,BufferPool::PageBytes,budget,uint32_t(DkMemBlockFlags_GpuCached|DkMemBlockFlags_Image));
         },64);
     DkQueueMaker queueMaker;
-    dkQueueMakerDefaults(&queueMaker, device); queueMaker.flags = DkQueueFlags_Graphics;
+    dkQueueMakerDefaults(&queueMaker, device); queueMaker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute; // v153: compute for frame generation
+    // v173q: the render queue's own command memory 1 MiB (was deko3d's 64 KiB minimum, flushed every 8 KiB) and
+    // room for 512 compute jobs in flight (was 128), so a frame with the whole LSFG chain doesn't make the game
+    // thread wait in its submit for the GPU to run most of that frame. Memory only: every fence and wait stays.
+    // CELOSIA_DIAG_SMALL_QUEUE173=1: the old sizes (A/B).
+    if(!std::getenv("CELOSIA_DIAG_SMALL_QUEUE173")){
+        queueMaker.commandMemorySize=1u<<20;queueMaker.flushThreshold=1u<<17;queueMaker.maxConcurrentComputeJobs=512;
+    }
     queue.reset(dkQueueCreate(&queueMaker));
     if (!queue.value) throw std::runtime_error("deko3d: queue creation failed");
-    const DkImage *images[Frames];
+    // v164: the frame generation's present queue (graphics: copies only) and its command buffer.
+    if(const char *off=std::getenv("CELOSIA_DIAG_SYNC_PRESENT"))presentAsync=std::atoi(off)==0;
+    if(std::getenv("CELOSIA_DIAG_NO_LSFG_DIRECT"))lsfgDirectReal=false;
+    if(std::getenv("CELOSIA_DIAG_NO_LSFG_DIRECTGEN170"))lsfgDirectGen=false;
+    if(presentAsync){
+        DkQueueMaker presentMaker;
+        dkQueueMakerDefaults(&presentMaker,device);presentMaker.flags=DkQueueFlags_Graphics;
+        presentMaker.commandMemorySize=DK_QUEUE_MIN_CMDMEM_SIZE;presentMaker.flushThreshold=DK_QUEUE_MIN_CMDMEM_SIZE/8;
+        presentQueue.reset(dkQueueCreate(&presentMaker));
+        DkCmdBufMaker presentCmdMaker;dkCmdBufMakerDefaults(&presentCmdMaker,device);
+        if(presentQueue.value)presentCommands.reset(dkCmdBufCreate(&presentCmdMaker));
+        for(auto &m:presentCmdMem)m=std::make_shared<Buffer>(device,65536,allocationBudget);
+        if(!presentQueue.value || !presentCommands.value){presentAsync=false;std::fprintf(stderr,"[deko3d] present queue unavailable\n");}
+        else presentThread=std::thread([this]{presentWorker();});
+    }
     // Lossless hardware framebuffer compression on the colour and depth targets, as in the deko3d
     // examples: it cuts the memory traffic of blending and depth testing (layered additive effects).
     // CELOSIA_DIAG_NO_FB_COMPRESSION=1 reverts.
     const char *noCompression=std::getenv("CELOSIA_DIAG_NO_FB_COMPRESSION");
     const uint32_t targetCompression=noCompression && std::atoi(noCompression)!=0?0u:uint32_t(DkImageFlags_HwCompression);
-    for (uint32_t i = 0; i < Frames; ++i) {
-        colors[i] = std::make_shared<Image>(device, Width, Height, DkImageFormat_RGBA8_Unorm,
-            DkImageFlags_UsageRender | DkImageFlags_UsagePresent | targetCompression, allocationBudget);
-        images[i] = &colors[i]->image;
-    }
     depth = std::make_shared<Image>(device, Width, Height, DkImageFormat_ZF32_X24S8,
         DkImageFlags_UsageRender | targetCompression, allocationBudget);
-    DkSwapchainMaker swapMaker;
-    dkSwapchainMakerDefaults(&swapMaker, device, nwindowGetDefault(), images, Frames);
-    swapchain.reset(dkSwapchainCreate(&swapMaker));
-    if (!swapchain.value) throw std::runtime_error("deko3d: swapchain creation failed");
-    dkSwapchainSetSwapInterval(swapchain, 1);
+    targetFlags=targetCompression;
+    makeSwapchain(Width,Height);
     vertexShader = std::make_unique<Shader>(device,
         "romfs:/shaders/celosia_native.vert.dksh", DkStage_Vertex, allocationBudget);
     fragmentShader = std::make_unique<Shader>(device,
@@ -105,6 +118,12 @@ DekoBackend::DekoBackend() {
     std::memset(imageDescriptors->storage->cpu(),0,size_t(ImageDescriptorSlots)*sizeof(DkImageDescriptor));
     if(const char *direct=std::getenv("CELOSIA_DIAG_SKY_DIRECT"))skyImageEnabled=std::atoi(direct)==0;
     if(const char *merge=std::getenv("CELOSIA_DIAG_NO_ALPHA_MERGE"))mergeAlphaNoop=std::atoi(merge)==0;
+    if(std::getenv("CELOSIA_DIAG_NO_PUSH165"))pushDelta=false;
+    if(std::getenv("CELOSIA_DIAG_NO_PACK166"))packNormals=false;
+    if(std::getenv("CELOSIA_DIAG_NO_REGION_SPLIT"))alphaRegionSplit=false;
+    if(std::getenv("CELOSIA_DIAG_NO_TAIL_RECTS"))tailRects=false;
+    // v167: off by default (v166 A/B: +0.5 ms GPU in the cinematic, worse gameplay); CELOSIA_DIAG_TILED_CACHE=1: on.
+    tiledCache=std::getenv("CELOSIA_DIAG_TILED_CACHE")!=nullptr;
     if(const char *heavy=std::getenv("CELOSIA_DIAG_HEAVY_MS"))heavyCaptureNs=uint64_t(std::max(0,std::atoi(heavy)))*1000000ull;
     bgColour=std::make_shared<Image>(device,512,448,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
     bgDepth=std::make_shared<Image>(device,512,448,DkImageFormat_ZF32_X24S8,DkImageFlags_UsageRender,allocationBudget);
@@ -118,9 +137,39 @@ DekoBackend::DekoBackend() {
         dkImageDescriptorInitialize(imageDescriptors->entries()+bgSmallSlot,&smallView,false,false);
     }
     skyFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_sky.frag.dksh",DkStage_Fragment,allocationBudget);
+    postFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_post.frag.dksh",DkStage_Fragment,allocationBudget);
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_POST_VARIANTS"))postVariants=std::atoi(off)==0;
+    try{postFxShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_postfx.frag.dksh",DkStage_Fragment,allocationBudget);
+        postPlainShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_postplain.frag.dksh",DkStage_Fragment,allocationBudget);}
+    catch(const std::exception &e){postFxShader.reset();postPlainShader.reset();std::fprintf(stderr,"[deko3d] post variants: %s\n",e.what());}
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_SOLID_RESOLVE"))solidResolve=std::atoi(off)==0;
+    if(const char *on=std::getenv("CELOSIA_DIAG_COMPUTE_POST"))computePost=std::atoi(on)!=0; // v162: off by default
+    if(const char *off=std::getenv("CELOSIA_DIAG_COPY_IMAGE"))blitCopies=std::atoi(off)==0; // v161: back to dkCmdBufCopyImage
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_EARLY_MASK"))earlyMask=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_SHADOW_SHADER"))shadowSoft=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_BLOOM_SHADERS"))bloomSplit=std::atoi(off)==0;
+    try{bloomChainShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_bloomchain.frag.dksh",DkStage_Fragment,allocationBudget);
+        bloomCompShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_bloomcomp.frag.dksh",DkStage_Fragment,allocationBudget);}
+    catch(const std::exception &e){bloomChainShader.reset();bloomCompShader.reset();std::fprintf(stderr,"[deko3d] bloom shaders: %s\n",e.what());}
+    try{shadowSoftShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_shadowsoft.frag.dksh",DkStage_Fragment,allocationBudget);}
+    catch(const std::exception &e){std::fprintf(stderr,"[deko3d] soft shadow shader: %s\n",e.what());}
+    try{oneFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_one.frag.dksh",DkStage_Fragment,allocationBudget);}
+    catch(const std::exception &e){std::fprintf(stderr,"[deko3d] mask shader: %s\n",e.what());}
+    try{solidFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_solid.frag.dksh",DkStage_Fragment,allocationBudget);}
+    catch(const std::exception &e){std::fprintf(stderr,"[deko3d] solid resolve shader: %s\n",e.what());}
+    try{
+        postComputeShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_post.comp.dksh",DkStage_Compute,allocationBudget);
+        postConstants=std::make_shared<Buffer>(device,16*256,allocationBudget);
+    }catch(const std::exception &e){postComputeShader.reset();std::fprintf(stderr,"[deko3d] compute post shader: %s\n",e.what());}
     if(const char *off=std::getenv("CELOSIA_DIAG_NO_BLOOM"))bloomAllowed=std::atoi(off)==0;
     if(const char *hard=std::getenv("CELOSIA_DIAG_SHADOW_HARD"))softShadows=std::atoi(hard)==0;
     if(const char *off=std::getenv("CELOSIA_DIAG_NO_BG_ALPHA_MERGE"))mergeBgAlpha=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_FAINT_CULL"))faintCull=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_TEXTURE_CLIP"))textureClip=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_SHADOW_RECT"))shadowRectOn=std::atoi(off)==0;
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_RESOLVED_TAIL"))resolvedTail=std::atoi(off)==0;
+    if(const char *v=std::getenv("CELOSIA_DIAG_BLOOM"))diagBloom=std::atoi(v);
+    if(const char *off=std::getenv("CELOSIA_DIAG_NO_ALPHA_SPLIT"))alphaSplit=std::atoi(off)==0;
     if(const char *off=std::getenv("CELOSIA_DIAG_NO_ADD_DISCARD"))zeroAddDiscard=std::atoi(off)==0;
     {
         bloomFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_bloom.frag.dksh",DkStage_Fragment,allocationBudget);
@@ -137,6 +186,12 @@ DekoBackend::DekoBackend() {
             dkImageDescriptorInitialize(imageDescriptors->entries()+slot,&view,false,false);
         };
         describe(bloomMask,bloomMaskSlot);
+        maskFormatNow=maskFormat;
+        sceneSlot=imageDescriptors->slots.acquire();
+        if(sceneSlot==DescriptorSlots::None)throw std::runtime_error("deko3d: no descriptor slot for the scene image");
+        postOutSlot=imageDescriptors->slots.acquire(); // v160 (None: the fragment post only)
+        postOutTexSlot=imageDescriptors->slots.acquire(); // v161: the same image sampled
+        for(auto &s:fgInSlot)s=imageDescriptors->slots.acquire(); // v168: the compute post straight into LSFG's input
         for(int i=0;i<7;++i){
             const uint32_t size=(i==0 || i==6)?256u:((i==1 || i==5)?128u:64u);
             bloomChain[i]=std::make_shared<Image>(device,size,size,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
@@ -148,15 +203,18 @@ DekoBackend::DekoBackend() {
         }
     }
     // Descriptors 4..7 (nearest mip filter) are bound only by CELOSIA_DIAG_GPU_CYCLE mode 3.
-    samplers = std::make_shared<Buffer>(device, 8 * sizeof(DkSamplerDescriptor), allocationBudget,bufferPool);
-    for (uint32_t mode = 0; mode < 8; ++mode) {
+    // v149: five sets of the eight, one per anisotropy level (1, 2, 4, 8, 16: the menu's choice binds its set).
+    samplers = std::make_shared<Buffer>(device, 40 * sizeof(DkSamplerDescriptor), allocationBudget,bufferPool);
+    for (uint32_t index = 0; index < 40; ++index) {
+        const uint32_t mode = index & 7;
         DkSampler sampler; dkSamplerDefaults(&sampler);
+        sampler.maxAnisotropy = float(1u << (index >> 3));
         sampler.minFilter = sampler.magFilter = DkFilter_Linear;
         sampler.mipFilter = mode & 4 ? DkMipFilter_Nearest : DkMipFilter_Linear;
         sampler.wrapMode[0] = mode & 1 ? DkWrapMode_ClampToEdge : DkWrapMode_Repeat;
         sampler.wrapMode[1] = mode & 2 ? DkWrapMode_ClampToEdge : DkWrapMode_Repeat;
         auto *desc = static_cast<DkSamplerDescriptor *>(samplers->cpu());
-        dkSamplerDescriptorInitialize(desc + mode, &sampler);
+        dkSamplerDescriptorInitialize(desc + index, &sampler);
     }
     DkCmdBufMaker cmdMaker;
     dkCmdBufMakerDefaults(&cmdMaker, device);
@@ -169,7 +227,30 @@ DekoBackend::DekoBackend() {
     uploadTexture(1, 1, 1, white, 1);
     dummyTexture = textures.at(1); textures.erase(1);
 }
+// v151: the swapchain and its images at width x height (the window's buffers resized to match).
+void DekoBackend::makeSwapchain(uint32_t width,uint32_t height){
+    swapchain.reset();
+    const DkImage *images[Frames];
+    for (uint32_t i = 0; i < Frames; ++i) {
+        colors[i] = std::make_shared<Image>(device, width, height, DkImageFormat_RGBA8_Unorm,
+            DkImageFlags_UsageRender | DkImageFlags_UsagePresent | targetFlags, allocationBudget);
+        images[i] = &colors[i]->image;
+    }
+    nwindowSetDimensions(nwindowGetDefault(), width, height);
+    DkSwapchainMaker swapMaker;
+    dkSwapchainMakerDefaults(&swapMaker, device, nwindowGetDefault(), images, Frames);
+    swapchain.reset(dkSwapchainCreate(&swapMaker));
+    if (!swapchain.value) throw std::runtime_error("deko3d: swapchain creation failed");
+    dkSwapchainSetSwapInterval(swapchain, swapIntervalNow);
+    ow=width;oh=height;
+}
 DekoBackend::~DekoBackend() {
+    if(presentThread.joinable()){
+        {std::lock_guard<std::mutex> lock(presentMutex);presentStop=true;}
+        presentCv.notify_all();presentThread.join();
+    }
+    if(presentQueue.value)dkQueueWaitIdle(presentQueue);
+    presentCommands.reset();
     if (queue.value) dkQueueWaitIdle(queue);
     // Commands and swapchain must be destroyed before their backing allocations.
     commands.reset(); swapchain.reset();
@@ -195,7 +276,10 @@ void DekoBackend::startCommands(Frame &frame) {
     dkCmdBufClear(commands);
     frame.commands.clear(); frame.draws.clear(); frame.uploads.clear(); frame.capture.reset();
     activeFrame = &frame;
+    pushedValid = false; // v165: a new command list: its first material push is whole
+    vtxFormat = -1;      // v166: so is its first vertex format
     addCommandMemory(this, commands, 65536);
+    if (tiledCache) dkCmdBufTiledCacheOp(commands, DkTiledCacheOp_Enable);
 }
 std::shared_ptr<Buffer> DekoBackend::vertexStorage(size_t bytes,uint32_t &offset,bool transient) {
     offset=0;
@@ -216,29 +300,97 @@ void DekoBackend::uploadMesh(uint64_t id, const Vertex *vertices, uint32_t count
     const auto bytes = meshBytes(count);
     if (!vertices) throw std::invalid_argument("deko3d: null mesh vertices");
     auto mesh = std::make_shared<Mesh>();
-    mesh->vertices = vertexStorage(bytes,mesh->vertexOffset,transient);
+    // v166: packed when every normal component is within [-1, 1].
+    bool pack=packNormals && count!=0;
+    for(uint32_t i=0;pack && i<count;++i){const Vertex &v=vertices[i];pack=std::fabs(v.nx)<=1.0f && std::fabs(v.ny)<=1.0f && std::fabs(v.nz)<=1.0f;}
+    mesh->packed=pack;(pack?packedMeshes:floatMeshes)++;
+    mesh->vertices = vertexStorage(pack?size_t(count)*sizeof(PackedVertex):bytes,mesh->vertexOffset,transient);
     // v111: one pass for the copy, the least vertex alpha and the bounds (same values as
     // minimumVertexAlpha / meshBounds; the copy is the same bytes).
     {
         if(!count)throw std::invalid_argument("Invalid vertex alpha range");
-        auto *to=reinterpret_cast<Vertex *>(static_cast<uint8_t *>(mesh->vertices->cpu())+mesh->vertexOffset);
-        uint8_t alpha=255;
+        auto *to=static_cast<uint8_t *>(mesh->vertices->cpu())+mesh->vertexOffset;
+        uint8_t alpha=255,top=0;
         MeshBounds b;
         b.lo[0]=b.hi[0]=vertices[0].x; b.lo[1]=b.hi[1]=vertices[0].y; b.lo[2]=b.hi[2]=vertices[0].z;
         for(uint32_t i=0;i<count;++i){
             const Vertex &v=vertices[i];
-            alpha=std::min(alpha,v.a);
+            alpha=std::min(alpha,v.a);top=std::max(top,v.a);
             b.lo[0]=std::min(b.lo[0],v.x);b.hi[0]=std::max(b.hi[0],v.x);
             b.lo[1]=std::min(b.lo[1],v.y);b.hi[1]=std::max(b.hi[1],v.y);
             b.lo[2]=std::min(b.lo[2],v.z);b.hi[2]=std::max(b.hi[2],v.z);
         }
-        std::memcpy(to,vertices,bytes);
+        if(pack){auto *p=reinterpret_cast<PackedVertex *>(to);for(uint32_t i=0;i<count;++i)p[i]=packVertex(vertices[i]);}
+        else std::memcpy(to,vertices,bytes);
         b.valid=std::isfinite(b.lo[0]) && std::isfinite(b.lo[1]) && std::isfinite(b.lo[2]) &&
                 std::isfinite(b.hi[0]) && std::isfinite(b.hi[1]) && std::isfinite(b.hi[2]);
-        mesh->minAlpha=alpha;mesh->bounds=b;
+        mesh->minAlpha=alpha;mesh->bounds=b;mesh->maxAlpha=top;
+        // v126: each triangle's largest vertex alpha (a triangle list: three vertices each).
+        // v167: every triangle list up to 16384 triangles (the alpha-test split by texture region needs
+        // them with opaque vertex colours too), with each triangle's uv rectangle.
+        if(count%3==0 && (alpha<128 || (alphaRegionSplit && count<=3u*16384u))){
+            const uint32_t triangles=count/3;
+            if(alphaRegionSplit && triangles<=16384u){
+                mesh->triangleUV.resize(size_t(triangles)*4);
+                for(uint32_t t=0;t<triangles;++t){
+                    const Vertex &a=vertices[3*t],&b=vertices[3*t+1],&c=vertices[3*t+2];
+                    float *r=&mesh->triangleUV[size_t(t)*4];
+                    r[0]=std::min({a.u,b.u,c.u});r[1]=std::max({a.u,b.u,c.u});r[2]=std::min({a.v,b.v,c.v});r[3]=std::max({a.v,b.v,c.v});
+                }
+            }
+            mesh->triangleAlpha.resize(triangles);mesh->triangleMin.resize(triangles);
+            uint8_t floor=255;
+            for(uint32_t t=0;t<triangles;++t){
+                const uint8_t a0=vertices[3*t].a,a1=vertices[3*t+1].a,a2=vertices[3*t+2].a;
+                const uint8_t m=std::max(a0,std::max(a1,a2));
+                mesh->triangleAlpha[t]=m;mesh->triangleMin[t]=std::min(a0,std::min(a1,a2));floor=std::min(floor,m);
+            }
+            mesh->triangleFloor=floor;
+        }
     }
     mesh->count = count; mesh->transient = transient;
+    if(mesh->maxAlpha<64 && count<=8192)mesh->cpuVertices=std::make_shared<const std::vector<Vertex>>(vertices,vertices+count);
     meshes[id] = std::move(mesh);
+}
+// v167: a texture pack's BC3 texture (see native_renderer::CompressedTexture).
+bool DekoBackend::uploadCompressed(uint64_t id, const native_renderer::CompressedTexture &t) {
+    // v168: the reason of the first refusals logged (v167b: every pack texture refused, cause unknown).
+    static int refusals=0;
+    auto refuse=[&](const char *why,size_t need){
+        if(refusals++<12)std::fprintf(stderr,"[texpack] backend refused %016llx: %s (%ux%u levels %u bytes %zu need %zu uploads %zu)\n",
+            (unsigned long long)id,why,t.width,t.height,t.levels,t.bytes,need,uploads.size());
+        return false;
+    };
+    if (!id || id==1 || !t.data || !t.width || !t.height || t.width>4096 || t.height>4096 || !t.levels || t.levels>13) return refuse("arguments",0);
+    size_t need=0;
+    for(uint32_t l=0,w=t.width,h=t.height;l<t.levels;++l,w=std::max(1u,w/2),h=std::max(1u,h/2))need+=size_t((w+3)/4)*((h+3)/4)*16;
+    if(need>t.bytes)return refuse("short data",need);
+    if(uploads.size()>=4096)return refuse("upload queue full",need);
+    const auto timerStart=armTicksToNs(armGetSystemTick());
+    struct Timer{DekoBackend &b;uint64_t start;~Timer(){b.frameTexNs+=armTicksToNs(armGetSystemTick())-start;++b.frameTexCount;}} timer{*this,timerStart};
+    auto texture = std::make_shared<Texture>();
+    texture->minAlpha=t.minAlpha;texture->maxAlpha=t.maxAlpha;texture->fullTexels=t.fullTexels;texture->clearTexels=t.clearTexels;
+    texture->width=uint16_t(t.width);texture->height=uint16_t(t.height);texture->levels=uint16_t(t.levels);texture->replaced=true;
+    if(t.alphaGrid && t.gridW>=4 && t.gridH>=4 && t.gridW<=256 && t.gridH<=256){
+        texture->alphaGrid.assign(t.alphaGrid,t.alphaGrid+size_t(t.gridW)*t.gridH);texture->gridW=uint16_t(t.gridW);texture->gridH=uint16_t(t.gridH);
+    }
+    texture->image = std::make_shared<Image>(device, t.width, t.height, DkImageFormat_RGBA_BC3, 0, allocationBudget, t.levels, imagePool);
+    auto view = texture->image->view();
+    texture->slot=imageDescriptors->slots.acquire();
+    if(texture->slot!=DescriptorSlots::None){
+        texture->pool=imageDescriptors;
+        dkImageDescriptorInitialize(imageDescriptors->entries()+texture->slot,&view,false,false);
+    }else{
+        ++privateDescriptorTextures;
+        texture->descriptor = std::make_shared<Buffer>(device, sizeof(DkImageDescriptor), allocationBudget,bufferPool);
+        dkImageDescriptorInitialize(static_cast<DkImageDescriptor *>(texture->descriptor->cpu()),&view, false, false);
+    }
+    auto staging = imagePool && need>65536?Buffer::pooled(bufferPool,need):nullptr;
+    if(!staging)staging = std::make_shared<Buffer>(device, need, allocationBudget,bufferPool);
+    std::memcpy(staging->cpu(), t.data, need);
+    uploads.push_back({texture, std::move(staging), t.width, t.height, t.levels, true});
+    textures[id] = std::move(texture);
+    return true;
 }
 void DekoBackend::uploadTexture(uint64_t id, uint32_t w, uint32_t h,
                                 const uint8_t *rgba, uint32_t levels) {
@@ -249,7 +401,38 @@ void DekoBackend::uploadTexture(uint64_t id, uint32_t w, uint32_t h,
     if (uploads.size() >= 4096) throw std::runtime_error("deko3d: excessive pending textures");
     auto texture = std::make_shared<Texture>();
     texture->minAlpha=minimumTextureAlpha(rgba,bytes);
+    {
+        uint8_t top=0;size_t full=0,clear=0;
+        for(size_t i=3;i<bytes;i+=4){const uint8_t a=rgba[i];top=std::max(top,a);full+=a>=128;clear+=a<=2;}
+        texture->maxAlpha=top;const size_t texels=bytes/4;
+        texture->fullTexels=uint16_t(full*1000/texels);texture->clearTexels=uint16_t(clear*1000/texels);
+    }
     texture->width=uint16_t(w);texture->height=uint16_t(h);texture->levels=uint16_t(levels);
+    if((levels==1 || alphaRegionSplit) && w>=4 && h>=4 && w<=256 && h<=256 && texture->clearTexels>=200 && !(w&(w-1)) && !(h&(h-1))){
+        texture->alphaGrid.resize(size_t(w)*h);texture->gridW=uint16_t(w);texture->gridH=uint16_t(h);
+        for(size_t i=0;i<size_t(w)*h;++i)texture->alphaGrid[i]=rgba[4*i+3];
+        // v167: a mipmapped texture: each level-0 cell also holds the largest alpha a bilinear sample of a
+        // coarser level can read over it (that level's 3 x 3 maxima, the texture repeating), so a range of
+        // the grid bounds a sample at any level: the regions and splits stay conservative.
+        size_t at=size_t(w)*h*4;std::vector<uint8_t> dilated;
+        for(uint32_t level=1,lw=w,lh=h;level<levels;++level){
+            lw=std::max(1u,lw/2);lh=std::max(1u,lh/2);
+            const uint8_t *a=rgba+at;at+=size_t(lw)*lh*4;
+            dilated.assign(size_t(lw)*lh,0);
+            for(uint32_t y=0;y<lh;++y)for(uint32_t x=0;x<lw;++x){
+                uint8_t m=0;
+                for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx){
+                    const uint32_t sy=(y+lh+uint32_t(dy))%lh,sx=(x+lw+uint32_t(dx))%lw;
+                    m=std::max(m,a[(size_t(sy)*lw+sx)*4+3]);
+                }
+                dilated[size_t(y)*lw+x]=m;
+            }
+            for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x){
+                uint8_t &g=texture->alphaGrid[size_t(y)*w+x];
+                g=std::max(g,dilated[size_t(std::min(y>>level,lh-1))*lw+std::min(x>>level,lw-1)]);
+            }
+        }
+    }
     texture->image = std::make_shared<Image>(device, w, h, DkImageFormat_RGBA8_Unorm, 0, allocationBudget, levels, imagePool);
     auto view = texture->image->view();
     // Slot writes target entries no in-flight frame references (slots free only after their
@@ -288,7 +471,10 @@ void DekoBackend::beginFrame() {
             // With a diagnosis cycle, one capture per mode (the modes rotate every status window).
             // Without a cycle: up to 8 captures, at least 600 frames apart after the first three.
             const bool modeFree=diagGpuCycle.empty()?(heavyCaptures<3 || (heavyCaptures<8 && submittedFrames-lastHeavyFrame>=600)):!(heavyModeCaptured&(1u<<diagGpuMode));
-            if(heavyCaptureNs && modeFree && *ns>heavyCaptureNs && !diagnosticCaptureFrame && frame.draws.size()>=1500){
+            // v165: CELOSIA_DIAG_HEAVY_ANY=1 also takes heavy frames with few draws (the cinematic's overdraw-bound
+            // frames have ~260 draws and were never captured).
+            static const bool heavyAny=std::getenv("CELOSIA_DIAG_HEAVY_ANY")!=nullptr;
+            if(heavyCaptureNs && modeFree && *ns>heavyCaptureNs && !diagnosticCaptureFrame && (heavyAny || frame.draws.size()>=1500)){
                 heavyModeCaptured|=1u<<diagGpuMode; // gameplay views only, not loading
                 diagnosticCaptureFrame=submittedFrames+2;++heavyCaptures;lastHeavyFrame=submittedFrames;
             }
@@ -344,7 +530,7 @@ void DekoBackend::draw(uint64_t id, const float clip[16], const DrawState &state
 }
 void DekoBackend::setFog(const Fog &value) {
     validateFog(value);
-    fog = value;
+    fog = value; // v173w: the [fog173] log and its draw counters removed (development only)
 }
 void DekoBackend::setBloom(const Bloom &b) {
     if(b.enabled && (!std::isfinite(b.threshold) || !std::isfinite(b.zA) || !std::isfinite(b.zB) || !std::isfinite(b.temporal) ||

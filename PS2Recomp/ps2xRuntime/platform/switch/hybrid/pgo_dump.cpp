@@ -43,8 +43,10 @@ FILE *__wrap_fopen(const char *path, const char *mode) {
 namespace {
 constexpr u64 kDumpSeconds = 30;
 Thread dumpThread;
-// libgcov merges each .gcda through stdio buffers; keep generous headroom.
-alignas(0x1000) unsigned char dumpStack[0x80000];
+// libgcov merges each .gcda through stdio buffers; keep generous headroom (0x80000).
+// v173w: the stack from libnx (nullptr), as startDetached in main.cpp: threadCreate on a static .bss stack
+// returns 0x559 on this console since v173 (the apm thread never started that way).
+constexpr size_t kDumpStackSize = 0x80000;
 
 // Append-only trace (opened per line so a frozen process still leaves complete lines).
 void trace(const char *what, unsigned n) {
@@ -75,7 +77,7 @@ struct PgoDumpStarter {
         // High priority (0x20): the dump holds the stdio/FS locks the game also takes; at the lowest
         // priority (0x3B) it was starved mid-file and froze the game (training build only, so the
         // brief hitch every kDumpSeconds is acceptable). 0x3F is outside the application range.
-        const Result rc = threadCreate(&dumpThread, dumpLoop, nullptr, dumpStack, sizeof(dumpStack), 0x20, -2);
+        const Result rc = threadCreate(&dumpThread, dumpLoop, nullptr, nullptr, kDumpStackSize, 0x20, -2);
         trace(R_SUCCEEDED(rc) ? "created" : "create-failed", rc);
         if (R_SUCCEEDED(rc)) threadStart(&dumpThread);
     }

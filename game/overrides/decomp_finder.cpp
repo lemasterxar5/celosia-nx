@@ -325,6 +325,59 @@ namespace decomp_finder
             g_stats.parts += stats;
             if (r32(part + 4u) != 0u)
             {
+                // v171 (CPU rewrite #2, finder 0.74 ms a frame in v171p's zones): the block below (the segment through
+                // the part's three matrices, its midpoint, half length and centre) reads only pointA / pointB, the
+                // three matrices at SP + 0xF4 / 0xF8 / 0xF0, vf0 and f23, the same at every part of a call unless guest
+                // code wrote them. Its inputs' bytes are kept with every register and stack word it writes; at a
+                // later part whose inputs compare equal, those are put back instead of the three transforms (the
+                // same bits). CELOSIA_DIAG_NO_PARTSEG171=1: computed at every part as before.
+                static const bool partSeg171Off = std::getenv("CELOSIA_DIAG_NO_PARTSEG171") != nullptr;
+                struct Seg171
+                {
+                    uint8_t key[16 * 2 + 64 * 3 + 16 + 4];
+                    __m128 vf[18], acc;
+                    float q, f0, f1, f21;
+                    uint64_t r8;
+                    __m128i mem[4];
+                };
+                alignas(16) static thread_local Seg171 seg171;
+                static thread_local bool seg171Valid = false;
+                uint8_t key171[sizeof(seg171.key)];
+                bool reuse171 = false;
+                const uint32_t mA = r32(SP + 0xF4u), mB = r32(SP + 0xF8u), mC = r32(SP + 0xF0u);
+                // (main RAM only, as lq reads them: 16-byte aligned; anything else computed as before)
+                const auto plain171 = [](uint32_t at, uint32_t bytes) { return at >= 0x1000u && (at & ~0xFu) + bytes <= 0x02000000u; };
+                const bool keyable171 = !partSeg171Off && plain171(pointA, 16u) && plain171(pointB, 16u) && plain171(mA, 64u) && plain171(mB, 64u) && plain171(mC, 64u);
+                if (keyable171)
+                {
+                    std::memcpy(key171, rdram + (pointA & ~0xFu), 16);
+                    std::memcpy(key171 + 16, rdram + (pointB & ~0xFu), 16);
+                    std::memcpy(key171 + 32, rdram + (mA & ~0xFu), 64);
+                    std::memcpy(key171 + 96, rdram + (mB & ~0xFu), 64);
+                    std::memcpy(key171 + 160, rdram + (mC & ~0xFu), 64);
+                    std::memcpy(key171 + 224, &vf[0], 16);
+                    std::memcpy(key171 + 240, &f[23], 4);
+                    reuse171 = seg171Valid && std::memcmp(key171, seg171.key, sizeof(key171)) == 0;
+                }
+                if (reuse171)
+                {
+                    for (int k : {5, 6, 7, 8, 9, 10, 14, 15, 16, 17})
+                        vf[k] = seg171.vf[k];
+                    acc = seg171.acc;
+                    ctx->vu0_q = seg171.q;
+                    f[0] = seg171.f0;
+                    f[1] = seg171.f1;
+                    f[21] = seg171.f21;
+                    SET_GPR_U64(ctx, 8, seg171.r8);
+                    WRITE128(SP + 0x30u, seg171.mem[0]);
+                    WRITE128(SP + 0x40u, seg171.mem[1]);
+                    WRITE128(SP + 0x50u, seg171.mem[2]);
+                    WRITE128(SP + 0x60u, seg171.mem[3]);
+                    s4 = sx(SP + 0x30u);
+                    s7 = sx(SP + 0x40u);
+                }
+                else
+                {
                 transform(pointA, r32(SP + 0xF4u));
                 sq(SP + 0x50u, vf[10]);
                 transform(pointB, r32(SP + 0xF8u));
@@ -352,6 +405,24 @@ namespace decomp_finder
                 transform(SP + 0x30u, r32(SP + 0xF0u));
                 sq(SP + 0x40u, vf[10]);
                 f[21] = FPU_ADD_S(f[1], f[23]);
+                if (keyable171)
+                {
+                    std::memcpy(seg171.key, key171, sizeof(key171));
+                    for (int k : {5, 6, 7, 8, 9, 10, 14, 15, 16, 17})
+                        seg171.vf[k] = vf[k];
+                    seg171.acc = acc;
+                    seg171.q = ctx->vu0_q;
+                    seg171.f0 = f[0];
+                    seg171.f1 = f[1];
+                    seg171.f21 = f[21];
+                    seg171.r8 = GPR_U64(ctx, 8);
+                    seg171.mem[0] = READ128(SP + 0x30u);
+                    seg171.mem[1] = READ128(SP + 0x40u);
+                    seg171.mem[2] = READ128(SP + 0x50u);
+                    seg171.mem[3] = READ128(SP + 0x60u);
+                    seg171Valid = true;
+                }
+                }
                 if (r32(part + 0x10u) != 0u)
                 {
                     // The boundary surfaces' sphere.

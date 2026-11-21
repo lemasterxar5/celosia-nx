@@ -31,6 +31,7 @@
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
 #endif
+#include <cstdlib>
 #include <cstring>
 
 namespace decomp_particles
@@ -1259,10 +1260,20 @@ namespace decomp_ptclupdate
                 }
             } done{st, t123, p123 ? 1 : 0, n};
             s0 = static_cast<uint64_t>(static_cast<int64_t>(n));
+            // v165: the list's next record (0xB0 bytes, three lines) fetched while this one steps: the walk no longer
+            // waits on memory at each link. CELOSIA_DIAG_NO_PTCL165=1: off.
+            static const bool pf165 = std::getenv("CELOSIA_DIAG_NO_PTCL165") == nullptr;
             for (int32_t left = n; left != 0; --left)
             {
                 f0 = m.f32(a0 + 0x40u);
                 s2 = static_cast<uint64_t>(static_cast<int64_t>(m.s32(a0 + 0xA8u)));
+                if (pf165)
+                    if (const uint32_t next = static_cast<uint32_t>(s2); next != 0u && next < PS2_RAM_SIZE - 0xC0u)
+                    {
+                        __builtin_prefetch(rdram + next, 1);
+                        __builtin_prefetch(rdram + next + 64u, 1);
+                        __builtin_prefetch(rdram + next + 128u, 1);
+                    }
                 if (!FPU_C_EQ_S(f0, zero))
                 {
                     // Round 123 (SOTC_PTCL123): the step in plain host floats, no call frame (v0 0 as the original's).

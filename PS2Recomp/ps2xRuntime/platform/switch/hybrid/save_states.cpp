@@ -1,6 +1,6 @@
 // Save states on the Switch (v94): the menu asks for a slot (live_settings saveRequest /
 // loadRequest); the EE scheduler's idle hook (no guest thread running) takes or loads the whole
-// machine (PS2Runtime::saveMachineState). Files: sdmc:/switch/celosia-native-boot/states/slotN.state
+// machine (PS2Runtime::saveMachineState). Files: sdmc:/switch/celosia_nx/states/slotN.state
 // = "CNXZ", version, raw size, a zstd frame. The previous file of the slot is kept as .bak.
 // Memory-card saves (mc0 / mc1) are never touched.
 #include "live_settings.hpp"
@@ -22,13 +22,17 @@ extern "C" void celosia_native_after_state_load() __attribute__((weak));
 
 namespace
 {
-    constexpr const char *kDir = "sdmc:/switch/celosia-native-boot/states";
+    constexpr const char *kDir = "sdmc:/switch/celosia_nx/states";
     constexpr uint32_t kFileVersion = 1u;
     constexpr uint64_t kMaxWaitUs = 10000000u; // how long to wait for a safe switch point
 
     std::atomic<bool> g_writing{false};
     int g_tries = 0;
     uint64_t g_firstTryUs = 0;
+    // v160: a load refused only for "not at a safe point" is retried at the next switch points (as a save
+    // is), the slot read once and kept here meanwhile; nothing of the machine changes before that check.
+    std::vector<uint8_t> g_pendingLoad;
+    int g_pendingSlot = 0;
 
     std::string slotPath(int slot, const char *suffix = "")
     {
@@ -49,7 +53,7 @@ namespace
     {
         auto &live = celosia::live::settings();
         const uint64_t t0 = nowUs();
-        mkdir("sdmc:/switch/celosia-native-boot", 0777);
+        mkdir("sdmc:/switch/celosia_nx", 0777);
         mkdir(kDir, 0777);
         const std::string tmp = slotPath(slot, ".tmp"), dst = slotPath(slot), bak = slotPath(slot, ".bak");
         bool ok = false;
@@ -192,20 +196,36 @@ namespace
             writeSlot(save, raw);
             return false; // the machine is unchanged
         }
-        live.loadRequest = 0;
-        g_tries = 0;
         const uint64_t t0 = nowUs();
         std::vector<uint8_t> raw;
         int code = 0;
-        if (!readSlot(load, raw, code))
+        if (g_pendingSlot == load && !g_pendingLoad.empty())
+            raw.swap(g_pendingLoad);
+        else if (!readSlot(load, raw, code))
         {
+            live.loadRequest = 0;
+            g_tries = 0;
+            g_pendingSlot = 0;
             std::fprintf(stderr, "[state] slot %d: cannot read (%d)\n", load, code);
             live.stateResult = code;
             return false;
         }
+        g_pendingSlot = 0;
         const uint64_t t1 = nowUs();
         std::string error;
-        if (!runtime.loadMachineState(raw.data(), raw.size(), error))
+        const bool loaded = runtime.loadMachineState(raw.data(), raw.size(), error);
+        if (!loaded && error.rfind("not at a safe point", 0) == 0 && nowUs() - g_firstTryUs < kMaxWaitUs)
+        {
+            ++g_tries; // the request stays: the next switch point tries again
+            g_pendingLoad.swap(raw);
+            g_pendingSlot = load;
+            return false;
+        }
+        live.loadRequest = 0;
+        if (loaded && g_tries)
+            std::fprintf(stderr, "[state] slot %d: loaded after %d tries\n", load, g_tries);
+        g_tries = 0;
+        if (!loaded)
         {
             std::fprintf(stderr, "[state] slot %d: load failed: %s\n", load, error.c_str());
             // The header checks run before anything changes; past them the machine is half

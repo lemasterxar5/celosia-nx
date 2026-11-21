@@ -42,7 +42,7 @@ set(runtime_sources
     ps2_macro_selftest.cpp ps2_vif1_interpreter.cpp vu/ps2_vu1_core.cpp
     vu/ps2_vu1_upper.cpp vu/ps2_vu1_lower.cpp vu/ps2_vu1_rec.cpp games_database.cpp
     gs/gs_metal_raster_stub.cpp native/native_renderer.cpp native/native_recorder.cpp
-    native/deko3d/backend.cpp native/deko3d/frame_mesh.cpp native/deko3d/render.cpp)
+    native/deko3d/backend.cpp native/deko3d/frame_mesh.cpp native/deko3d/render.cpp native/deko3d/lsfg.cpp)
 list(TRANSFORM runtime_sources PREPEND "${CELOSIA_RUNTIME}/src/lib/")
 file(GLOB_RECURSE kernel_sources CONFIGURE_DEPENDS "${CELOSIA_RUNTIME}/src/lib/Kernel/*.cpp")
 add_library(celosia_hybrid_runtime STATIC ${runtime_sources} ${kernel_sources})
@@ -51,6 +51,7 @@ target_sources(celosia_hybrid_runtime PRIVATE
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/raylib_input_audio.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/raylib_sounds.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/switch_menu.cpp"
+    "${CELOSIA_RUNTIME}/platform/switch/hybrid/async_log.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/hybrid/save_states.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/native_audio_output.cpp")
 target_sources(celosia_hybrid_runtime PRIVATE "${CELOSIA_RUNTIME}/platform/switch/native_faults.cpp")
@@ -59,6 +60,12 @@ target_sources(celosia_hybrid_runtime PRIVATE "${CELOSIA_RUNTIME}/platform/switc
     "${CELOSIA_RUNTIME}/platform/switch/native_executor.cpp" "${CELOSIA_RUNTIME}/platform/switch/native_threads.cpp"
     "${CELOSIA_RUNTIME}/platform/switch/native_semaphore.cpp")
 target_include_directories(celosia_hybrid_runtime PRIVATE "${CELOSIA_RUNTIME}/platform/switch")
+# v173m: lsfg-deko3d runtime (NaGaa95 Cemu-nx 1.3.3, GPL-3.0-or-later): image graph, schedule, bindings, cache.
+set(lsfg_deko3d "${CELOSIA_ROOT}/dependencies/lsfg-deko3d")
+foreach(f binding layout schedule cache_load cache_format cache_store image_graph error sha256 dksh shader_set spirv_module pe_resources)
+    target_sources(celosia_hybrid_runtime PRIVATE "${lsfg_deko3d}/src/${f}.cpp")
+endforeach()
+target_include_directories(celosia_hybrid_runtime PUBLIC "${lsfg_deko3d}/include")
 target_compile_features(celosia_hybrid_runtime PUBLIC cxx_std_20)
 target_compile_definitions(celosia_hybrid_runtime PUBLIC __SWITCH__ USE_SSE2NEON PS2X_NATIVE_DEKO3D=1)
 target_compile_definitions(celosia_hybrid_runtime PRIVATE PS2X_SWITCH_HYBRID=1)

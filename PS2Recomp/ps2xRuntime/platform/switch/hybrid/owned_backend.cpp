@@ -4,6 +4,7 @@
 #include "../../../src/lib/native/native_backend.h"
 #include "../../../src/lib/native/deko3d/policy.hpp"
 #include "../../../src/lib/native/deko3d/render_progress.hpp"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 namespace native_renderer::detail {
 namespace {
 // v122: a POD array that keeps its storage between frames and never zero-fills (std::vector::resize
@@ -75,6 +77,40 @@ struct FrameBatch {
         }
     }
 };
+// v170a: the frame's mesh ids: open addressing (linear probing), a slot live when its generation is the
+// current one; clear() bumps the generation (no frees, no walk). Erase leaves a tombstone (id 0: never a mesh).
+class FrameIdSet {
+    std::vector<uint64_t> keys;std::vector<uint32_t> gens;uint32_t gen=1;size_t used=0,mask=0;
+    static size_t hash(uint64_t k){k^=k>>33;k*=0xff51afd7ed558ccdull;k^=k>>33;return size_t(k);}
+    void grow()
+    {
+        std::vector<uint64_t> oldKeys;std::vector<uint32_t> oldGens;oldKeys.swap(keys);oldGens.swap(gens);
+        const size_t room=oldKeys.empty()?2048:oldKeys.size()*2;
+        keys.assign(room,0);gens.assign(room,0);mask=room-1;used=0;
+        const uint32_t live=gen;gen=1;
+        for(size_t i=0;i<oldKeys.size();++i)if(oldGens[i]==live && oldKeys[i])insert(oldKeys[i]);
+    }
+public:
+    bool contains(uint64_t k)const
+    {
+        if(!mask || !k)return false;
+        for(size_t i=hash(k)&mask;;i=(i+1)&mask){if(gens[i]!=gen)return false;if(keys[i]==k)return true;}
+    }
+    void insert(uint64_t k)
+    {
+        if((used+1)*2>keys.size())grow();
+        for(size_t i=hash(k)&mask;;i=(i+1)&mask){
+            if(gens[i]!=gen){gens[i]=gen;keys[i]=k;++used;return;}
+            if(keys[i]==k)return;
+        }
+    }
+    void erase(uint64_t k)
+    {
+        if(!mask || !k)return;
+        for(size_t i=hash(k)&mask;;i=(i+1)&mask){if(gens[i]!=gen)return;if(keys[i]==k){keys[i]=0;return;}}
+    }
+    void clear(){used=0;if(++gen==0){std::fill(gens.begin(),gens.end(),0u);gen=1;}}
+};
 class OwnedBackend final:public Backend {
     celosia::native::NativeExecutor worker;
     std::unique_ptr<Backend> gpu;
@@ -82,6 +118,9 @@ class OwnedBackend final:public Backend {
     FrameBatch batches[2];
     FrameBatch *filling=&batches[0];
     std::unordered_set<uint64_t> meshes,textures,transientMeshes;
+    FrameIdSet frameIds; // v170a: the frame's mesh ids (CELOSIA_DIAG_NO_FRAMEIDS170=1: transientMeshes as before)
+    const bool flatIds=!std::getenv("CELOSIA_DIAG_NO_FRAMEIDS170");
+    bool known(uint64_t id)const{return meshes.count(id)!=0 || (flatIds && frameIds.contains(id));}
     size_t pendingVertexBase=0,pendingIndexBase=0;
     uint32_t pendingVertices=0,pendingIndices=0;
     size_t queuedBytes=0;
@@ -131,7 +170,7 @@ public:
             worker.execute([&]{gpu.reset();});}
         catch(...){std::fputs("Native GPU owner cleanup failed\n",stderr);std::terminate();}
     }
-    bool hasMesh(uint64_t id)override{std::lock_guard lock(mutex);ready();return meshes.count(id)!=0;}
+    bool hasMesh(uint64_t id)override{std::lock_guard lock(mutex);ready();return known(id);}
     bool hasTexture(uint64_t id)override{std::lock_guard lock(mutex);ready();return textures.count(id)!=0;}
     // The caller writes the mesh straight into the batch (no staging copies).
     Vertex *frameMesh(uint32_t count)override
@@ -163,7 +202,9 @@ public:
         filling->order.push_back({FrameBatch::FrameMeshCall,uint32_t(filling->meshes.size())});
         filling->meshes.push_back({id,uint32_t(pendingVertexBase),count,uint32_t(pendingIndexBase),indexCount});
         queuedBytes+=totalBytes;
-        meshes.insert(id);transientMeshes.insert(id);pendingVertices=pendingIndices=0;
+        if(flatIds){if(!meshes.empty())meshes.erase(id);frameIds.insert(id);}
+        else {meshes.insert(id);transientMeshes.insert(id);}
+        pendingVertices=pendingIndices=0;
     }
     void cancelFrameMesh()override
     {
@@ -176,8 +217,13 @@ public:
         const auto bytes=deko::meshBytes(count);if(!source || !id)throw std::invalid_argument("Invalid native mesh upload");
         std::vector<Vertex> vertices(source,source+count);std::lock_guard lock(mutex);
         enqueue([id,vertices=std::move(vertices),transient](Backend &backend){backend.uploadMesh(id,vertices.data(),vertices.size(),transient);},bytes);
-        meshes.insert(id);
-        if(transient)transientMeshes.insert(id);else transientMeshes.erase(id);
+        if(flatIds){
+            if(transient){if(!meshes.empty())meshes.erase(id);frameIds.insert(id);}
+            else {frameIds.erase(id);meshes.insert(id);}
+        }else {
+            meshes.insert(id);
+            if(transient)transientMeshes.insert(id);else transientMeshes.erase(id);
+        }
     }
     void uploadTexture(uint64_t id,uint32_t width,uint32_t height,const uint8_t *source,uint32_t levels)override
     {
@@ -185,6 +231,31 @@ public:
         std::vector<uint8_t> rgba(source,source+bytes);std::lock_guard lock(mutex);
         enqueue([id,width,height,levels,rgba=std::move(rgba)](Backend &backend){backend.uploadTexture(id,width,height,rgba.data(),levels);},bytes);
         textures.insert(id);
+    }
+    // v168: the texture pack's calls passed on to the GPU owner (v167 left them to Backend's defaults: every pack
+    // texture refused, the PS2 one kept). The data and the alpha grid copied (the caller's buffers are freed).
+    bool uploadCompressed(uint64_t id,const native_renderer::CompressedTexture &t)override
+    {
+        if(!id || id==1 || !t.data || !t.bytes || !t.width || !t.height || !t.levels)return false;
+        std::vector<uint8_t> data(t.data,t.data+t.bytes);
+        std::vector<uint8_t> grid;
+        if(t.alphaGrid && t.gridW && t.gridH)grid.assign(t.alphaGrid,t.alphaGrid+size_t(t.gridW)*t.gridH);
+        const size_t bytes=data.size();
+        std::lock_guard lock(mutex);
+        enqueue([id,t,data=std::move(data),grid=std::move(grid)](Backend &backend){
+            native_renderer::CompressedTexture copy=t;
+            copy.data=data.data();copy.bytes=data.size();
+            copy.alphaGrid=grid.empty()?nullptr:grid.data();
+            if(!backend.uploadCompressed(id,copy))std::fprintf(stderr,"[texpack] GPU owner: texture %016llx refused\n",(unsigned long long)id);
+        },bytes);
+        textures.insert(id);
+        return true;
+    }
+    void dropTexture(uint64_t id)override
+    {
+        std::lock_guard lock(mutex);
+        enqueue([id](Backend &backend){backend.dropTexture(id);});
+        textures.erase(id);
     }
     void beginFrame()override
     {
@@ -199,7 +270,7 @@ public:
         deko::validateDraw(state,true);std::array<float,16> matrix;std::copy_n(clip,16,matrix.begin());
         for(const auto value:matrix)if(!std::isfinite(value))throw std::invalid_argument("Invalid native draw transform");
         std::lock_guard lock(mutex);ready();
-        if(!open || !meshes.count(mesh) || (state.texture&&!textures.count(state.texture)))throw std::logic_error("Native draw has missing resources/frame");
+        if(!open || !known(mesh) || (state.texture&&!textures.count(state.texture)))throw std::logic_error("Native draw has missing resources/frame");
         room(0);
         filling->order.push_back({FrameBatch::DrawCall,uint32_t(filling->draws.size())});
         filling->draws.push_back({mesh,matrix,state});
@@ -225,8 +296,8 @@ public:
         // The GPU drops transient mesh ownership after submission. Mirror its
         // cache here so subsequent frames rebuild animated geometry correctly.
         std::lock_guard lock(mutex);
-        for(const auto id:transientMeshes)meshes.erase(id);
-        transientMeshes.clear();
+        if(flatIds)frameIds.clear();
+        else {for(const auto id:transientMeshes)meshes.erase(id);transientMeshes.clear();}
     }
     void finishFrames()override
     {

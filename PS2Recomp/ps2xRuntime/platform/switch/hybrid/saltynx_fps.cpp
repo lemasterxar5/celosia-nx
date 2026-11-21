@@ -20,6 +20,7 @@
 // any thread) the sm session is released for the duration of the connection and restored after.
 // The same technique is used by other deko3d Switch ports (e.g. NaGaa95's NetherSX2_nx saltynx.cpp).
 #include <switch.h>
+#include "live_settings.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -53,6 +54,17 @@ static_assert(offsetof(NxFpsBlock, renderCalls) == 60, "NX-FPS overlay layout");
 static_assert(offsetof(NxFpsBlock, frameNumber) == 165, "NX-FPS overlay layout");
 static_assert(sizeof(NxFpsBlock) == 174, "NX-FPS overlay layout");
 constexpr uint32_t NxFpsMagic = 0x465053;
+// v151: ReverseNX-RT's block (its overlay's Overlay/source/main.cpp, 9 bytes packed). The game publishes
+// it; the overlay sets def = false and isDocked to force a mode, or def = true for the console's own.
+struct __attribute__((packed)) NxRtBlock {
+    uint32_t magic;
+    bool isDocked, def, pluginActive;
+    uint8_t res;        // handheld_res : 4, docked_res : 4 (ReverseNX's resolution menu; not used)
+    bool wasDDRused;
+};
+static_assert(sizeof(NxRtBlock) == 9, "ReverseNX-RT layout");
+constexpr uint32_t NxRtMagic = 0x5452584E; // "NXRT"
+constexpr uint64_t NxRtReserve = 12;       // 9 rounded to the 4-byte scan step
 constexpr uint64_t ReserveBytes = 310; // the core's full block size
 constexpr size_t PageBytes = 0x1000;
 constexpr uint8_t ApiDeko3d = 0;          // NX-FPS api field: 0 = unknown/other
@@ -60,6 +72,7 @@ constexpr uint8_t ApiDeko3d = 0;          // NX-FPS api field: 0 = unknown/other
 SharedMemory page{};
 uint8_t *pageBase = nullptr;
 volatile NxFpsBlock *block = nullptr;     // owned by the publisher thread after start
+std::atomic<volatile NxRtBlock *> rtBlock{nullptr};
 Thread publisherThread;
 alignas(0x1000) unsigned char publisherStack[0x8000];
 int logLines = 0;
@@ -71,10 +84,20 @@ std::array<std::atomic<uint32_t>, 10> presentTicks{};
 void log(const char *text, Result rc) {
     if (logLines >= 40) return;
     ++logLines;
-    if (FILE *f = std::fopen("sdmc:/switch/celosia-native-boot/saltynx-fps.txt", "a")) {
+    if (FILE *f = std::fopen("sdmc:/switch/celosia_nx/saltynx-fps.txt", "a")) {
         std::fprintf(f, "%s rc=0x%x\n", text, rc);
         std::fclose(f);
     }
+}
+
+volatile NxRtBlock *findRt() {
+    if (!pageBase) return nullptr;
+    for (size_t offset = 0; offset + sizeof(NxRtBlock) <= PageBytes; offset += 4) {
+        uint32_t value;
+        std::memcpy(&value, pageBase + offset, sizeof(value));
+        if (value == NxRtMagic) return reinterpret_cast<volatile NxRtBlock *>(pageBase + offset);
+    }
+    return nullptr;
 }
 
 volatile NxFpsBlock *findBlock() {
@@ -106,7 +129,7 @@ bool sessionsFull() {
 }
 
 bool attach(bool early) {
-    if (pageBase && (block = findBlock())) return true;
+    if (pageBase && (block = findBlock()) && rtBlock.load()) return true;
     const bool releaseSm = sessionsFull() && early;
     if (releaseSm) smExit();
     Handle port = INVALID_HANDLE;
@@ -135,6 +158,22 @@ bool attach(bool early) {
                 block->currentRefreshRate = 60;
                 block->magic = NxFpsMagic;
             } else log("shared block reservation refused", reserveRc);
+        }
+        if (pageBase && !rtBlock.load()) {
+            volatile NxRtBlock *rt = findRt();
+            if (!rt) {
+                uint64_t offset = ~0ULL;
+                const Result reserveRc = serviceDispatchInOut(&service, 6, NxRtReserve, offset, .in_send_pid = true);
+                if (R_SUCCEEDED(reserveRc) && offset <= PageBytes - NxRtReserve && offset % 4 == 0) {
+                    std::memset(pageBase + offset, 0, NxRtReserve);
+                    rt = reinterpret_cast<volatile NxRtBlock *>(pageBase + offset);
+                    rt->def = true;
+                    rt->isDocked = appletGetOperationMode() == AppletOperationMode_Console;
+                    rt->magic = NxRtMagic;
+                    log("ReverseNX-RT block published", 0);
+                } else log("ReverseNX-RT block reservation refused", reserveRc);
+            }
+            rtBlock.store(rt);
         }
         const uint64_t zero = 0;
         serviceDispatchIn(&service, 0, zero, .in_send_pid = true); // EndSession: free the port for overlays
@@ -167,8 +206,9 @@ void publish() {
     block->api = ApiDeko3d;
     block->frameNumber = presents.load(std::memory_order_acquire);
     for (unsigned i = 0; i < 8; ++i) block->renderCalls[i].calls = block->viewportCalls[i].calls = 0;
-    block->renderCalls[0].width = block->viewportCalls[0].width = 1280;
-    block->renderCalls[0].height = block->viewportCalls[0].height = 720;
+    const auto &live = celosia::live::settings();
+    block->renderCalls[0].width = block->viewportCalls[0].width = uint16_t(live.renderWidthNow.load(std::memory_order_relaxed));
+    block->renderCalls[0].height = block->viewportCalls[0].height = uint16_t(live.renderHeightNow.load(std::memory_order_relaxed));
     block->renderCalls[0].calls = block->viewportCalls[0].calls = uint16_t(std::clamp(rounded, 1u, 65534u));
     // Overlays clear this and expect it back within 100 ms while the game runs.
     block->pluginActive = recent;
@@ -193,6 +233,17 @@ extern "C" void celosia_saltynx_start(void) {
 }
 
 // Called by the deko3d backend once per presented image (render.cpp, weak reference).
+// v151: the mode the game runs in: ReverseNX-RT's when it controls it (def false), else the console's
+// (written back so the overlay shows it). pluginActive tells the overlay the game reads the mode.
+extern "C" int celosia_effective_docked(int real) {
+    volatile NxRtBlock *rt = rtBlock.load(std::memory_order_acquire);
+    if (!rt || rt->magic != NxRtMagic) return real;
+    rt->pluginActive = true;
+    rt->wasDDRused = true;
+    if (rt->def) {rt->isDocked = real != 0; return real;}
+    return rt->isDocked ? 1 : 0;
+}
+
 extern "C" void celosia_frame_presented(void) {
     const uint64_t now = armGetSystemTick();
     const uint64_t previous = lastPresentTick.exchange(now, std::memory_order_relaxed);

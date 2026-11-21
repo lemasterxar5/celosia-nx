@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>celosia nx — Shadow of the Colossus installer for Switch</title>
+<meta name="author" content="lemasterxar5">
+<link rel="icon" href="img/portada.jpg">
+<link rel="stylesheet" href="css/estilo.css">
+</head>
+<body>
+
+<header class="barra">
+  <div class="envoltura">
+    <a class="marca" href="#inicio">CELOSIA NX</a>
+    <nav>
+      <a href="#juego">The game</a>
+      <a href="#instalador">Installer</a>
+      <a href="#guia">Guide</a>
+      <a href="#preguntas">FAQ</a>
+      <a href="#ayuda">Help</a>
+    </nav>
+    <button class="boton-musica" id="musica" aria-pressed="false" title="Background music">♪ Music</button>
+  </div>
+</header>
+
+<main>
+  <section id="inicio">
+    <div class="envoltura heroe">
+      <div>
+        <div class="etiqueta">Local installer · Nintendo Switch</div>
+        <h1>Shadow of the Colossus</h1>
+        <p>Get your copy ready for <b>celosia nx</b>, the native Switch recompilation. Pick your ISO, your
+           <code>Lossless.dll</code> and the Panda Venom textures: each piece is optional and independent, and everything
+           is packed into a single ZIP ready to copy to the microSD.</p>
+        <p>Everything happens in your browser. No file is uploaded anywhere.</p>
+        <div class="acciones">
+          <a class="boton primario" href="#instalador">Get started</a>
+          <a class="boton secundario" href="#guia">How to install</a>
+        </div>
+      </div>
+      <div class="portada"><img src="img/portada.jpg" alt="Shadow of the Colossus cover"></div>
+    </div>
+  </section>
+
+  <section id="juego">
+    <div class="envoltura">
+      <h2>The game</h2>
+      <p class="subtitulo">The supported version and what the port needs.</p>
+      <div class="tarjeta juego">
+        <img src="img/portada.jpg" alt="">
+        <div>
+          <h3 class="titulo" style="margin:0;color:var(--luz)">Shadow of the Colossus</h3>
+          <p style="margin:.3rem 0 0;color:var(--tenue)">PlayStation 2 · NTSC-U. The installer checks the disc's executable
+             before copying anything.</p>
+          <div class="datos">
+            <div class="dato"><b>Serial</b>SCUS-97472</div>
+            <div class="dato"><b>Executable</b>SCUS_974.72</div>
+            <div class="dato"><b>ISO size</b>≈ 2.7 GB</div>
+            <div class="dato"><b>SD folder</b>/switch/celosia_nx</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="instalador">
+    <div class="envoltura">
+      <h2>Installer</h2>
+      <p class="subtitulo">Add the pieces you have. You don't need all of them: the ZIP holds only the ones you pick. celosia nx itself (<code>celosia_nx.nro</code>) is always included.</p>
+
+      <div class="piezas">
+        <div class="tarjeta pieza" id="pieza-iso">
+          <span class="num">I</span>
+          <span class="opcional">Optional</span>
+          <h3>Game disc</h3>
+          <p class="que">Your Shadow of the Colossus ISO (NTSC-U). It is verified and its files are extracted.</p>
+          <div class="destino">switch/celosia_nx/assets/</div>
+          <input type="file" id="entrada-iso" accept=".iso" hidden>
+          <button class="boton secundario" data-para="entrada-iso">Choose ISO…</button>
+          <div class="estado" id="estado-iso">Not chosen.</div>
+          <button class="quitar" data-quitar="iso" hidden>Remove</button>
+        </div>
+
+        <div class="tarjeta pieza" id="pieza-lsfg">
+          <span class="num">II</span>
+          <span class="opcional">Optional</span>
+          <h3>Frame generation</h3>
+          <p class="que">Your original <code>Lossless.dll</code> from Lossless Scaling. The LSFG shaders (quality and
+             performance) are prepared for the Switch right here, exactly as the port's own tool does.</p>
+          <div class="destino">switch/celosia_nx/lsfg/Cache/</div>
+          <input type="file" id="entrada-lsfg" accept=".dll" hidden>
+          <button class="boton secundario" data-para="entrada-lsfg">Choose Lossless.dll…</button>
+          <div class="estado" id="estado-lsfg">Not chosen.</div>
+          <button class="quitar" data-quitar="lsfg" hidden>Remove</button>
+        </div>
+
+        <div class="tarjeta pieza" id="pieza-tex">
+          <span class="num">III</span>
+          <span class="opcional">Optional</span>
+          <h3>Panda Venom textures</h3>
+          <p class="que">The folder of the Panda Venom HD pack (PCSX2 format, <code>.dds</code>/<code>.png</code> files).</p>
+          <div class="destino">switch/celosia_nx/textures/pandavenom/</div>
+          <input type="file" id="entrada-tex" webkitdirectory multiple hidden>
+          <button class="boton secundario" data-para="entrada-tex">Choose folder…</button>
+          <label class="aviso" id="botones-tex" hidden>Button icons:
+            <select id="estilo-botones">
+              <option value="main">Pack default</option>
+              <option value="playstation">PlayStation (optional set)</option>
+              <option value="xbox">Xbox (optional set)</option>
+            </select></label>
+          <div class="estado" id="estado-tex">Not chosen.</div>
+          <button class="quitar" data-quitar="tex" hidden>Remove</button>
+        </div>
+      </div>
+
+      <div class="tarjeta empaquetar">
+        <div class="resumen" id="resumen"></div>
+        <div class="aviso" id="aviso-navegador" hidden></div>
+        <div>
+          <button class="boton primario" id="crear" disabled>Create ZIP</button>
+          <button class="boton secundario" id="cancelar" hidden>Cancel</button>
+        </div>
+        <div class="progreso"><div id="barra-progreso"></div></div>
+        <div class="linea-progreso"><span id="texto-progreso">Pick at least one piece.</span><span id="cifra-progreso"></span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="guia">
+    <div class="envoltura">
+      <h2>Guide</h2>
+      <p class="subtitulo">Three steps to play.</p>
+      <div class="pasos">
+        <div class="tarjeta paso"><h3>Create the ZIP</h3><p>Pick the pieces you have and press “Create ZIP”. Choose where to
+          save it: it is written straight to your disk.</p></div>
+        <div class="tarjeta paso"><h3>Copy it to the microSD</h3><p>Extract the ZIP to the root of the microSD. Its contents
+          already sit inside <code>switch/celosia_nx/</code>; if the folder exists, accept merging.</p></div>
+        <div class="tarjeta paso"><h3>Launch celosia nx</h3><p>Start <code>celosia_nx.nro</code> from the homebrew menu through a
+          game (application mode). LSFG and Panda Venom are turned on in the settings menu.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="preguntas">
+    <div class="envoltura">
+      <h2>FAQ</h2>
+      <details><summary>Are my ISO or my DLL uploaded to a server?</summary>
+        <p>No. The page reads the files inside your own browser and writes the ZIP to your disk. There is no server to receive them.</p></details>
+      <details><summary>Do I need all three pieces?</summary>
+        <p>No. Each one is independent. You can make a ZIP with just the textures, just LSFG or just the game, and add the rest
+           later with another ZIP: they merge into the same folder.</p></details>
+      <details><summary>Which browser do I need?</summary>
+        <p>Chrome or Edge on a computer. They can save a large file straight to disk (the ZIP with the game is about 2.7 GB).</p></details>
+      <details><summary>Why does it ask for my own Lossless.dll?</summary>
+        <p>The frame generation shaders belong to Lossless Scaling and cannot be redistributed. The installer converts them from
+           your purchased copy, with the same tool and settings the port uses.</p></details>
+      <details><summary>My ISO fails the check.</summary>
+        <p>The port needs the NTSC-U edition (SCUS-97472). Other regions and modified ISOs are not supported.</p></details>
+    </div>
+  </section>
+
+  <section id="ayuda">
+    <div class="envoltura">
+      <h2>Need help?</h2>
+      <p class="subtitulo">If you have problems with the installation, contact me on Discord.</p>
+      <a class="boton primario" href="https://discord.com/users/1108525615793045564" target="_blank" rel="noopener">Message lemasterxar5 on Discord</a>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="envoltura">
+    <p><b>celosia nx</b> · by <a href="https://github.com/lemasterxar5">lemasterxar5</a> ·
+       <a href="https://discord.com/users/1108525615793045564">Discord</a></p>
+    <p>Design inspired by the preparer page by
+       <a href="https://dbz-bt3-preparador-unknown.alexyt2021es.chatgpt.site/">alexyt2021es</a>. Thanks for the idea.</p>
+    <p>LSFG preparation: lsfg-deko3d (PalindromicBreadLoaf), SPIRV-Cross and uam (devkitPro).</p>
+    <p>Background music: Shadow of the Colossus original soundtrack (Kow Otani), taken from
+       <a href="https://www.youtube.com/watch?v=3VokRpoy08I&amp;list=RD3VokRpoy08I&amp;start_radio=1" target="_blank" rel="noopener">this YouTube video</a>.</p>
+    <p>Shadow of the Colossus is a trademark of Sony Interactive Entertainment. Unaffiliated fan project. You need your own
+       copy of the game and of Lossless Scaling.</p>
+  </div>
+</footer>
+
+<audio id="audio" loop preload="none" src="musica/tema.mp3"></audio>
+<script src="app/celosia-nx-nro.js"></script>
+<script src="wasm/lsfgprep-bundle.js"></script>
+<script src="js/iso9660.js"></script>
+<script src="js/zip.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

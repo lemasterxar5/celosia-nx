@@ -30,5 +30,7 @@ void main() {
     }
     viewDepth=c.w;
     fogAmount=u.fog.w!=0.0?clamp(u.fog.x+u.fog.y/max(c.w,0.001),0.0,255.0)/255.0:1.0;
-    nearCull=u.fog.z>0.0?c.w-u.fog.z:1.0;
+    // v171c first person: fog.z < 0 is a near plane at depth -fog.z (Wander's head around the eye discarded by
+    // native.frag; v171c's hardware clip distance broke every draw on the console).
+    nearCull=u.fog.z>0.0?c.w-u.fog.z:(u.fog.z<0.0?c.w+u.fog.z:1.0);
 }

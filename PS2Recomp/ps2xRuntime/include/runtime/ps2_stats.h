@@ -13,6 +13,7 @@
 namespace ps2_stats
 {
     inline std::atomic<uint64_t> vu1Mscal{0};
+    inline std::atomic<uint32_t> padButtons{0xFFFFu}; // v171s: the buttons the game last read (PS2 layout, active low; the cheats' joker)
     inline std::atomic<uint64_t> vu1Xgkick{0};
     inline std::atomic<uint64_t> vu1Mscnt{0};
     inline std::atomic<uint64_t> vu1Programs{0}; // VU1 program starts, ever (3D drawn)

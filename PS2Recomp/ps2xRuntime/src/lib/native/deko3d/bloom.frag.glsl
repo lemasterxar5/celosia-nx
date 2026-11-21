@@ -67,7 +67,17 @@ void main() {
         ivec2 size=ivec2(u.params.xy);
         ivec2 base=ivec2(floor(frag))*4;
         float sum=0.0;
-        for(int y=0;y<4;++y)for(int x=0;x<4;++x)sum+=texelFetch(image,min(base+ivec2(x,y),size-1),0).r;
+        if(base.x+3<size.x && base.y+3<size.y){
+            // v131: four gathers of 2 x 2 (the block lies inside the mask: no clamping). The mask holds 0 or
+            // 1, so the sum of the 16 texels is the same integer in any order.
+            vec2 inv=1.0/vec2(size);
+            for(int y=0;y<4;y+=2)for(int x=0;x<4;x+=2){
+                vec4 g=textureGather(image,(vec2(base+ivec2(x,y))+1.0)*inv,0);
+                sum+=g.x+g.y+g.z+g.w;
+            }
+        }else{
+            for(int y=0;y<4;++y)for(int x=0;x<4;++x)sum+=texelFetch(image,min(base+ivec2(x,y),size-1),0).r;
+        }
         outputColour=vec4(vec3(sum/16.0),1.0);
         return;
     }
@@ -84,5 +94,9 @@ void main() {
     // 18: the composite
     vec2 x=frag/u.params.xy-0.5;
     vec2 uv=(0.5+x*vec2(256.0/512.0,256.0/448.0))/256.0;
-    outputColour=vec4(texture(image,uv).rgb*u.fogColour.rgb*u.fogColour.a,0.0);
+    // v158: blended One + One (alpha Zero, One): a zero colour leaves the pixel as it is, so it is not
+    // written at all (no read-modify-write of the 4x samples where the bloom is black).
+    const vec3 add=texture(image,uv).rgb*u.fogColour.rgb*u.fogColour.a;
+    if(add.r<=0.0 && add.g<=0.0 && add.b<=0.0)discard;
+    outputColour=vec4(add,0.0);
 }

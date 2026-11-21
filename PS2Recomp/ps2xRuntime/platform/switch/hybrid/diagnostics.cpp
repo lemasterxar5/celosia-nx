@@ -19,7 +19,7 @@ u64 __nx_exception_stack_size=sizeof(exceptionStack);
 void prepareSwitchDiagnostics(){
     auto *filesystem=fsdevGetDeviceFileSystem("sdmc");
     if(!filesystem)return;
-    constexpr const char *path="/switch/celosia-native-boot/native-fault.txt";
+    constexpr const char *path="/switch/celosia_nx/native-fault.txt";
     (void)fsFsCreateFile(filesystem,path,4096,0);
     if(R_FAILED(fsFsOpenFile(filesystem,path,FsOpenMode_Write,&faultFile)))return;
     faultFileReady=true;
@@ -28,7 +28,9 @@ void prepareSwitchDiagnostics(){
     (void)fsFileSetSize(&faultFile,sizeof(initial));
     (void)fsFileWrite(&faultFile,0,initial,sizeof(initial),FsWriteOption_Flush);
 }
+extern "C" void switchAsyncLogFlushNow();
 extern "C" void switchFaultRecord(const char *message,size_t size){
+    switchAsyncLogFlushNow(); // v169: the log lines still in memory first (try-locks only)
     if(!faultFileReady || faultWritten.test_and_set())return;
     size=size>4095?4095:size;
     (void)fsFileWrite(&faultFile,0,message,size,FsWriteOption_Flush);

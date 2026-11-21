@@ -1,3 +1,4 @@
+#include <optional>
 #include <cstdio>
 #include "GuestKernelMemory.h"
 #include "runtime/ee_scheduler.h"
@@ -260,6 +261,8 @@ void EeScheduler::run()
 
         GuestThread *running = currentThread();
         assert(running != nullptr);
+        if (ps2_load::t_slot == ps2_load::kGame && ps2_load::gameZone.load(std::memory_order_relaxed) >= 0x2040u)
+            ps2_load::gameZone.store(0x2042u, std::memory_order_relaxed); // v170a: the hand-over's rest
         if (running->resumeCompletion)
         {
             auto completion = std::move(running->resumeCompletion);
@@ -2213,6 +2216,10 @@ void EeScheduler::processPendingEvents()
         applyPendingPreemption();
         return;
     }
+    // v170a: prof129 sub-zone 0x2041 (the events' work), on the game thread only.
+    const bool zoned170 = ps2_load::t_slot == ps2_load::kGame;
+    if (zoned170)
+        ps2_load::gameZone.store(0x2041u, std::memory_order_relaxed);
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
@@ -2223,15 +2230,30 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
-    std::deque<EeEvent> pending;
+    static const bool local170 = std::getenv("PS2X_NO_DISPATCH170") != nullptr;
+    const bool reuse = !local170 && m_eventDepth == 0u;
+    std::optional<std::deque<EeEvent>> localPending; // (a deque allocates when made: only for a nested pass)
+    if (!reuse)
+        localPending.emplace();
+    std::deque<EeEvent> &pending = reuse ? m_eventScratch : *localPending;
+    pending.clear();
     {
         std::lock_guard lock(m_eventMutex);
         pending.swap(m_events);
     }
-    for (const EeEvent &event : pending)
     {
-        processEvent(event);
+        struct Depth
+        {
+            uint32_t &d;
+            explicit Depth(uint32_t &v) : d(v) { ++d; }
+            ~Depth() { --d; }
+        } depth(m_eventDepth);
+        for (const EeEvent &event : pending)
+        {
+            processEvent(event);
+        }
     }
+    pending.clear();
 
     {
         std::lock_guard lock(m_eventMutex);
@@ -2250,7 +2272,17 @@ void EeScheduler::processDueDeadlines()
 {
     for (;;)
     {
-        std::vector<ScheduledEvent> due;
+        static const bool local170 = std::getenv("PS2X_NO_DISPATCH170") != nullptr;
+        const bool reuse = !local170 && m_dueDepth == 0u;
+        std::vector<ScheduledEvent> localDue;
+        std::vector<ScheduledEvent> &due = reuse ? m_dueScratch : localDue;
+        due.clear();
+        struct Depth
+        {
+            uint32_t &d;
+            explicit Depth(uint32_t &v) : d(v) { ++d; }
+            ~Depth() { --d; }
+        } depth(m_dueDepth);
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);

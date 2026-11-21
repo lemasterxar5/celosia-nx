@@ -476,6 +476,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
+    ps2_stats::padButtons.store(btns, std::memory_order_relaxed);
     native_recorder::padRead(data); // (the scene recorder: what the game read)
     return true;
 }

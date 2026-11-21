@@ -194,6 +194,26 @@ namespace native_renderer
     // RGBA8 (alpha 0x80 = opaque, as the PS2's), kept on the GPU under `id`.
     // `levels` mip levels, each half the last, one after the other in `rgba`.
     void uploadTexture(uint64_t id, uint32_t width, uint32_t height, const uint8_t *rgba, uint32_t levels = 1);
+    // v167 (texture packs): a BC3 (DXT5) texture, `levels` mip levels one after the other (alpha 0x80 =
+    // opaque, as the PS2's), sampled with the hardware's own mip choice. The alpha figures are the
+    // renderer's alpha-test inputs (as uploadTexture measures them); alphaGrid optional (gridW x gridH,
+    // each texel the most alpha of its area). false: the backend cannot (upload the PS2 texture instead).
+    struct CompressedTexture
+    {
+        uint32_t width = 0, height = 0, levels = 1;
+        const uint8_t *data = nullptr;
+        size_t bytes = 0;
+        uint8_t minAlpha = 0, maxAlpha = 255;
+        uint16_t fullTexels = 0, clearTexels = 0;
+        const uint8_t *alphaGrid = nullptr;
+        uint32_t gridW = 0, gridH = 0;
+    };
+    bool uploadCompressedTexture(uint64_t id, const CompressedTexture &texture);
+    // The texture under `id` forgotten (its GPU memory freed once no frame in flight uses it).
+    void dropTexture(uint64_t id);
+    // v168: a detached worker thread for the game's side (std::thread throws there: std::terminate): libnx's
+    // threadCreate on the Switch (low priority, any core), std::thread elsewhere. false: not started.
+    bool startWorkerThread(void (*entry)(void *), void *argument, size_t stackBytes);
 
     // Work off the game thread (tuning().asyncBuilds, Debug "Builds on a
     // worker"): `work` runs on a worker thread (it holds copies of what it
@@ -429,6 +449,11 @@ namespace native_renderer
     bool shown();
     // The last finished frame (RGBA8); false before the first.
     bool latestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
+    // v173 photo mode's free camera: while taping, each frame's backend calls are kept (the last whole frame);
+    // photoReplay draws that frame again (beginFrame .. endFrame) with every non-screen draw's matrix multiplied
+    // on the left by `correction` (column-major, as the draws' matrices). False: nothing taped.
+    void photoTape(bool on);
+    bool photoReplay(const float correction[16]);
     // SOTC_BLOOM_DUMP=1 (the OpenGL renderer): the bloom chain's targets of
     // the frame latestFrame returns (RGBA8, top row first).
     struct BloomStage
@@ -596,6 +621,12 @@ namespace native_renderer
         void lastFrame(Snapshot &out);
         int lineOf(const Snapshot &s, char *out, size_t room);
         int layout(); // SOTC_THREADS as read (0 / 1)
+        // v170 ("4-core boost", Switch): every helper thread placed (and the threads that call noteForBoost)
+        // noted with its handle and its 3-core placement; setBoost4(true) moves the boost profile's threads to
+        // core 3 (when the process may use it), setBoost4(false) puts each back. Hot; a no-op unchanged.
+        void noteForBoost();
+        void setBoost4(bool on);
+        bool core3Allowed();
     }
 
     // Host memory the game's hooks hold, for the backend's memory log

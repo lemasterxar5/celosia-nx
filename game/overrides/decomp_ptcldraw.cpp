@@ -21,11 +21,18 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_memory.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace decomp_math
 {
     void getSinCos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+}
+
+namespace char122::quat
+{
+    bool sinCosValues(uint8_t *rdram, float x, float r[4]); // v168
+    bool sinCosDirect();
 }
 
 namespace sotc_native
@@ -240,6 +247,18 @@ namespace decomp_ptcldraw
             // a link the loop reads later; nothing is written in between but
             // the display list and the context, and a link it gets wrong
             // only costs a wasted line).
+            // v164: the jal's target and the table's entry for it, once (the code and the table do not change
+            // inside the loop; before: decoded and looked up for every particle). CELOSIA_DIAG_NO_PTCL164=1: per particle.
+            static const bool ptcl164Off = std::getenv("CELOSIA_DIAG_NO_PTCL164") != nullptr;
+            const uint32_t sinCosTarget = sotc_decomp::jalTarget(rdram, 0x0113EAC4u);
+            const bool sinCosDirect = sinCosTarget == 0x001BDDB0u && runtime->guestFunctionAt(sinCosTarget) == &decomp_math::getSinCos;
+            // v168 (CPU rewrite #2, the cinematic's next own function: this loop): with round 122's plain sin/cos
+            // in use (no checking), each particle's (cos, sin, 0, 0) made here from the same function of f12
+            // (char122::quat::sinCosValues, the arithmetic quat::sinCos runs) instead of the call chain
+            // getSinCos -> quat::on -> sinCos -> returnTo per particle. The same values in the same place; the
+            // registers the call left (ra, pc) as it left them. CELOSIA_DIAG_NO_PTCL168=1: the call.
+            static const bool ptcl168Off = std::getenv("CELOSIA_DIAG_NO_PTCL168") != nullptr;
+            const bool sinCosInline = !ptcl164Off && !ptcl168Off && sinCosDirect && char122::quat::sinCosDirect();
             const bool w67 = sotc_decomp::walk67On();
             constexpr uint32_t kAhead = 4u;
             uint32_t runner = s0, outAhead = s1;
@@ -328,9 +347,18 @@ namespace decomp_ptcldraw
                     s3 += 0x30u;
                     ctx->f[12] = f12;
                     // iosGetSinCosf: straight to decomp_math's when the table holds it.
+                    float sc[4];
+                    const uint32_t sinCosOut = GPR_U32(ctx, 4); // a0: this particle's slot + 0x20 (s3 before its step)
+                    if (sinCosInline && plain(sinCosOut & ~0xFu, 16u) && char122::quat::sinCosValues(rdram, f12, sc))
                     {
-                        const uint32_t target = sotc_decomp::jalTarget(rdram, 0x0113EAC4u);
-                        if (target == 0x001BDDB0u && runtime->guestFunctionAt(target) == &decomp_math::getSinCos)
+                        std::memcpy(ram.p(sinCosOut & ~0xFu), sc, 16);
+                        SET_GPR_U32(ctx, 31, 0x0113EACCu);
+                        ctx->pc = 0x0113EACCu; // (returnTo's)
+                    }
+                    else
+                    {
+                        const uint32_t target = ptcl164Off ? sotc_decomp::jalTarget(rdram, 0x0113EAC4u) : sinCosTarget;
+                        if (ptcl164Off ? (target == 0x001BDDB0u && runtime->guestFunctionAt(target) == &decomp_math::getSinCos) : sinCosDirect)
                         {
                             SET_GPR_U32(ctx, 31, 0x0113EACCu);
                             decomp_math::getSinCos(rdram, ctx, runtime);

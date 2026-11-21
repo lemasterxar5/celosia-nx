@@ -81,10 +81,10 @@ struct Image {
     DkImage image{};
     Image(DkDevice device, uint32_t width, uint32_t height,
           DkImageFormat format, uint32_t flags, std::shared_ptr<AllocationBudget> budget,
-          uint32_t levels = 1, const std::shared_ptr<BufferPool> &pool = {}) {
+          uint32_t levels = 1, const std::shared_ptr<BufferPool> &pool = {}, DkMsMode samples = DkMsMode_1x, bool zeroFill = false) {
         DkImageLayoutMaker maker;
         dkImageLayoutMakerDefaults(&maker, device);
-        maker.format = format; maker.flags = flags;
+        maker.format = format; maker.flags = flags; maker.msMode = samples;
         maker.dimensions[0] = width; maker.dimensions[1] = height;
         maker.mipLevels = levels;
         DkImageLayout layout;
@@ -94,7 +94,7 @@ struct Image {
         // v108: sampled images from a pooled page when the layout's alignment fits a page slot.
         if(pool && alignment<=BufferPool::SlotBytes)storage=Buffer::pooled(pool,dkImageLayoutGetSize(&layout));
         if(!storage)storage = std::make_shared<Buffer>(device, dkImageLayoutGetSize(&layout), std::move(budget),
-            DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+            DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image | (zeroFill ? DkMemBlockFlags_ZeroFillInit : 0u));
         if(alignment && storage->gpu()%alignment)
             throw std::runtime_error("deko3d: image storage misaligned for its layout");
         // Dedicated allocations start at zero, satisfying every image offset alignment.

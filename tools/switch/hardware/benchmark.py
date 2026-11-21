@@ -11,8 +11,8 @@ import traceback
 
 from sysbot import SysBot, validate_endpoint
 
-TITLE_ID = '055FDD199F883000'
-STATUS_PATH = '/switch/celosia-native-boot/hardware-status.txt'
+TITLE_ID = '05E1B33926CFF000'
+STATUS_PATH = '/switch/celosia_nx/hardware-status.txt'
 
 
 def parse_status(text):

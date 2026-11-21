@@ -23,6 +23,8 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_memory.h"
 
+#include <cstring>
+
 namespace decomp_hot44g
 {
     constexpr uint32_t kGsReg = 0x001C5B00u, kPacket = 0x001E11A4u;
@@ -33,6 +35,34 @@ namespace decomp_hot44g
     {
         if (!sotc_decomp::hotList44On())
             return sotc_decomp::recompiled(kGsReg)(rdram, ctx, runtime);
+        // v159: main RAM throughout (the record, its two words, the pair's 16 bytes): plain loads and stores,
+        // the same values and registers as below; anything else (or a write trace) takes the macros.
+#if !PS2X_GUEST_WRITE_TRACE
+        {
+            uint32_t record, closed, at;
+            std::memcpy(&record, rdram + kPacket, 4);
+            if (record + 0x20u <= PS2_RAM_SIZE && record >= 0x100000u)
+            {
+                std::memcpy(&closed, rdram + record + 0x1Cu, 4);
+                std::memcpy(&at, rdram + record + 0xCu, 4);
+                if (closed == 0u && (at & 7u) == 0u && at >= 0x100000u && at + 16u <= PS2_RAM_SIZE &&
+                    (at + 16u <= kPacket || at >= kPacket + 4u) && (at + 16u <= record + 0xCu || at >= record + 0x20u))
+                {
+                    const uint64_t value = GPR_U64(ctx, 5), reg = GPR_U64(ctx, 4);
+                    std::memcpy(rdram + at, &value, 8);
+                    std::memcpy(rdram + at + 8u, &reg, 8);
+                    const uint32_t end = at + 16u;
+                    std::memcpy(rdram + record + 0xCu, &end, 4);
+                    SET_GPR_U64(ctx, 7, sx(kPacket));
+                    SET_GPR_U64(ctx, 3, sx(record + 0xCu));
+                    SET_GPR_U64(ctx, 6, sx(record + 0xCu));
+                    SET_GPR_U64(ctx, 2, sx(end));
+                    sotc_decomp::returnTo(ctx);
+                    return;
+                }
+            }
+        }
+#endif
         SET_GPR_U64(ctx, 7, sx(kPacket));
         uint32_t record = READ32(kPacket);
         SET_GPR_U64(ctx, 3, sx(record));

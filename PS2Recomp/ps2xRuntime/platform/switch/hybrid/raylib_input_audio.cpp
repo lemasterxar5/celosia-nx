@@ -1,5 +1,8 @@
+#include <cstdio>
+#include <cmath>
 #include "raylib.h"
 #include "native_audio_output.hpp"
+#include "live_settings.hpp"
 #include <switch.h>
 #include <algorithm>
 #include <array>
@@ -11,6 +14,8 @@
 void mixSwitchSounds(int16_t *,size_t);
 void clearSwitchSounds();
 void celosiaMenuInput(uint64_t &buttons,std::array<float,4> &sticks);
+// v169: buttons down at any HID sample since the previous poll (the menu's presses between two slow frames).
+extern uint64_t celosiaMenuBetween;
 
 namespace {
 struct InputState {
@@ -72,6 +77,29 @@ void pollSwitchInput()
         padInitializeDefault(&input.pad);input.initialized=true;
     }
     padUpdate(&input.pad);input.connected=padIsConnected(&input.pad);
+    {
+        // v169: a press shorter than the gap between two host frames (a 150-250 ms frame in a cinematic) was
+        // never seen by the menu: HID's sample history (newest first, up to 17 per controller) since the last
+        // poll, for the menu only; the game's buttons stay this poll's snapshot.
+        static uint64_t lastSample[2]{};
+        uint64_t between=0;
+        const HidNpadIdType ids[2]{HidNpadIdType_No1,HidNpadIdType_Handheld};
+        for(int k=0;k<2;++k){
+            HidNpadCommonState states[17];size_t count=0;
+            const uint32_t style=hidGetNpadStyleSet(ids[k]);
+            if(style&HidNpadStyleTag_NpadFullKey)count=hidGetNpadStatesFullKey(ids[k],states,17);
+            else if(style&HidNpadStyleTag_NpadHandheld)count=hidGetNpadStatesHandheld(ids[k],states,17);
+            else if(style&HidNpadStyleTag_NpadJoyDual)count=hidGetNpadStatesJoyDual(ids[k],states,17);
+            uint64_t newest=lastSample[k];
+            for(size_t i=0;i<count;++i){
+                if(states[i].sampling_number<=lastSample[k])break;
+                if(states[i].attributes&HidNpadAttribute_IsConnected)between|=states[i].buttons;
+                newest=std::max<uint64_t>(newest,states[i].sampling_number);
+            }
+            lastSample[k]=newest;
+        }
+        celosiaMenuBetween=between;
+    }
     input.buttons=input.connected?padGetButtons(&input.pad):0;
     input.sticks.fill(0);
     if(!input.connected)return;
@@ -79,6 +107,13 @@ void pollSwitchInput()
     input.sticks={axis(left.x,false),axis(left.y,true),axis(right.x,false),axis(right.y,true)};
     // The in-game menu (Minus + Plus): while open the game sees no input.
     celosiaMenuInput(input.buttons,input.sticks);
+    // v173r: the Switch layout (menu "swapbuttons"): A<->B, X<->Y for the game only (after the menu took its input).
+    if(celosia::live::settings().swapFaceButtons.load(std::memory_order_relaxed)){
+        const uint64_t b=input.buttons;
+        const auto swap=[&](uint64_t x,uint64_t y){return ((b&x)?y:0)|((b&y)?x:0);};
+        input.buttons=(b&~uint64_t(HidNpadButton_A|HidNpadButton_B|HidNpadButton_X|HidNpadButton_Y))|
+            swap(HidNpadButton_A,HidNpadButton_B)|swap(HidNpadButton_X,HidNpadButton_Y);
+    }
 }
 bool IsKeyDown(int){return false;}
 bool IsKeyPressed(int){return false;}

@@ -1253,6 +1253,331 @@ namespace
         uint64_t m_frames = 0;
     };
 
+
+namespace
+{
+    // v173 photo mode (native_renderer::photoTape / photoReplay): forwards every call; while taping, the calls of
+    // each frame (from beginFrame to endFrame) are kept in order, with the per-frame meshes' vertices and the
+    // per-frame palettes, so the last whole frame can be drawn again while the game is frozen.
+    class PhotoTape final : public native_renderer::detail::Backend
+    {
+        using V = native_renderer::Vertex;
+        using DS = native_renderer::DrawState;
+        enum Kind : uint8_t { kMesh, kFrameMesh, kSkinned, kPalette, kRewrite, kDraw, kMulti, kFog, kBloom, kBlur, kGlow, kDof };
+        struct Op
+        {
+            Kind kind;
+            uint64_t id = 0;
+            uint32_t a = 0, b = 0, at = 0; // counts / handle; `at` indexes the payload vectors
+        };
+        struct Tape
+        {
+            std::vector<Op> ops;
+            std::vector<V> vertices;
+            std::vector<uint32_t> indices;
+            std::vector<native_renderer::SkinVertex> skin;
+            std::vector<float> floats; // palettes, matrices
+            std::vector<DS> states;
+            std::vector<uint64_t> ids;
+            std::vector<size_t> idxStarts;
+            std::vector<native_renderer::Fog> fogs;
+            std::vector<native_renderer::Bloom> blooms;
+            std::vector<native_renderer::ScreenBlur> blurs;
+            std::vector<native_renderer::GlowComposite> glows;
+            std::vector<native_renderer::DepthOfField> dofs;
+            uint32_t w = 0, h = 0;
+            bool whole = false;
+            void clear()
+            {
+                ops.clear(), vertices.clear(), indices.clear(), skin.clear(), floats.clear(), states.clear(), ids.clear(), idxStarts.clear();
+                fogs.clear(), blooms.clear(), blurs.clear(), glows.clear(), dofs.clear();
+                whole = false;
+            }
+        };
+        native_renderer::detail::Backend *in;
+        Tape next, done;
+        bool armed = false, taping = false;
+        V *pendingV = nullptr;
+        uint32_t *pendingI = nullptr;
+        uint32_t pendingVN = 0, pendingIN = 0;
+        uint32_t pushFloats(const float *f, size_t n)
+        {
+            const uint32_t at = static_cast<uint32_t>(next.floats.size());
+            next.floats.insert(next.floats.end(), f, f + n);
+            return at;
+        }
+    public:
+        explicit PhotoTape(native_renderer::detail::Backend *inner) : in(inner) {}
+        void arm(bool on)
+        {
+            armed = on;
+            if (!on)
+                taping = false, next.clear();
+        }
+        bool hasTape() const { return done.whole; }
+        bool hasMesh(uint64_t id) override { return in->hasMesh(id); }
+        uint64_t meshEvictions() override { return in->meshEvictions(); }
+        void uploadMesh(uint64_t id, const V *v, uint32_t n, bool perFrame) override
+        {
+            in->uploadMesh(id, v, n, perFrame);
+            if (taping && perFrame && v)
+            {
+                next.ops.push_back({kMesh, id, n, 0, static_cast<uint32_t>(next.vertices.size())});
+                next.vertices.insert(next.vertices.end(), v, v + n);
+            }
+        }
+        V *frameMesh(uint32_t count) override
+        {
+            pendingV = in->frameMesh(count), pendingVN = count, pendingI = nullptr, pendingIN = 0;
+            return pendingV;
+        }
+        uint32_t *frameMeshIndices(uint32_t count, uint32_t &base) override
+        {
+            pendingI = in->frameMeshIndices(count, base), pendingIN = count;
+            return pendingI;
+        }
+        void commitFrameMesh(uint64_t id, uint32_t count, uint32_t indexCount) override
+        {
+            if (taping && pendingV && count <= pendingVN && (!indexCount || (pendingI && indexCount <= pendingIN)))
+            {
+                next.ops.push_back({kFrameMesh, id, count, indexCount, static_cast<uint32_t>(next.vertices.size())});
+                next.vertices.insert(next.vertices.end(), pendingV, pendingV + count);
+                next.ops.back().b = indexCount;
+                next.idxStarts.push_back(next.indices.size()); // where its indices start
+                if (indexCount)
+                    next.indices.insert(next.indices.end(), pendingI, pendingI + indexCount);
+            }
+            else if (taping)
+                next.whole = false, taping = false; // not kept: this frame cannot be drawn again
+            in->commitFrameMesh(id, count, indexCount);
+            pendingV = nullptr, pendingI = nullptr;
+        }
+        void cancelFrameMesh() override
+        {
+            pendingV = nullptr, pendingI = nullptr;
+            in->cancelFrameMesh();
+        }
+        bool canSkin() override { return in->canSkin(); }
+        void uploadSkinnedMesh(uint64_t id, const native_renderer::SkinVertex *v, uint32_t n, const uint32_t *idx, uint32_t ni) override
+        {
+            in->uploadSkinnedMesh(id, v, n, idx, ni);
+            if (taping && v)
+            {
+                next.ops.push_back({kSkinned, id, n, ni, static_cast<uint32_t>(next.skin.size())});
+                next.skin.insert(next.skin.end(), v, v + n);
+                next.idxStarts.push_back(next.indices.size());
+                if (idx && ni)
+                    next.indices.insert(next.indices.end(), idx, idx + ni);
+            }
+        }
+        uint32_t framePalette(const float *m, uint32_t qwords) override
+        {
+            const uint32_t handle = in->framePalette(m, qwords);
+            if (taping && m)
+                next.ops.push_back({kPalette, handle, qwords, 0, pushFloats(m, size_t(qwords) * 4u)});
+            return handle;
+        }
+        void rewriteFramePalette(uint32_t handle, const float *m, uint32_t qwords) override
+        {
+            in->rewriteFramePalette(handle, m, qwords);
+            if (taping && m)
+                next.ops.push_back({kRewrite, handle, qwords, 0, pushFloats(m, size_t(qwords) * 4u)});
+        }
+        bool hasTexture(uint64_t id) override { return in->hasTexture(id); }
+        void uploadTexture(uint64_t id, uint32_t w, uint32_t h, const uint8_t *p, uint32_t l) override { in->uploadTexture(id, w, h, p, l); }
+        bool uploadCompressed(uint64_t id, const native_renderer::CompressedTexture &t) override { return in->uploadCompressed(id, t); }
+        void dropTexture(uint64_t id) override { in->dropTexture(id); }
+        void beginFrame() override
+        {
+            in->beginFrame();
+            taping = armed;
+            if (taping)
+                next.clear(), next.whole = true;
+        }
+        void draw(uint64_t mesh, const float c[16], const DS &s) override
+        {
+            in->draw(mesh, c, s);
+            if (taping)
+            {
+                next.ops.push_back({kDraw, mesh, static_cast<uint32_t>(next.states.size()), 0, pushFloats(c, 16)});
+                next.states.push_back(s);
+            }
+        }
+        void drawMulti(const uint64_t *meshes, uint32_t count, const float c[16], const DS &s) override
+        {
+            in->drawMulti(meshes, count, c, s);
+            if (taping)
+            {
+                next.ops.push_back({kMulti, next.ids.size(), static_cast<uint32_t>(next.states.size()), count, pushFloats(c, 16)});
+                next.states.push_back(s);
+                next.ids.insert(next.ids.end(), meshes, meshes + count);
+            }
+        }
+        void setFog(const native_renderer::Fog &f) override
+        {
+            in->setFog(f);
+            if (taping)
+                next.ops.push_back({kFog, 0, 0, 0, static_cast<uint32_t>(next.fogs.size())}), next.fogs.push_back(f);
+        }
+        void setBloom(const native_renderer::Bloom &x) override
+        {
+            in->setBloom(x);
+            if (taping)
+                next.ops.push_back({kBloom, 0, 0, 0, static_cast<uint32_t>(next.blooms.size())}), next.blooms.push_back(x);
+        }
+        void addScreenBlur(const native_renderer::ScreenBlur &x) override
+        {
+            in->addScreenBlur(x);
+            if (taping)
+                next.ops.push_back({kBlur, 0, 0, 0, static_cast<uint32_t>(next.blurs.size())}), next.blurs.push_back(x);
+        }
+        void setGlowComposite(const native_renderer::GlowComposite &x) override
+        {
+            in->setGlowComposite(x);
+            if (taping)
+                next.ops.push_back({kGlow, 0, 0, 0, static_cast<uint32_t>(next.glows.size())}), next.glows.push_back(x);
+        }
+        void setDepthOfField(const native_renderer::DepthOfField &x) override
+        {
+            in->setDepthOfField(x);
+            if (taping)
+                next.ops.push_back({kDof, 0, 0, 0, static_cast<uint32_t>(next.dofs.size())}), next.dofs.push_back(x);
+        }
+        void endFrame(uint32_t w, uint32_t h) override
+        {
+            in->endFrame(w, h);
+            if (taping && next.whole)
+            {
+                next.w = w, next.h = h;
+                std::swap(next, done);
+            }
+            taping = false;
+        }
+        void holdFrame() override
+        {
+            in->holdFrame();
+            if (taping)
+                next.whole = false; // a held frame is not the picture on screen
+        }
+        bool latestFrame(std::vector<uint8_t> &rgba, uint32_t &w, uint32_t &h) override { return in->latestFrame(rgba, w, h); }
+        void finishFrames() override { in->finishFrames(); }
+        bool timesItself() override { return in->timesItself(); }
+        // The taped frame drawn again (the game frozen: nothing else is drawing).
+        bool replay(const float C[16])
+        {
+            if (!done.whole)
+                return false;
+            const Tape &t = done;
+            const auto mul = [&](const float *m, float *out)
+            {
+                for (int c = 0; c < 4; ++c)
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        float v = 0.0f;
+                        for (int k = 0; k < 4; ++k)
+                            v += C[k * 4 + r] * m[c * 4 + k];
+                        out[c * 4 + r] = v;
+                    }
+            };
+            std::vector<std::pair<uint32_t, uint32_t>> handles; // taped palette handle -> this replay's
+            const auto handleFor = [&](uint32_t old)
+            {
+                for (const auto &p : handles)
+                    if (p.first == old)
+                        return p.second;
+                return old;
+            };
+            size_t meshIndexAt = 0;
+            // v173c diagnosis: the first replays step by step (stderr flushed: a crash leaves the last step).
+            static int traced = 0;
+            const bool trace = traced < 2;
+            if (trace)
+            {
+                ++traced;
+                size_t kinds[12] = {};
+                for (const Op &op : t.ops)
+                    ++kinds[op.kind];
+                std::fprintf(stderr, "[photo173] replay %d: %zu ops (mesh %zu frameMesh %zu skinned %zu palette %zu rewrite %zu draw %zu multi %zu) %ux%u\n", traced,
+                             t.ops.size(), kinds[kMesh], kinds[kFrameMesh], kinds[kSkinned], kinds[kPalette], kinds[kRewrite], kinds[kDraw], kinds[kMulti], t.w, t.h);
+                std::fflush(stderr);
+            }
+            in->beginFrame();
+            size_t opIndex = 0;
+            for (const Op &op : t.ops)
+            {
+                if (trace && (opIndex < 8 || opIndex % 200 == 0))
+                {
+                    std::fprintf(stderr, "[photo173] op %zu kind %d id %llx a %u b %u\n", opIndex, int(op.kind), (unsigned long long)op.id, op.a, op.b);
+                    std::fflush(stderr);
+                }
+                ++opIndex;
+                switch (op.kind)
+                {
+                case kMesh:
+                    in->uploadMesh(op.id, t.vertices.data() + op.at, op.a, true);
+                    break;
+                case kFrameMesh:
+                {
+                    const size_t idxAt = t.idxStarts[meshIndexAt++];
+                    V *v = in->frameMesh(op.a);
+                    std::memcpy(v, t.vertices.data() + op.at, sizeof(V) * op.a);
+                    if (op.b)
+                    {
+                        uint32_t base = 0;
+                        uint32_t *ix = in->frameMeshIndices(op.b, base);
+                        for (uint32_t i = 0; i < op.b; ++i)
+                            ix[i] = t.indices[idxAt + i] + base;
+                    }
+                    in->commitFrameMesh(op.id, op.a, op.b);
+                    break;
+                }
+                case kSkinned:
+                {
+                    const size_t idxAt = t.idxStarts[meshIndexAt++];
+                    in->uploadSkinnedMesh(op.id, t.skin.data() + op.at, op.a, op.b ? t.indices.data() + idxAt : nullptr, op.b);
+                    break;
+                }
+                case kPalette:
+                    handles.emplace_back(static_cast<uint32_t>(op.id), in->framePalette(t.floats.data() + op.at, op.a));
+                    break;
+                case kRewrite:
+                    in->rewriteFramePalette(handleFor(static_cast<uint32_t>(op.id)), t.floats.data() + op.at, op.a);
+                    break;
+                case kDraw:
+                case kMulti:
+                {
+                    DS s = t.states[op.a];
+                    if (s.skinPalette)
+                        s.skinPalette = handleFor(s.skinPalette);
+                    float m[16];
+                    const float *c = t.floats.data() + op.at;
+                    if (!s.screen)
+                        mul(c, m);
+                    else
+                        std::memcpy(m, c, sizeof(m));
+                    if (op.kind == kDraw)
+                        in->draw(op.id, m, s);
+                    else
+                        in->drawMulti(t.ids.data() + op.id, op.b, m, s);
+                    break;
+                }
+                case kFog: in->setFog(t.fogs[op.at]); break;
+                case kBloom: in->setBloom(t.blooms[op.at]); break;
+                case kBlur: break; // the frozen frame's screen blurs (camera motion) left out while flying
+                case kGlow: in->setGlowComposite(t.glows[op.at]); break;
+                case kDof: in->setDepthOfField(t.dofs[op.at]); break;
+                }
+            }
+            if (trace)
+                std::fprintf(stderr, "[photo173] replay ops done, endFrame\n"), std::fflush(stderr);
+            in->endFrame(t.w, t.h);
+            if (trace)
+                std::fprintf(stderr, "[photo173] replay done\n"), std::fflush(stderr);
+            return true;
+        }
+    };
+    PhotoTape *g_photoTape = nullptr;
+}
     native_renderer::detail::Backend *g_backend = nullptr;
     bool g_tried = false;
     std::atomic<bool> g_shown{false};
@@ -1281,6 +1606,9 @@ namespace
             g_tried = true;
 #if defined(__SWITCH__) && defined(PS2X_NATIVE_DEKO3D)
             g_backend = native_renderer::detail::createDeko3dBackend();
+            // v173: the photo mode's tape in front (plain forwarding until photoTape(true)). CELOSIA_DIAG_NO_PHOTOTAPE=1: none.
+            if (g_backend && !std::getenv("CELOSIA_DIAG_NO_PHOTOTAPE"))
+                g_backend = g_photoTape = new PhotoTape(g_backend);
 #else
             if (wantGl() && g_glMakeCurrent)
             {
@@ -1631,10 +1959,135 @@ namespace native_renderer
         // Switch: game (core 0, placed by its own thread) and render (core 1) keep their cores; the
         // helper threads (hook worker, disc reader, lane, log, ...) go to core 2, the third
         // application core, when the process mask allows it. Priority is left as created.
+        // v170: the noted threads (the 4-core boost). Each one's handle, its kind (-1: noteForBoost) and the
+        // core / mask it had after its 3-core placement (put back when the boost goes off).
+        namespace
+        {
+            struct Noted { Handle handle; int kind; s32 core; u64 mask; };
+            std::mutex g_notedMutex;
+            std::vector<Noted> g_noted;
+            bool g_boostOn = false;
+            // The boost profile: every thread off the game (0) and render (1) cores (v170b: see boostPlace).
+            bool boosted(int kind)
+            {
+                return kind == -1 || kind == kWorker || kind == kOffload || kind == kGuest || kind == kLane ||
+                       kind == kLoader || kind == kLog || kind == kAudio || kind == kRecorder ||
+                       kind == kMain || kind == kBuild || kind == kDma; // v170b: main, build, DMA too (cores 2-3)
+            }
+            // v170b (the boost, "los 4 nucleos al maximo"): v170 pinned every helper to core 3 alone, while the main
+            // thread, the build and DMA workers kept core 2: core 3 queued all the helpers (and Horizon's own work
+            // there) and the game thread waited on them (v170a-play4: 41-54 frames over 50 ms, 150-250 ms stalls
+            // every second; boost off: 1). Now every thread off the game (0) and render (1) cores gets cores 2 AND 3
+            // (mask 0xC): Horizon's scheduler moves each one to whichever of the two is free. The ideal core spreads
+            // them at the start: the ones the game thread joins with the main thread (hook worker, build, DMA) on 2,
+            // the offload workers (tex64, guest, lane) and the background ones (disc, logs, audio, recorder) on 3.
+            // A mask refused: v170's core 3. CELOSIA_DIAG_BOOST_PIN170=1 (flag 0x200): v170's core 3 for all.
+            Result boostPlace(Handle h, int kind)
+            {
+                if (celosia_thread_flags.load(std::memory_order_acquire) & 0x200)
+                    return (kind == kMain || kind == kBuild || kind == kDma) ? 0 : svcSetThreadCoreMask(h, 3, 1u << 3);
+                const s32 ideal = (kind == kMain || kind == kWorker || kind == kBuild || kind == kDma) ? 2 : 3;
+                const Result r = svcSetThreadCoreMask(h, ideal, 0xCu);
+                return R_SUCCEEDED(r) ? r : svcSetThreadCoreMask(h, 3, 1u << 3);
+            }
+            void note(int kind)
+            {
+                Noted n{threadGetCurHandle(), kind, -1, 0};
+                if (R_FAILED(svcGetThreadCoreMask(&n.core, &n.mask, n.handle)))
+                    return;
+                std::lock_guard<std::mutex> lock(g_notedMutex);
+                for (auto &o : g_noted)
+                    if (o.handle == n.handle) { o = n; return; }
+                g_noted.push_back(n);
+                if (g_boostOn && boosted(kind))
+                    boostPlace(n.handle, kind);
+            }
+        }
+        bool core3Allowed()
+        {
+            u64 allowed = 0;
+            return R_SUCCEEDED(svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && (allowed & 8u);
+        }
+        void noteForBoost() { note(-1); }
+        // v171: where the noted threads ran (Horizon's per-core run time of each thread, svcGetInfo ThreadTickCount),
+        // summed by kind, every ~10 s: "[cores171] boost off | worker 0.0 0.0 12.3 0.0 ..." (ms per core 0..3 in the
+        // window). Shows whether any game thread runs on core 3 with the boost off (the system's own core).
+        void coreLog171()
+        {
+            static const char *const kNames171[kKinds] = {"game", "worker", "render", "build", "audio", "main", "loader", "recorder", "log", "dma", "lane", "offload", "guest"};
+            static uint64_t calls = 0, lastTick = 0;
+            static std::vector<std::array<u64, 4>> last;
+            if (++calls % 600u != 0u)
+                return;
+            const u64 freq = armGetSystemTickFreq(), now = armGetSystemTick();
+            double ms[kKinds + 1][4] = {};
+            last.resize(g_noted.size());
+            for (size_t i = 0; i < g_noted.size(); ++i)
+            {
+                const int k = g_noted[i].kind < 0 ? kKinds : g_noted[i].kind;
+                for (int c = 0; c < 4; ++c)
+                {
+                    u64 t = 0;
+                    if (R_FAILED(svcGetInfo(&t, InfoType_ThreadTickCount, g_noted[i].handle, static_cast<u64>(c))))
+                        continue;
+                    if (lastTick && t >= last[i][c])
+                        ms[k][c] += double(t - last[i][c]) * 1000.0 / double(freq);
+                    last[i][c] = t;
+                }
+            }
+            if (lastTick)
+            {
+                char line[768];
+                int at = std::snprintf(line, sizeof(line), "[cores171] boost %s, %.1f s |", g_boostOn ? "on" : "off", double(now - lastTick) / double(freq));
+                for (int k = 0; k <= kKinds && at < int(sizeof(line)) - 64; ++k)
+                    if (ms[k][0] + ms[k][1] + ms[k][2] + ms[k][3] > 0.0)
+                        at += std::snprintf(line + at, sizeof(line) - at, " %s %.0f/%.0f/%.0f/%.0f", k == kKinds ? "noted" : kNames171[k], ms[k][0], ms[k][1], ms[k][2], ms[k][3]);
+                std::fprintf(stderr, "%s\n", line);
+            }
+            lastTick = now;
+        }
+        void setBoost4(bool on)
+        {
+            on = on && core3Allowed();
+            std::lock_guard<std::mutex> lock(g_notedMutex);
+            coreLog171();
+            if (on == g_boostOn)
+                return;
+            g_boostOn = on;
+            int moved = 0, failed = 0;
+            for (const auto &n : g_noted)
+            {
+                if (!boosted(n.kind))
+                    continue;
+                const Result r = on ? boostPlace(n.handle, n.kind) : svcSetThreadCoreMask(n.handle, n.core, n.mask);
+                ++(R_SUCCEEDED(r) ? moved : failed);
+            }
+            std::fprintf(stderr, "[boost4] %s: %d threads moved (%s), %d failed, %zu noted\n", on ? "on" : "off", moved,
+                         on ? ((celosia_thread_flags.load(std::memory_order_acquire) & 0x200) ? "to core 3" : "v170b: cores 2-3 shared")
+                            : "back", failed, g_noted.size());
+        }
         void place(Kind kind)
         {
-            if (kind == kGame || kind == kRender || kind == kMain)
+            // v170a: flush-to-zero (FPCR.FZ) on the threads that run guest code, the PS2's own denormal rule:
+            // the Vita's clamp-free chains (decomp_collision / skeleton / layout, ps2VuOperand) are exact under it.
+            // The game thread, tex64's offload and the guest worker also set it (ps2SetEeFloatingPointMode); the
+            // hook worker and the lane had not.
+            // CELOSIA_DIAG_NO_FZ170=1 (flag 0x100): left off.
+            if (false) // v170b: v170a's FPCR.FZ on the helper threads reverted (the Vita chains are off on the Switch)
+            {
+                uint64_t fpcr;
+                __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+                fpcr |= 1ull << 24;
+                __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+            }
+            if (kind == kMain)
+            {
+                note(kMain); // v170b: noted for the boost (its own place unchanged)
                 return;
+            }
+            if (kind == kGame || kind == kRender)
+                return;
+            struct NoteAfter { Kind k; ~NoteAfter() { note(k); } } noteAfter{kind}; // v170: after its placement
             // No getenv/stdio here: helper threads call this first thing, while other threads write the
             // log (stderr on the SD card is not safe to share). main.cpp sets the flags before any thread.
             const int flags = celosia_thread_flags.load(std::memory_order_acquire);
@@ -1655,6 +2108,9 @@ namespace native_renderer
         }
 #else
         void place(Kind) {}
+        void noteForBoost() {}
+        void setBoost4(bool) {}
+        bool core3Allowed() { return false; }
 #endif
         void setKindPriority(Kind, int) {}
         void sample() {}
@@ -2612,6 +3068,53 @@ namespace native_renderer
         ++c.texUploads;
         c.texBytes += static_cast<uint64_t>(width) * height * 4u;
     }
+    bool uploadCompressedTexture(uint64_t id, const CompressedTexture &texture)
+    {
+        RaceScope race("uploadCompressedTexture");
+        // The scene recorder keeps RGBA sources only: there the PS2 texture is used.
+        if (native_recorder::active() || !backend())
+        {
+            static int logged = 0;
+            if (logged++ < 4)
+                std::fprintf(stderr, "[texpack] upload refused: %s\n",native_recorder::active() ? "scene recorder on" : "no backend");
+            return false;
+        }
+        return g_backend->uploadCompressed(id, texture);
+    }
+    bool startWorkerThread(void (*entry)(void *), void *argument, size_t stackBytes)
+    {
+#if defined(__SWITCH__)
+        auto *thread = new Thread{}; // kept for the process's life (detached)
+        if (R_FAILED(threadCreate(thread, entry, argument, nullptr, (stackBytes + 0xFFFu) & ~size_t(0xFFFu), 0x30, -2)))
+        {
+            delete thread;
+            return false;
+        }
+        if (R_FAILED(threadStart(thread)))
+        {
+            threadClose(thread);
+            delete thread;
+            return false;
+        }
+        return true;
+#else
+        try
+        {
+            std::thread([entry, argument] { entry(argument); }).detach();
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+#endif
+    }
+    void dropTexture(uint64_t id)
+    {
+        RaceScope race("dropTexture");
+        if (backend())
+            g_backend->dropTexture(id);
+    }
     // requestDrawDump: 1 waiting for a frame start, 2 recording that frame.
     int g_dumpState = 0;
     std::string g_dumpPath;
@@ -3016,4 +3519,10 @@ namespace native_renderer
         // Not backend(): the presenting thread must not create it.
         return g_backend && g_backend->latestFrame(rgba, width, height);
     }
+    void photoTape(bool on)
+    {
+        if (g_photoTape)
+            g_photoTape->arm(on);
+    }
+    bool photoReplay(const float correction[16]) { return g_photoTape && g_photoTape->replay(correction); }
 }

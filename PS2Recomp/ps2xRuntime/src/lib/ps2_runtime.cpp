@@ -3077,7 +3077,7 @@ void PS2Runtime::run()
     celosia::native::ProgressMonitor progressMonitor([&]{
         using namespace native_renderer::detail::deko;
         const auto since=renderSince.load(std::memory_order_acquire),now=progressClock();
-        if(auto *file=std::fopen("sdmc:/switch/celosia-native-boot/render-progress.txt","w")){
+        if(auto *file=std::fopen("sdmc:/switch/celosia_nx/render-progress.txt","w")){
             std::fprintf(file,"host_phase=%s\nhost_steps=%llu\ngame_phase=%s\nphase=%s\nstagnant_ms=%llu\nprocess_seconds=%.3f\npc=0x%x\nra=0x%x\n",
                 hostPhase.load(),static_cast<unsigned long long>(hostSteps.load()),gamePhase.load(),
                 renderPhaseName(renderPhase.load(std::memory_order_relaxed)),

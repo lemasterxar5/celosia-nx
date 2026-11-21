@@ -1,0 +1,880 @@
+// v171: first-person camera (Switch menu: Menu > First person). The game's own camera keeps running unchanged
+// (its springs, collision avoidance); only while the view is built from it, the main camera's position is
+// Wander's eye: update_camera_obj (0x1162e30, the camera object's view matrix) and update_camera_context
+// (0x1160570, the context's position / world->view used by culling and the renderer) run with the eye in
+// camera_obj +0x1E0 and the game's values are put back right after, so nothing the camera system reads next
+// frame changes.
+// The eye: the player's layout class centre (+0x134 -> position) raised along the camera's up vector (+0x200) by
+// CELOSIA_FP_EYE x the class's bounding radius (collision DB +0x2C x the class scale +0x90; default 0.9) and
+// moved forward (the view direction flattened) by CELOSIA_FP_FWD x the radius (default 0.2): in front of the face,
+// in the model's own units. Off (or anything unreadable): the recompiled functions alone, as before.
+// v171b (user: weapons visible, a 100 % free camera, the right stick inverted, gameplay only):
+//  - gameplay only: the game turns its near-model hiding (0x0118BFD4, SetDisplayModelNearClippingSwitch) off for
+//    every demo (demoManBootRequest) and back on at its end (demoManEnd); the value the game asked for is kept
+//    here (the setter wrapped) and the eye applies only while it is on (no demo);
+//  - while the eye applies, that hiding is off (models near the camera drawn: the sword, the bow, Wander's body);
+//    the game's value is written back as soon as first person stops (menu off or a demo);
+//  - the view direction is the free camera's own (yaw / pitch about the world axis nearest the camera's up, from
+//    the right stick, inverted: CELOSIA_FP_INVX / CELOSIA_FP_INVY = 0 for not, CELOSIA_FP_HAND = -1 for the other
+//    handedness); the game gets no right stick and the left stick turned by the view's offset from the game's
+//    camera (raylib_input_audio.cpp), so the walk follows the view.
+#include "sotc_decomp.h"
+
+#include "ps2_runtime_macros.h"
+#include "runtime/ps2_memory.h"
+
+#if defined(__SWITCH__)
+#include <switch.h>
+#include "../../PS2Recomp/ps2xRuntime/platform/switch/hybrid/live_settings.hpp"
+#endif
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+
+namespace fp171
+{
+    using sotc_decomp::callGuest;
+    using sotc_decomp::returnTo;
+
+    constexpr uint32_t kUpdateCameraObj = 0x01162E30u, kUpdateCameraContext = 0x01160570u;
+    constexpr uint32_t kMainCameraObj = 0x0141D390u; // get_main_cameraman_camera_obj
+    constexpr uint32_t kPlayerObj = 0x01343410u;     // GAMEUTIL_get_player_obj
+    constexpr uint32_t kLayoutClass = 0x010F1A20u;   // GetLayoutClass (a0 object -> v0 class)
+    constexpr uint32_t kPos = 0x1E0u, kDir = 0x1F0u, kUp = 0x200u;
+    constexpr uint32_t kNearSwitch = 0x0118BFD4u, kClipSkin = 0x01098450u;
+
+    inline bool ok(uint32_t a, uint32_t bytes = 16u) { return a >= 0x100000u && a + bytes <= PS2_RAM_SIZE; }
+    inline uint32_t u32(const uint8_t *r, uint32_t a) { uint32_t v; std::memcpy(&v, r + a, 4); return v; }
+    inline float f32(const uint8_t *r, uint32_t a) { float v; std::memcpy(&v, r + a, 4); return v; }
+
+    bool on()
+    {
+#if defined(__SWITCH__)
+        return celosia::live::settings().firstPerson.load(std::memory_order_relaxed);
+#else
+        return false;
+#endif
+    }
+    float knob(const char *name, float fallback)
+    {
+        const char *e = std::getenv(name);
+        if (!e && std::strncmp(name, "CELOSIA_", 8) == 0)
+        {
+            // v171m: diag-env.txt only passes CELOSIA_DIAG_* keys: CELOSIA_X read as CELOSIA_DIAG_X too
+            char diag[96];
+            std::snprintf(diag, sizeof(diag), "CELOSIA_DIAG_%s", name + 8);
+            e = std::getenv(diag);
+        }
+        if (!e)
+            return fallback;
+        const float v = std::strtof(e, nullptr);
+        return std::isfinite(v) ? v : fallback;
+    }
+
+    // A guest getter called as a jal would (its frame below ours); the whole context put back after it, only v0 kept.
+    uint32_t guestCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t target, uint32_t a0, uint32_t ra)
+    {
+        R5900Context saved;
+        std::memcpy(&saved, ctx, sizeof(saved));
+        SET_GPR_U32(ctx, 4, a0);
+        callGuest(rdram, ctx, runtime, target, ra, GPR_U32(ctx, 29) - 0x80u);
+        const uint32_t v0 = GPR_U32(ctx, 2);
+        std::memcpy(ctx, &saved, sizeof(saved));
+        return v0;
+    }
+
+    // v171b: the last player object and its bounding radius (the body's facing, the near plane).
+    std::atomic<uint32_t> g_lastPlayer{0};
+    std::atomic<float> g_lastRadius{0.0f};
+    float g_lastCentre[3] = {0.0f, 0.0f, 0.0f};
+    float g_lastUp[3] = {0.0f, 1.0f, 0.0f};
+    bool g_lastIsMain = true;
+
+    // The eye for camera object `obj` (true: written to `eye`), only for the main camera.
+    bool eyeFor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t obj, uint32_t ra, float eye[3])
+    {
+        if (!ok(obj + kUp))
+            return false;
+        // v171n: a camera other than the main one (the bow's aim camera: user, flashes of third person while aiming)
+        // takes the eye too when it is near the player (CELOSIA_FP_ANYCAM x the radius, default 30; 0: main only)
+        static const float anyCam = knob("CELOSIA_FP_ANYCAM", 30.0f);
+        const uint32_t mainObj = guestCall(rdram, ctx, runtime, kMainCameraObj, 0u, ra);
+        const bool isMain = mainObj == obj;
+        if (!isMain && anyCam <= 0.0f)
+            return false;
+        const uint32_t player = guestCall(rdram, ctx, runtime, kPlayerObj, 0u, ra);
+        if (!ok(player, 0x40u))
+            return false;
+        const uint32_t cls = guestCall(rdram, ctx, runtime, kLayoutClass, player, ra);
+        if (!ok(cls, 0x200u))
+            return false;
+        const uint32_t centre = u32(rdram, cls + 0x134u), rec = u32(rdram, cls + 0x184u);
+        if (!ok(centre) || !ok(rec + 0x20u, 4u))
+            return false;
+        const uint32_t db = u32(rdram, rec + 0x20u);
+        if (!ok(db + 0x2Cu, 4u))
+            return false;
+        const float radius = f32(rdram, db + 0x2Cu) * f32(rdram, cls + 0x90u);
+        if (!std::isfinite(radius) || radius <= 0.0f || radius > 1e5f)
+            return false;
+        g_lastPlayer.store(player, std::memory_order_relaxed);
+        g_lastRadius.store(radius, std::memory_order_relaxed);
+        float c[3], d[3], up[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            c[i] = f32(rdram, centre + 4u * i);
+            d[i] = f32(rdram, obj + kDir + 4u * i);
+            up[i] = f32(rdram, obj + kUp + 4u * i);
+        }
+        const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+        if (!std::isfinite(ul) || ul < 1e-6f || !std::isfinite(c[0] + c[1] + c[2] + d[0] + d[1] + d[2]))
+            return false;
+        for (float &v : up)
+            v /= ul;
+        if (!isMain)
+        {
+            float p[3];
+            for (int i = 0; i < 3; ++i)
+                p[i] = f32(rdram, obj + kPos + 4u * i) - c[i];
+            const float dist = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            static uint32_t seen = 0;
+            const bool take = std::isfinite(dist) && dist < anyCam * radius;
+            if (seen++ % 120u == 0u)
+                std::fprintf(stderr, "[fp171n] camera %08x is not the main one (%08x): %.2f from the player (radius %.3f) -> %s\n", obj, mainObj, dist, radius,
+                             take ? "eye applied" : "left alone");
+            if (!take)
+                return false;
+        }
+        g_lastIsMain = isMain;
+        std::memcpy(g_lastCentre, c, 12);
+        std::memcpy(g_lastUp, up, 12);
+        const float du = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+        float f[3] = {d[0] - du * up[0], d[1] - du * up[1], d[2] - du * up[2]};
+        const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        if (fl > 1e-6f)
+            for (float &v : f)
+                v /= fl;
+        else
+            f[0] = f[1] = f[2] = 0.0f;
+        static const float eyeK = knob("CELOSIA_FP_EYE", 0.9f), fwdK = knob("CELOSIA_FP_FWD", 0.2f);
+        for (int i = 0; i < 3; ++i)
+            eye[i] = c[i] + up[i] * eyeK * radius + f[i] * fwdK * radius;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            std::fprintf(stderr, "[fp171] on: centre %.3f %.3f %.3f radius %.3f up %.2f %.2f %.2f eye %.3f %.3f %.3f\n", c[0], c[1], c[2], radius,
+                         up[0], up[1], up[2], eye[0], eye[1], eye[2]);
+        }
+        return true;
+    }
+
+#if defined(__SWITCH__)
+    // v171b: the title screen (its background is a gameplay scene with the main camera and the near switch on): the
+    // flows' script threads end each frame with scrRun -> the frame end (decomp_scriptvm), whose ra is inside the
+    // flow; the title's flows (opening, title menu, title demo, attract demo, ending) noted with the time.
+    std::atomic<uint64_t> g_titleTick{0};
+    uint64_t nowTick() { return armGetSystemTick(); }
+    bool titleRecent()
+    {
+        const uint64_t t = g_titleTick.load(std::memory_order_relaxed);
+        return t != 0 && nowTick() - t < armGetSystemTickFreq() / 2u;
+    }
+#endif
+    void noteFlow(uint32_t ra)
+    {
+#if defined(__SWITCH__)
+        struct Range { uint32_t from, to; };
+        static constexpr Range kTitle[] = {
+            {0x013568C8u, 0x01357648u}, // st_opflow (the opening / title flow)
+            {0x01403558u, 0x01403908u}, // titlemenu
+            {0x01402FE0u, 0x014033F0u}, // demo_title
+            {0x013487E8u, 0x013488C0u}, // st_activedemoflow (the attract demo)
+            {0x0134CB60u, 0x0134D628u}, // st_endingflow
+        };
+        // v171d diagnosis: the first 48 distinct return addresses seen (which flows end their frames here)
+        {
+            static uint32_t seen[48];
+            static int count = 0;
+            if (count < 48)
+            {
+                bool known = false;
+                for (int i = 0; i < count; ++i)
+                    known = known || seen[i] == ra;
+                if (!known)
+                {
+                    seen[count++] = ra;
+                    std::fprintf(stderr, "[fp171d] flow ra %08x (new, %d)\n", ra, count);
+                }
+            }
+        }
+        for (const Range &r : kTitle)
+            if (ra >= r.from && ra < r.to)
+            {
+                if (g_titleTick.load(std::memory_order_relaxed) == 0)
+                    std::fprintf(stderr, "[fp171d] title flow seen (ra %08x)\n", ra);
+                g_titleTick.store(nowTick(), std::memory_order_relaxed);
+                return;
+            }
+#else
+        (void)ra;
+#endif
+    }
+#if defined(__SWITCH__)
+    // v171f: the game's near-model hiding is left as the game sets it (it hides Wander's skinned model near the eye: the
+    // head and the hair are not drawn), only rigid models (the sword, the bow) are drawn near the eye while first person
+    // applies (decomp_walk's modelClipSolid: solidNearOff). Gameplay = the game's switch on (it is off in every demo).
+    // v171g: the game's near-model switch is never written (holding it broke the gameplay check: first person never
+    // came on). Gameplay = the game's switch on (off in every demo). While first person applies, only the clip
+    // functions ignore it: modelClipSkin here (clipSkin), modelClipSolid in decomp_walk (solidNearOff): no model near
+    // the eye is hidden; the head is cut from Wander's own bones (headCut, sotc_native.cpp).
+    std::atomic<bool> g_applied{false};
+    int gameNear(const uint8_t *rdram) { return u32(rdram, kNearSwitch) != 0u ? 1 : 0; }
+
+    // The free camera (per frame, from update_camera_obj): yaw / pitch about the world axis nearest the camera's up.
+    struct Free
+    {
+        bool live = false;
+        uint64_t lastTick = 0;
+        float yaw = 0.0f, pitch = 0.0f;
+        float dir[3]{}, up[3]{};
+    } g_free;
+
+    void stepFree(uint8_t *rdram, uint32_t obj)
+    {
+        float d[3], up[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            d[i] = f32(rdram, obj + kDir + 4u * i);
+            up[i] = f32(rdram, obj + kUp + 4u * i);
+        }
+        // v171e: the world up axis kept while first person runs (v171d's log: a tilted camera up picked x for a
+        // frame, the yaw's frame turned with it: a jump of the view)
+        static int keptK = -1;
+        static float keptSign = 1.0f;
+        if (!g_free.live || keptK < 0)
+        {
+            int kk = 0;
+            for (int i = 1; i < 3; ++i)
+                if (std::fabs(up[i]) > std::fabs(up[kk]))
+                    kk = i;
+            keptK = kk;
+            keptSign = up[kk] < 0.0f ? -1.0f : 1.0f;
+        }
+        const int k = keptK;
+        float u[3] = {0.0f, 0.0f, 0.0f};
+        u[k] = keptSign;
+        // e1: the next world axis, e2 = u x e1.
+        float e1[3] = {0.0f, 0.0f, 0.0f};
+        e1[(k + 1) % 3] = 1.0f;
+        const float e2[3] = {u[1] * e1[2] - u[2] * e1[1], u[2] * e1[0] - u[0] * e1[2], u[0] * e1[1] - u[1] * e1[0]};
+        const float a = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2], b = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+        const float cu = d[0] * u[0] + d[1] * u[1] + d[2] * u[2];
+        const float gYaw = std::atan2(b, a), gPitch = std::atan2(cu, std::sqrt(a * a + b * b));
+        const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        const uint64_t now = armGetSystemTick(), freq = armGetSystemTickFreq();
+        if (!g_free.live || now - g_free.lastTick > freq / 4u)
+        {
+            g_free.yaw = gYaw; // the view starts where the game's camera looks
+            g_free.pitch = gPitch;
+            g_free.lastTick = now;
+        }
+        float dt = float(now - g_free.lastTick) / float(freq);
+        if (dt > 0.1f)
+            dt = 0.1f;
+        g_free.lastTick = now;
+        g_free.live = true;
+        static const float invX = knob("CELOSIA_FP_INVX", 1.0f) != 0.0f ? -1.0f : 1.0f;
+        static const float invY = knob("CELOSIA_FP_INVY", 1.0f) != 0.0f ? -1.0f : 1.0f;
+        static const float hand = knob("CELOSIA_FP_HAND", 1.0f) < 0.0f ? -1.0f : 1.0f;
+        static const float rate = knob("CELOSIA_FP_RATE", 2.6f); // radians a second at full stick
+        auto &live = celosia::live::settings();
+        auto dead = [](float v) { return std::fabs(v) < 0.12f ? 0.0f : (v - std::copysign(0.12f, v)) / 0.88f; };
+        const float lx = dead(live.fpLookX.load(std::memory_order_relaxed)), ly = dead(live.fpLookY.load(std::memory_order_relaxed));
+        g_free.yaw -= invX * hand * lx * rate * dt;
+        g_free.pitch += invY * ly * rate * 0.7f * dt;
+        // v171e: the view is not tied to the body (user: the walk follows the camera, not the body); when it is more than
+        // CELOSIA_FP_TURN degrees (default 90) from the body's facing, the body turns to the view: the character class's
+        // control quaternion (player + 0x90 + 0x470, GetCharacterClassControlFrontDirection's) set to the view's yaw about
+        // the up axis, the game's own turn towards it (its control front) doing the rest.
+        const float lim = 1.40f; // about 80 degrees up or down
+        g_free.pitch = std::fmax(-lim, std::fmin(lim, g_free.pitch));
+        if (g_free.yaw > 3.14159265f)
+            g_free.yaw -= 6.28318531f;
+        if (g_free.yaw < -3.14159265f)
+            g_free.yaw += 6.28318531f;
+        const float cp = std::cos(g_free.pitch), sp = std::sin(g_free.pitch), cy = std::cos(g_free.yaw), sy = std::sin(g_free.yaw);
+        const float len = dl > 1e-6f && std::isfinite(dl) ? dl : 1.0f;
+        for (int i = 0; i < 3; ++i)
+            g_free.dir[i] = (cp * (cy * e1[i] + sy * e2[i]) + sp * u[i]) * len;
+        // The up the view is built with: the world axis, the camera's up length.
+        const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+        for (int i = 0; i < 3; ++i)
+            g_free.up[i] = u[i] * (ul > 1e-6f && std::isfinite(ul) ? ul : 1.0f);
+        // The walk: the stick turned by the view's yaw offset from the game's (raylib_input_audio.cpp).
+        const float delta = std::remainder(g_free.yaw - gYaw, 6.28318531f);
+        // v171e: which way the game turns the stick (moveHand) checked from the walk itself: with the stick held straight
+        // forward (or back) and the view turned 0.3-1.2 rad from the game's camera, Wander's own movement (the layout
+        // centre, every 0.2 s) must go along the view; along the mirror (the game's yaw minus the offset) instead, three
+        // times in a row: the other hand from then on.
+        static float moveHand = hand;
+        static const bool rotateCheck = knob("CELOSIA_FP_ROTATE", 0.0f) != 0.0f;
+        static float g_bodyYaw = 0.0f;
+        static bool g_bodyKnown = false;
+        if (!g_free.live)
+            g_bodyKnown = false;
+        {
+            static float prevC[3] = {0.0f, 0.0f, 0.0f};
+            static uint64_t prevT = 0;
+            static int votes = 0;
+            const float sx = live.fpStickX.load(std::memory_order_relaxed), sy = live.fpStickY.load(std::memory_order_relaxed);
+            float c[3];
+            std::memcpy(c, g_lastCentre, 12);
+            if (prevT == 0 || now - prevT > freq / 2u)
+            {
+                std::memcpy(prevC, c, 12);
+                prevT = now;
+            }
+            else if (now - prevT >= freq / 5u)
+            {
+                const float m[3] = {c[0] - prevC[0], c[1] - prevC[1], c[2] - prevC[2]};
+                const float ma = m[0] * e1[0] + m[1] * e1[1] + m[2] * e1[2], mb = m[0] * e2[0] + m[1] * e2[1] + m[2] * e2[2];
+                const float ad = std::fabs(delta);
+                const float r = g_lastRadius.load(std::memory_order_relaxed);
+                if (std::sqrt(sx * sx + sy * sy) > 0.5f)
+                {
+                    // v171i diagnosis: where the walk goes against the view
+                    static uint32_t walkLogs = 0;
+                    if (walkLogs++ % 3u == 0u)
+                        std::fprintf(stderr, "[fp171i] walk: stick %.2f %.2f, moved %.3f toward yaw %.2f | view %.2f, game camera %.2f, hand %.0f\n", sx, sy,
+                                     std::sqrt(ma * ma + mb * mb), std::atan2(mb, ma), g_free.yaw, gYaw, moveHand);
+                }
+                if (rotateCheck && std::fabs(sy) > 0.7f && std::fabs(sx) < 0.3f && ad > 0.3f && ad < 1.2f && std::sqrt(ma * ma + mb * mb) > 0.05f * r)
+                {
+                    const float mv = std::atan2(mb, ma);
+                    auto off = [](float x) { const float y = std::remainder(x, 3.14159265f); return std::fabs(y); }; // forward or back
+                    const float toView = off(mv - g_free.yaw), toMirror = off(mv - (gYaw - delta));
+                    if (toMirror + 0.25f < toView)
+                        ++votes;
+                    else if (toView + 0.25f < toMirror)
+                        votes = 0;
+                    if (votes >= 3)
+                    {
+                        moveHand = -moveHand;
+                        votes = 0;
+                        std::fprintf(stderr, "[fp171e] walk went along the mirror: stick turning flipped (hand %.0f)\n", moveHand);
+                    }
+                }
+                // v171k: the body's facing as the game leaves it: the way it last walked
+                if (std::sqrt(ma * ma + mb * mb) > 0.05f * r)
+                {
+                    g_bodyYaw = std::remainder(std::atan2(mb, ma) + 3.14159265f, 6.28318531f); // v171m: the walk's yaw is the view's + pi
+                    g_bodyKnown = true;
+                }
+                std::memcpy(prevC, c, 12);
+                prevT = now;
+            }
+            // v171k (user: past 90 degrees to a side the body turns to where the camera looks): the view more than
+            // CELOSIA_FP_TURN degrees from the body with the left stick idle: a light tap of the stick towards the view
+            // (raylib_input_audio.cpp) for CELOSIA_FP_TURN_MS: the game turns Wander there itself (nothing written).
+            static const float turnAt = knob("CELOSIA_FP_TURN", 90.0f) * 0.01745329f;
+            static const float turnMs = knob("CELOSIA_FP_TURN_MS", 180.0f);
+            if (!g_bodyKnown)
+            {
+                g_bodyYaw = gYaw; // the game's camera starts behind Wander, looking where he faces
+                g_bodyKnown = true;
+            }
+            const bool idle = std::fabs(sx) < 0.2f && std::fabs(sy) < 0.2f;
+            if (idle && turnAt > 0.0f && now > live.fpTurnUntil.load(std::memory_order_relaxed) &&
+                std::fabs(std::remainder(g_free.yaw - g_bodyYaw, 6.28318531f)) > turnAt)
+            {
+                std::fprintf(stderr, "[fp171k] body turn: body %.2f, view %.2f -> tap towards the view\n", g_bodyYaw, g_free.yaw);
+                live.fpTurnUntil.store(now + static_cast<uint64_t>(turnMs * 0.001f * float(freq)), std::memory_order_relaxed);
+                g_bodyYaw = g_free.yaw;
+            }
+        }
+        // v171m: the game maps the stick with the camera it is given (the view): the walk already follows the view
+        // (v171l's log: the stick turned on top of it walked ~80 degrees off). CELOSIA_FP_ROTATE=1: v171e's turning.
+        static const bool rotate = knob("CELOSIA_FP_ROTATE", 0.0f) != 0.0f;
+        live.fpMoveCos.store(rotate ? std::cos(delta) : 1.0f, std::memory_order_relaxed);
+        live.fpMoveSin.store(rotate ? -moveHand * std::sin(delta) : 0.0f, std::memory_order_relaxed);
+        live.fpStampTick.store(now, std::memory_order_release);
+        static int logs = 0;
+        if (logs < 3 || (++logs % 60) == 0) // v171d: every 60 frames (diagnosis while first person is tuned)
+        {
+            if (logs < 3)
+                ++logs;
+            std::fprintf(stderr, "[fp171b] game yaw %.3f pitch %.3f | free yaw %.3f pitch %.3f | stick %.2f %.2f | up axis %d%c\n", gYaw, gPitch,
+                         g_free.yaw, g_free.pitch, lx, ly, k, u[k] < 0 ? '-' : '+');
+        }
+    }
+#endif
+
+    // v171b: the last eye applied (a frame whose eye cannot be built, or a call on the worker lane, uses it while it is
+    // under a quarter second old: no third-person frame between first-person ones).
+    struct Last
+    {
+        std::atomic<uint64_t> tick{0};
+        std::atomic<uint32_t> obj{0};
+        float eye[3]{};
+    } g_last;
+
+#if defined(__SWITCH__)
+    // v171n (user: the camera glued to the forehead, the head never in view): the view the game built with the eye
+    // (world -> camera space: the bone palettes' space) is found in the camera object / context the update wrote it to
+    // (a 4x4 block whose rotation is orthonormal and that takes the eye to the origin; or its inverse); the palettes'
+    // head bone, read where they are read (sotc_native.cpp, the same moment as the guest's view), goes back to the
+    // world with it: the next eye is that head's forehead.
+    uint8_t *g_rdram = nullptr;
+    std::atomic<uint32_t> g_viewAddr{0}; // the block's address | layout (low 2 bits: 0 column-major, 1 row-major, 2/3 their inverse)
+    float g_head[3]{};
+    std::atomic<uint64_t> g_headTick{0};
+
+    bool viewAt(const uint8_t *rdram, uint32_t a, uint32_t layout, const float *eye, float R[9], float T[3])
+    {
+        if (!ok(a, 64u))
+            return false;
+        float M[16];
+        for (int i = 0; i < 16; ++i)
+            M[i] = f32(rdram, a + 4u * i);
+        const bool rowMajor = (layout & 1u) != 0u;
+        for (int i = 0; i < 3; ++i)
+        {
+            for (int j = 0; j < 3; ++j)
+                R[3 * i + j] = rowMajor ? M[4 * i + j] : M[4 * j + i];
+            T[i] = rowMajor ? M[4 * i + 3] : M[12 + i];
+        }
+        for (int i = 0; i < 3; ++i)
+            for (int j = i; j < 3; ++j)
+            {
+                const float d = R[3 * i] * R[3 * j] + R[3 * i + 1] * R[3 * j + 1] + R[3 * i + 2] * R[3 * j + 2];
+                if (!std::isfinite(d) || std::fabs(d - (i == j ? 1.0f : 0.0f)) > 0.02f)
+                    return false;
+            }
+        if (layout >= 2u)
+        {
+            // camera -> world: the translation is the eye; turned into world -> camera (R transposed, -R^T T)
+            float Rt[9], Tn[3];
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    Rt[3 * i + j] = R[3 * j + i];
+            for (int i = 0; i < 3; ++i)
+                Tn[i] = -(Rt[3 * i] * T[0] + Rt[3 * i + 1] * T[1] + Rt[3 * i + 2] * T[2]);
+            std::memcpy(R, Rt, sizeof(Rt));
+            std::memcpy(T, Tn, sizeof(Tn));
+        }
+        if (!eye)
+            return true;
+        const float el = std::sqrt(eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]);
+        float e2 = 0.0f;
+        for (int i = 0; i < 3; ++i)
+        {
+            const float e = R[3 * i] * eye[0] + R[3 * i + 1] * eye[1] + R[3 * i + 2] * eye[2] + T[i];
+            e2 += e * e;
+        }
+        return std::isfinite(e2) && std::sqrt(e2) < 1e-3f * (1.0f + el) + 0.01f;
+    }
+
+    // After the update wrote its view with `eye`: the block found once in [base, base + 0x400) and checked every call.
+    void findView(const uint8_t *rdram, uint32_t base, const float eye[3])
+    {
+        float R[9], T[3];
+        const uint32_t cached = g_viewAddr.load(std::memory_order_relaxed);
+        if (cached && cached >= base && cached < base + 0x400u && viewAt(rdram, cached & ~3u, cached & 3u, eye, R, T))
+            return;
+        for (uint32_t off = 0; off + 64u <= 0x400u; off += 16u)
+            for (uint32_t layout = 0; layout < 4u; ++layout)
+                if (viewAt(rdram, base + off, layout, eye, R, T))
+                {
+                    if ((cached & ~3u) != base + off || (cached & 3u) != layout)
+                        std::fprintf(stderr, "[fp171n] the view (world -> camera) at %08x + %03x, layout %u (%s)\n", base, off, layout,
+                                     layout == 0 ? "column-major" : layout == 1 ? "row-major" : "inverse");
+                    g_viewAddr.store((base + off) | layout, std::memory_order_relaxed);
+                    return;
+                }
+    }
+
+    // Wander's head bone (camera space, the palette as the guest has it now) back to the world; upCam: the world up in
+    // camera space (for the hair bones above it). False: no view known.
+    // v171q: the view's forward (world) from the context's projection (+0x40): the depth (w) row's main axis, its sign
+    float g_face[3]{};
+    std::atomic<bool> g_faceOk{false};
+    std::atomic<uint32_t> g_ctxBase{0};
+    std::atomic<uint64_t> g_kickTick{0};
+    float g_headLin[9]{}; // v171r: the head bone's linear part in the world (columns)
+    bool noteHeadImpl(const float *m, float upCam[3], bool atKick)
+    {
+        const float *t = m + 12;
+        const uint32_t v = g_viewAddr.load(std::memory_order_relaxed);
+        if (!v || !g_rdram)
+            return false;
+        float R[9], T[3];
+        if (!viewAt(g_rdram, v & ~3u, v & 3u, nullptr, R, T))
+            return false;
+        for (int i = 0; i < 3; ++i)
+            upCam[i] = R[3 * i] * g_lastUp[0] + R[3 * i + 1] * g_lastUp[1] + R[3 * i + 2] * g_lastUp[2];
+        // v171q (user: the eye jumped between two places): the head from the kick's palettes (read with the view at the
+        // same moment) only; the draw's (a job, maybe another frame's view) only when no kick noted it this quarter second
+        const uint64_t now = armGetSystemTick();
+        if (atKick)
+            g_kickTick.store(now, std::memory_order_relaxed);
+        else if (now - g_kickTick.load(std::memory_order_relaxed) < armGetSystemTickFreq() / 4u)
+            return true;
+        if (const uint32_t cb = g_ctxBase.load(std::memory_order_relaxed); cb && ok(cb + 0x40u, 64u))
+        {
+            float P[16];
+            for (int i = 0; i < 16; ++i)
+                P[i] = f32(g_rdram, cb + 0x40u + 4u * i);
+            // the w row: column-major (P[3], P[7], P[11]) or row-major (P[12], P[13], P[14]); the one with a single main axis
+            const float cand[2][3] = {{P[3], P[7], P[11]}, {P[12], P[13], P[14]}};
+            for (int c = 0; c < 2; ++c)
+            {
+                const float *w = cand[c];
+                const float l = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+                int k = 0;
+                for (int i = 1; i < 3; ++i)
+                    if (std::fabs(w[i]) > std::fabs(w[k]))
+                        k = i;
+                if (!(l > 1e-6f) || std::fabs(w[k]) < 0.98f * l)
+                    continue;
+                const float sgn = w[k] > 0.0f ? 1.0f : -1.0f;
+                float f[3];
+                for (int i = 0; i < 3; ++i)
+                    f[i] = sgn * R[3 * k + i];
+                std::memcpy(g_face, f, 12);
+                static bool logged = false;
+                if (!logged)
+                {
+                    logged = true;
+                    const float dd = f[0] * g_free.dir[0] + f[1] * g_free.dir[1] + f[2] * g_free.dir[2];
+                    std::fprintf(stderr, "[fp171q] view forward from the projection (%s, axis %d, sign %+.0f): %.2f %.2f %.2f; . camera dir %.2f\n",
+                                 c ? "row-major" : "column-major", k, sgn, f[0], f[1], f[2], dd);
+                }
+                g_faceOk.store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
+        float w[3];
+        for (int i = 0; i < 3; ++i)
+            w[i] = R[i] * (t[0] - T[0]) + R[3 + i] * (t[1] - T[1]) + R[6 + i] * (t[2] - T[2]);
+        if (!std::isfinite(w[0] + w[1] + w[2]))
+            return false;
+        // v171r: the bone's axes (camera space columns 0-2) to the world: R^T x column
+        float lin[9];
+        for (int c = 0; c < 3; ++c)
+            for (int i = 0; i < 3; ++i)
+                lin[3 * c + i] = R[i] * m[4 * c] + R[3 + i] * m[4 * c + 1] + R[6 + i] * m[4 * c + 2];
+        if (!std::isfinite(lin[0] + lin[4] + lin[8]))
+            return false;
+        std::memcpy(g_headLin, lin, sizeof(lin));
+        std::memcpy(g_head, w, 12);
+        g_headTick.store(armGetSystemTick(), std::memory_order_release);
+        return true;
+    }
+
+    // The eye at the head's forehead (from the head bone: CELOSIA_FP_FOREUP up, CELOSIA_FP_FOREFWD forward along the
+    // view, x the radius); false: no head this quarter second, or it is not near the eye built the old way (a wrong
+    // view: the old eye kept, logged).
+    bool foreheadEye(float eye[3])
+    {
+        static const bool glue = knob("CELOSIA_FP_GLUE", 1.0f) != 0.0f;
+        const uint64_t t = g_headTick.load(std::memory_order_acquire);
+        if (!glue || t == 0 || armGetSystemTick() - t > armGetSystemTickFreq() / 4u)
+            return false;
+        // v171p (user: v171o's eye at the top back of the head): the camera object's direction points opposite the view
+        // (the walk's yaw is its + pi), so the face is along -dir; lower too
+        // v171r (v171q's log: the projection's forward is +dir; user: still too far back, more so running): 0.5 r ahead
+        static const float upK = knob("CELOSIA_FP_FOREUP", 0.10f), fwdK = -knob("CELOSIA_FP_FOREFWD", 0.50f);
+        const float r = g_lastRadius.load(std::memory_order_relaxed);
+        const float *up = g_lastUp;
+        float f[3] = {0.0f, 0.0f, 0.0f};
+        const bool faceOk = g_faceOk.load(std::memory_order_relaxed);
+        if (faceOk || g_free.live)
+        {
+            // v171q: the view's forward from the projection (no sign guessed); else -dir (v171p)
+            const float *src = faceOk ? g_face : g_free.dir;
+            const float sg = faceOk ? -1.0f : 1.0f; // fwdK is negative (v171p's -dir): the projection's forward is the face
+            const float du = src[0] * up[0] + src[1] * up[1] + src[2] * up[2];
+            for (int i = 0; i < 3; ++i)
+                f[i] = sg * (src[i] - du * up[i]);
+            const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+            for (float &x : f)
+                x = fl > 1e-6f ? x / fl : 0.0f;
+        }
+        float e[3], o[3];
+        for (int i = 0; i < 3; ++i)
+            o[i] = up[i] * upK * r + f[i] * fwdK * r;
+        // v171t (user: v171s's eye at the top, back right of the head): v171r's calibration took the view's forward, not the
+        // face's (the view at the start can look anywhere). The head's own axes instead: its up = the bone axis nearest
+        // the world up (first 30 frames), its face = of the other two the one along Wander's walk (the layout centre's
+        // movement, 40 samples while he moves); then eye = head + up axis x FOREUP r + face axis x FOREFWD r, carried by
+        // the head (its lean when running). Until both are known: the view-based eye above.
+        static const bool inHead = knob("CELOSIA_FP_HEADFRAME", 1.0f) != 0.0f;
+        const float *H = g_headLin;
+        float ax[3][3];
+        bool axesOk = true;
+        for (int c = 0; c < 3; ++c)
+        {
+            const float l = std::sqrt(H[3 * c] * H[3 * c] + H[3 * c + 1] * H[3 * c + 1] + H[3 * c + 2] * H[3 * c + 2]);
+            axesOk = axesOk && std::isfinite(l) && l > 1e-6f;
+            for (int i = 0; i < 3; ++i)
+                ax[c][i] = axesOk ? H[3 * c + i] / l : 0.0f;
+        }
+        static float upAcc[3], faceAcc[3];
+        static int upN = 0, faceN = 0, upAxis = -1, faceAxis = -1;
+        static float upSign = 1.0f, faceSign = 1.0f;
+        static float lastC[3];
+        static bool haveLastC = false;
+        if (inHead && axesOk)
+        {
+            if (upAxis < 0)
+            {
+                for (int c = 0; c < 3; ++c)
+                    upAcc[c] += ax[c][0] * up[0] + ax[c][1] * up[1] + ax[c][2] * up[2];
+                if (++upN >= 30)
+                {
+                    upAxis = 0;
+                    for (int c = 1; c < 3; ++c)
+                        if (std::fabs(upAcc[c]) > std::fabs(upAcc[upAxis]))
+                            upAxis = c;
+                    upSign = upAcc[upAxis] < 0.0f ? -1.0f : 1.0f;
+                    std::fprintf(stderr, "[fp171t] head up axis %d%c (sums %.1f %.1f %.1f over %d frames)\n", upAxis, upSign < 0 ? '-' : '+', upAcc[0], upAcc[1],
+                                 upAcc[2], upN);
+                }
+            }
+            // the walk: the centre's horizontal movement since the last call (Wander faces where he walks)
+            const float *c0 = g_lastCentre;
+            if (haveLastC && faceAxis < 0)
+            {
+                float d[3] = {c0[0] - lastC[0], c0[1] - lastC[1], c0[2] - lastC[2]};
+                const float du = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+                for (int i = 0; i < 3; ++i)
+                    d[i] -= du * up[i];
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (std::isfinite(dl) && dl > 0.02f * r && dl < 2.0f * r)
+                {
+                    for (int c = 0; c < 3; ++c)
+                        faceAcc[c] += (ax[c][0] * d[0] + ax[c][1] * d[1] + ax[c][2] * d[2]) / dl;
+                    if (++faceN >= 40 && upAxis >= 0)
+                    {
+                        int best = -1;
+                        for (int c = 0; c < 3; ++c)
+                            if (c != upAxis && (best < 0 || std::fabs(faceAcc[c]) > std::fabs(faceAcc[best])))
+                                best = c;
+                        faceAxis = best;
+                        faceSign = faceAcc[best] < 0.0f ? -1.0f : 1.0f;
+                        std::fprintf(stderr, "[fp171t] head face axis %d%c (sums %.1f %.1f %.1f over %d steps)\n", faceAxis, faceSign < 0 ? '-' : '+',
+                                     faceAcc[0], faceAcc[1], faceAcc[2], faceN);
+                    }
+                }
+            }
+            std::memcpy(lastC, c0, 12);
+            haveLastC = true;
+            if (upAxis >= 0 && faceAxis >= 0)
+            {
+                static const float hUp = knob("CELOSIA_FP_HEADUP", 0.12f), hFwd = knob("CELOSIA_FP_HEADFWD", 0.30f);
+                for (int i = 0; i < 3; ++i)
+                    o[i] = ax[upAxis][i] * upSign * hUp * r + ax[faceAxis][i] * faceSign * hFwd * r;
+            }
+        }
+        for (int i = 0; i < 3; ++i)
+            e[i] = g_head[i] + o[i];
+        const float dx = e[0] - eye[0], dy = e[1] - eye[1], dz = e[2] - eye[2];
+        const float off = std::sqrt(dx * dx + dy * dy + dz * dz);
+        static uint32_t calls = 0;
+        const bool near = std::isfinite(off) && off < 2.5f * r;
+        if (calls++ % 300u == 0u)
+            std::fprintf(stderr, "[fp171n] forehead eye %.3f %.3f %.3f (head %.3f %.3f %.3f), %.3f from the old eye (radius %.3f) -> %s\n", e[0], e[1], e[2],
+                         g_head[0], g_head[1], g_head[2], off, r, near ? "used" : "too far: old eye");
+        if (!near)
+            return false;
+        std::memcpy(eye, e, 12);
+        return true;
+    }
+#endif
+
+    // Runs the recompiled `fn` with the camera object's position (and the free direction / up) swapped while it runs.
+    void withEye(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t fn, uint32_t obj, bool frame)
+    {
+        float eye[3];
+        const auto original = sotc_decomp::recompiled(fn);
+        if (!original)
+            return;
+#if defined(__SWITCH__)
+        {
+            // v171n diagnosis (user: flashes of third person while aiming the bow): every new (function, camera, a0)
+            // the camera updates run with, logged once (the aim's own camera path, if any)
+            static uint32_t seen[64][3];
+            static uint32_t count = 0;
+            const uint32_t a0 = GPR_U32(ctx, 4);
+            bool known = false;
+            for (uint32_t i = 0; i < count && !known; ++i)
+                known = seen[i][0] == fn && seen[i][1] == obj && seen[i][2] == a0;
+            if (!known && count < 64u && !sotc_decomp::onWorkerLane(runtime))
+            {
+                seen[count][0] = fn, seen[count][1] = obj, seen[count][2] = a0;
+                ++count;
+                std::fprintf(stderr, "[fp171n] camera update %s: camera %08x, a0 %08x, ra %08x (new, %u)\n", frame ? "object" : "context", obj, a0,
+                             GPR_U32(ctx, 31), count);
+            }
+        }
+        auto &live = celosia::live::settings();
+        // gameplay: first person on, the game's near hiding on (off in every demo), no title flow this half second
+        // v171h: an event script running (getNowExecEventScriptObj, 0x1466B0C: the in-engine cinematics keep the near
+        // switch on) is not gameplay either (CELOSIA_FP_EVENT=0: not checked).
+        static const bool checkEvent = knob("CELOSIA_FP_EVENT", 1.0f) != 0.0f;
+        const uint32_t eventObj = u32(rdram, 0x01466B0Cu);
+        const bool fpOn = on(), near = gameNear(rdram) != 0, title = titleRecent(), event = checkEvent && eventObj != 0u;
+        const bool want = fpOn && near && !title && !event;
+        {
+            // v171f diagnosis: every change of first person's state with its reason (the perspective changes)
+            static int lastState = -1;
+            const int state = (fpOn ? 1 : 0) | (near ? 2 : 0) | (title ? 4 : 0) | (event ? 8 : 0);
+            if (state != lastState && !sotc_decomp::onWorkerLane(runtime))
+            {
+                std::fprintf(stderr, "[fp171f] state: menu %d, near switch (gameplay) %d, title flow %d, event script %08x -> first person %s\n", fpOn, near, title, eventObj,
+                             want ? "on" : "off");
+                lastState = state;
+            }
+        }
+        if (!want)
+        {
+            if (!sotc_decomp::onWorkerLane(runtime))
+            {
+                g_free.live = false;
+                g_last.tick.store(0, std::memory_order_relaxed);
+                g_applied.store(false, std::memory_order_relaxed);
+                live.fpNearW.store(0.0f, std::memory_order_relaxed);
+            }
+            return original(rdram, ctx, runtime);
+        }
+        const bool lane = sotc_decomp::onWorkerLane(runtime);
+        bool fresh = !lane && eyeFor(rdram, ctx, runtime, obj, fn, eye);
+        {
+            // v171d diagnosis: how often the eye is fresh / kept / missing (third person) on each path
+            static std::atomic<uint32_t> nFresh{0}, nLane{0}, nFail{0}, nAll{0};
+            (fresh ? nFresh : lane ? nLane : nFail).fetch_add(1, std::memory_order_relaxed);
+            if (nAll.fetch_add(1, std::memory_order_relaxed) % 600u == 599u)
+                std::fprintf(stderr, "[fp171d] eye calls: fresh %u, worker lane %u, not built %u\n", nFresh.load(), nLane.load(), nFail.load());
+        }
+        if (fresh)
+            foreheadEye(eye); // v171n: the eye glued to the head's forehead (the old eye when the head is not known)
+        if (fresh)
+        {
+            std::memcpy(g_last.eye, eye, 12);
+            g_last.obj.store(obj, std::memory_order_relaxed);
+            g_last.tick.store(nowTick(), std::memory_order_release);
+        }
+        else
+        {
+            // the main camera only: the eye kept for the object it was built for
+            const uint64_t t = g_last.tick.load(std::memory_order_acquire);
+            if (t == 0 || nowTick() - t > armGetSystemTickFreq() || g_last.obj.load(std::memory_order_relaxed) != obj) // v171e: 1 s
+            {
+                static uint32_t misses = 0;
+                if (++misses % 30u == 1u)
+                    std::fprintf(stderr, "[fp171f] eye not built for camera %08x (kept eye for %08x, %s): third person this call (%u)\n", obj,
+                                 g_last.obj.load(std::memory_order_relaxed), t == 0 ? "none" : "too old", misses);
+                return original(rdram, ctx, runtime);
+            }
+            std::memcpy(eye, g_last.eye, 12);
+        }
+        if (!g_applied.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[fp171g] first person applied: near-model hiding ignored by the clip functions\n");
+        if (frame && fresh && g_lastIsMain)
+            stepFree(rdram, obj);
+        g_rdram = rdram;
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        uint8_t kept[0x30];
+        std::memcpy(kept, rdram + obj + kPos, 0x30);
+        std::memcpy(rdram + obj + kPos, eye, 12);
+        if (g_free.live)
+        {
+            std::memcpy(rdram + obj + kDir, g_free.dir, 12);
+            std::memcpy(rdram + obj + kUp, g_free.up, 12);
+        }
+        original(rdram, ctx, runtime);
+        if (fresh)
+        {
+            // v171n: the view the update wrote with the eye: the context's (update_camera_context, a0), else the object's
+            const uint32_t v = g_viewAddr.load(std::memory_order_relaxed);
+            // v171q: the context's view only (v171p: the object's and the context's alternated)
+            (void)v;
+            if (!frame)
+            {
+                g_ctxBase.store(a0, std::memory_order_relaxed);
+                findView(rdram, a0, eye);
+            }
+        }
+        std::memcpy(rdram + obj + kPos, kept, 12);
+        std::memcpy(rdram + obj + kDir, kept + 0x10, 12);
+        std::memcpy(rdram + obj + kUp, kept + 0x20, 12);
+#else
+        (void)eye;
+        (void)obj;
+        (void)frame;
+        original(rdram, ctx, runtime);
+#endif
+    }
+
+    void updateCameraObj(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        withEye(rdram, ctx, runtime, kUpdateCameraObj, GPR_U32(ctx, 4), true);
+    }
+    void updateCameraContext(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        withEye(rdram, ctx, runtime, kUpdateCameraContext, GPR_U32(ctx, 5), false);
+    }
+
+    // modelClipSkin (0x1098450, the skinned models' near hiding reads the switch): while first person applies it runs
+    // with the switch read as 0, the game's value back after (nothing else sees the change).
+    void clipSkin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto original = sotc_decomp::recompiled(kClipSkin);
+        if (!original)
+            return;
+#if defined(__SWITCH__)
+        if (g_applied.load(std::memory_order_relaxed))
+        {
+            uint32_t kept;
+            std::memcpy(&kept, rdram + kNearSwitch, 4);
+            const uint32_t zero = 0;
+            std::memcpy(rdram + kNearSwitch, &zero, 4);
+            original(rdram, ctx, runtime);
+            std::memcpy(rdram + kNearSwitch, &kept, 4);
+            return;
+        }
+#endif
+        original(rdram, ctx, runtime);
+    }
+#if defined(__SWITCH__)
+    bool solidNearOff() { return g_applied.load(std::memory_order_relaxed); }
+    // v171g: the head cut (sotc_native.cpp, each skinned model's bone palette, camera space): while first person
+    // applies, bones whose origin lies within this distance of the eye are Wander's head (and hair): their vertices
+    // collapse onto the bone (not drawn). 0: off.
+    float headCut()
+    {
+        static const bool test = knob("CELOSIA_FP_HEADTEST", 0.0f) != 0.0f; // v171m: the cut in third person too (to see it)
+        if (test)
+            return 1000.0f;
+        if (!g_applied.load(std::memory_order_relaxed))
+            return 0.0f;
+        static const float k = knob("CELOSIA_FP_HEAD", 1.4f); // v171h log: the head bones 0.51-0.54 from the eye (r 0.42)
+        return k * g_lastRadius.load(std::memory_order_relaxed);
+    }
+    bool noteHead(const float *m, float upCam[3], bool atKick) { return noteHeadImpl(m, upCam, atKick); }
+    float radius() { return g_lastRadius.load(std::memory_order_relaxed); }
+#else
+    bool solidNearOff() { return false; }
+    float headCut() { return 0.0f; }
+    bool noteHead(const float *, float *, bool) { return false; }
+    float radius() { return 0.0f; }
+#endif
+}
+
+SOTC_DECOMP_UNCHECKED(0x01162E30u, update_camera_obj, fp171::updateCameraObj);
+SOTC_DECOMP_UNCHECKED(0x01160570u, update_camera_context, fp171::updateCameraContext);
+SOTC_DECOMP_UNCHECKED(0x01098450u, modelClipSkin, fp171::clipSkin);

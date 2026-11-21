@@ -22,8 +22,8 @@ import time
 import benchmark
 from sysbot import SysBot
 
-NRO_PATH = '/switch/celosia-native-boot/celosia_switch_game.nro'
-CLOCKS_PATH = '/switch/celosia-native-boot/hardware-clocks.txt'
+NRO_PATH = '/switch/celosia_nx/celosia_nx.nro'
+CLOCKS_PATH = '/switch/celosia_nx/hardware-clocks.txt'
 # Route is adaptive: see adaptive_route().
 AGRO_SKIP_WAIT = 6
 STEP_BACK = ('LEFT', 0, -25000, 3.0)  # kept in route.json for older runs; unused

@@ -1202,6 +1202,26 @@ namespace char122
         // iosGetSinCosf(a0, f12): (cos, sin, 0, 0) at a0: the PS2 code's own polynomial (its coefficients
         // in the boot ELF at 0x1e2bc0) on sin(pi/2 -+ x) after the angle is brought into -pi..pi, the other
         // lane +-sqrt(1 - s^2), in plain floats.
+        // v168: the value part of sinCos below (the particles' draw loop calls it straight, ptcldraw).
+        bool sinCosValues(uint8_t *rdram, float x, float r[4])
+        {
+            if (!std::isfinite(x) || std::fabs(x) > 1.0e6f)
+                return false;
+            const float pi = 3.14159274f, twoPi = 6.28318548f;
+            if (x < -pi || x >= pi)
+                x -= twoPi * static_cast<float>(static_cast<int32_t>((x + (x < 0.0f ? -pi : pi)) / twoPi));
+            const bool neg = x < 0.0f;
+            const float t = neg ? 1.57079637f + x : 1.57079637f - x;
+            float c[4];
+            std::memcpy(c, at(rdram, 0x001E2BC0u), 16);
+            const float t2 = t * t, t3 = t2 * t, t5 = t3 * t2, t7 = t5 * t2, t9 = t7 * t2;
+            const float s = t + c[3] * t3 + c[2] * t5 + c[1] * t7 + c[0] * t9;
+            const float o = std::sqrt(std::fabs(1.0f - s * s));
+            r[0] = s, r[1] = neg ? -o : o, r[2] = 0.0f, r[3] = 0.0f;
+            return true;
+        }
+        // v168: sinCos's values may be taken straight (the switch on, no checking).
+        bool sinCosDirect() { return on() && checkEvery() <= 0; }
         bool sinCos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, Fn old)
         {
             static uint64_t k = 0;

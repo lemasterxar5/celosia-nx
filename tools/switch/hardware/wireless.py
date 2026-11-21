@@ -7,8 +7,8 @@ from pathlib import Path, PurePosixPath
 import uuid
 from sysbot import SysBot, validate_endpoint, ProtocolError
 
-ROOT='/switch/celosia-native-boot'
-REMOTE=ROOT+'/celosia_switch_game.nro'
+ROOT='/switch/celosia_nx'
+REMOTE=ROOT+'/celosia_nx.nro'
 
 def upload_verified(ftp,source,before_activate=None):
     source=Path(source)

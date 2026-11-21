@@ -52,6 +52,23 @@ Remove-Item -LiteralPath (Join-Path $shaderDir 'celosia_lean.frag.dksh') -ErrorA
 if($LASTEXITCODE){throw 'Switch depth pre-pass shader compilation failed'}
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_sky.frag.dksh') (Join-Path $backend 'sky.frag.glsl')
 if($LASTEXITCODE){throw 'Switch background image shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_post.frag.dksh') (Join-Path $backend 'post.frag.glsl')
+if($LASTEXITCODE){throw 'Switch post-process shader compilation failed'}
+# v160: the post as a compute pass, and the hard shadow resolve's trivial fragment.
+& "$DevkitPro/tools/bin/uam.exe" -s comp -o (Join-Path $shaderDir 'celosia_post.comp.dksh') (Join-Path $backend 'post.comp.glsl')
+if($LASTEXITCODE){throw 'Switch compute post shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_solid.frag.dksh') (Join-Path $backend 'solid.frag.glsl')
+if($LASTEXITCODE){throw 'Switch solid resolve shader compilation failed'}
+# v162: the mask passes' early-test fragment.
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_one.frag.dksh') (Join-Path $backend 'one.frag.glsl')
+if($LASTEXITCODE){throw 'Switch mask shader compilation failed'}
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_shadowsoft.frag.dksh') (Join-Path $backend 'shadowsoft.frag.glsl')
+if($LASTEXITCODE){throw 'Switch soft shadow shader compilation failed'}
+# v163: the bloom chain / composite shaders.
+foreach($b in 'bloomchain','bloomcomp','postfx','postplain'){
+    & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir "celosia_$b.frag.dksh") (Join-Path $backend "$b.frag.glsl")
+    if($LASTEXITCODE){throw "Switch $b shader compilation failed"}
+}
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_bloom.frag.dksh') (Join-Path $backend 'bloom.frag.glsl')
 if($LASTEXITCODE){throw 'Switch bloom shader compilation failed'}
 # Early-depth-test variant of the generic shader, generated from the same source.
@@ -62,12 +79,12 @@ Set-Content -LiteralPath $earlySource -Encoding ascii -Value (@($generic[0],'lay
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_native_early.frag.dksh') $earlySource
 if($LASTEXITCODE){throw 'Switch early-test shader compilation failed'}
 Remove-Item -LiteralPath $earlySource
-$elf=Join-Path $OutputDirectory 'celosia_switch_game.elf'
+$elf=Join-Path $OutputDirectory 'celosia_nx.elf'
 Copy-Item -LiteralPath (Join-Path $BuildDirectory 'celosia_switch_game.elf') -Destination $elf
 $nacp=Join-Path $OutputDirectory 'control.nacp'
-& "$DevkitPro/tools/bin/nacptool.exe" --create 'Celosia Switch development' 'Celosia contributors' '0.1.0' $nacp
+& "$DevkitPro/tools/bin/nacptool.exe" --create 'Shadow of the Colossus' 'Celosia contributors' '0.1.0' $nacp
 if($LASTEXITCODE){throw 'Switch NACP generation failed'}
-$nro=Join-Path $OutputDirectory 'celosia_switch_game.nro'
-& "$DevkitPro/tools/bin/elf2nro.exe" $elf $nro "--nacp=$nacp" "--icon=$DevkitPro/libnx/default_icon.jpg" "--romfsdir=$(Join-Path $OutputDirectory 'romfs')"
+$nro=Join-Path $OutputDirectory 'celosia_nx.nro'
+& "$DevkitPro/tools/bin/elf2nro.exe" $elf $nro "--nacp=$nacp" "--icon=$(Join-Path $PSScriptRoot 'icon/icon.jpg')" "--romfsdir=$(Join-Path $OutputDirectory 'romfs')"
 if($LASTEXITCODE){throw 'Switch NRO packaging failed'}
 Get-FileHash -LiteralPath $nro -Algorithm SHA256

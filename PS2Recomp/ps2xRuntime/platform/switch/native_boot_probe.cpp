@@ -24,8 +24,8 @@
 
 namespace {
 struct RomfsLease { bool ready=false; ~RomfsLease() { if(ready) romfsExit(); } };
-constexpr const char *Directory="sdmc:/switch/celosia-native-boot";
-constexpr const char *LogPath="sdmc:/switch/celosia-native-boot/boot.log";
+constexpr const char *Directory="sdmc:/switch/celosia_nx";
+constexpr const char *LogPath="sdmc:/switch/celosia_nx/boot.log";
 constexpr std::array<uint8_t,32> ScusHash{
     0xD1,0x6A,0xD7,0x6B,0xA8,0xCD,0xF8,0x76,0x95,0xD9,0x4B,0x13,0x16,0xD5,0x1C,0x1F,
     0x24,0x89,0x59,0xEC,0x07,0x49,0x81,0x4C,0x31,0xBB,0x7A,0x2D,0x55,0xD9,0xA2,0xE1};
@@ -89,18 +89,18 @@ int main()
     std::unique_ptr<celosia::native::NativeAudioOutput> audio;
     R5900Context context;
     try {
-        if(!std::freopen("sdmc:/switch/celosia-native-boot/game-stdout.log","w",stdout))
+        if(!std::freopen("sdmc:/switch/celosia_nx/game-stdout.log","w",stdout))
             throw std::runtime_error("Native game stdout log could not open");
         if(R_FAILED(romfsInit())) throw std::runtime_error("Native boot shader ROMFS initialization failed");
         romfs.ready=true;
         display=std::make_unique<celosia::native::NativeDisplay>();
         runtime=std::make_unique<PS2Runtime>();
-        mkdir("sdmc:/switch/celosia-native-boot/assets",0777);
-        files=std::make_unique<celosia::native::NativeFiles>("sdmc:/switch/celosia-native-boot/assets");
+        mkdir("sdmc:/switch/celosia_nx/assets",0777);
+        files=std::make_unique<celosia::native::NativeFiles>("sdmc:/switch/celosia_nx/assets");
         celosia::native::NativeFileAccess access;
         access.rootPath=[](ps2x::iop::HostPathKind kind) {
             return kind==ps2x::iop::HostPathKind::CdImage || kind==ps2x::iop::HostPathKind::MemoryCardRoot ?
-                std::string{} : std::string("sdmc:/switch/celosia-native-boot/assets");
+                std::string{} : std::string("sdmc:/switch/celosia_nx/assets");
         };
         access.translate=[&](std::string_view path) { return files->translate(path); };
         access.open=[&](std::string_view path) { return files->open(path); };
@@ -128,7 +128,7 @@ int main()
             throw std::runtime_error("Private SCUS ELF metadata does not match native library bindings");
         runtime->services().library().enableScus();
         runtime->services().configureAssets(*files,celosia::native::ScusAssets);
-        runtime->services().configureSaveRoot("sdmc:/switch/celosia-native-boot/saves");
+        runtime->services().configureSaveRoot("sdmc:/switch/celosia_nx/saves");
         runtime->services().library().setDisplayInitializer([&] {
             display->initialize();
             std::fprintf(log.get(),"Native deko3d display initialized: 1280x720; empty boot frame, not game rendering\n");

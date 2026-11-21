@@ -1,6 +1,6 @@
 """Download the .gcda profiles written by a CELOSIA_PGO=GENERATE build (read-only on the console).
 
-The instrumented NRO dumps every 30 s into sdmc:/switch/celosia-native-boot/pgo (see
+The instrumented NRO dumps every 30 s into sdmc:/switch/celosia_nx/pgo (see
 platform/switch/hybrid/pgo_dump.cpp). Run this after the profiling route, while or after the
 app runs (wait at least one dump period after the last gameplay you want included).
 """
@@ -9,7 +9,7 @@ import ftplib
 import json
 from pathlib import Path
 
-REMOTE = '/switch/celosia-native-boot/pgo'
+REMOTE = '/switch/celosia_nx/pgo'
 
 
 def main(argv=None):

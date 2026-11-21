@@ -592,6 +592,11 @@ private:
     std::condition_variable m_eventCv;
     std::deque<EeEvent> m_events;
     std::vector<ScheduledEvent> m_deadlines;
+    // v170a: processPendingEvents / processDueDeadlines' containers kept between passes (no mallocs a pass);
+    // the depth counters give a nested pass its own (PS2X_NO_DISPATCH170=1: always local).
+    std::deque<EeEvent> m_eventScratch;
+    std::vector<ScheduledEvent> m_dueScratch;
+    uint32_t m_eventDepth = 0, m_dueDepth = 0;
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;

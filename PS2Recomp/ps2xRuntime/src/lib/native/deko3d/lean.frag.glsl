@@ -44,7 +44,12 @@ void main() {
 #else
     float mip=0.0;
 #endif
+#ifdef LEAN_MIP
+    // v167: a texture pack's texture (lod.z = -1): the hardware's mip choice, lod.x the bias.
+    vec4 t=u.lod.z<0.0?texture(image,uv,u.lod.x):textureLod(image,uv,mip);
+#else
     vec4 t=textureLod(image,uv,mip);
+#endif
     float a=clamp(t.a*2.0*shade.a,0.0,1.0);
 #endif
 #ifndef LEAN_OPAQUE
@@ -63,7 +68,7 @@ void main() {
     {
         float f=clamp((viewDepth-u.bgFog.x)/u.bgFog.y,0.0,1.0);
         if(u.bgFog.z>0.0)f=floor(f*u.bgFog.z)/u.bgFog.z;
-        rgb=mix(rgb,textureLod(background,gl_FragCoord.xy*vec2(1.0/1280.0,1.0/720.0),0.0).rgb,f);
+        rgb=mix(rgb,textureLod(background,gl_FragCoord.xy*u.debug.xy,0.0).rgb,f);
     }
 #endif
 #if defined(LEAN_ZEROADD) && !defined(LEAN_OPAQUE)

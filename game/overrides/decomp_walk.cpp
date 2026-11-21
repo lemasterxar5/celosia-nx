@@ -64,6 +64,7 @@
 // code: DispDispObjGroupModel from its loop head (0x10f5348 / 0x10f5710)
 // with the registers it has there, the callbacks from their entry before
 // anything is written.
+#include "../../PS2Recomp/ps2xRuntime/platform/switch/hybrid/live_settings.hpp"
 #include "sotc_decomp.h"
 #include "runtime/ps2_diag.h"
 #include "sotc_worker.h"
@@ -192,6 +193,78 @@ namespace decomp_walk
         acc = PS2_VADD(acc, PS2_VMUL(c[2], lane<2>(v)));
         return PS2_VADD(acc, PS2_VMUL(c[3], lane<3>(v)));
     }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    // v168 (CPU rewrite #1, the cinematic's heaviest own function after the modelDisp wrapper: solidDisp's part
+    // blocks): apply() without its per-operation normalisation when every lane of c and v is +-0 or a normal
+    // float of magnitude in [2^-30, 2^61). There ps2VuNormalizeFast is the identity on every operand and result:
+    // a product is below 2^122 and the sums below 2^124 (no Inf); every product and sum is a multiple of 2^-83
+    // (the inputs' ulps are at least 2^-53), so a non-zero one is at least 2^-83: never denormal. The same
+    // operations in the same order (products not fused into the adds: the asm barriers), so the same bits,
+    // ACC included. Tested on the bits (no dependence on FPCR's flush-to-zero).
+    inline uint32x4_t safe168(__m128 v)
+    {
+        const uint32x4_t a = vandq_u32(vreinterpretq_u32_m128(v), vdupq_n_u32(0x7FFFFFFFu));
+        return vorrq_u32(vceqzq_u32(a), vandq_u32(vcgeq_u32(a, vdupq_n_u32(0x30800000u)), vcltq_u32(a, vdupq_n_u32(0x5E000000u))));
+    }
+    inline bool safe168(const __m128 c[4])
+    {
+        const uint32x4_t s = vandq_u32(vandq_u32(safe168(c[0]), safe168(c[1])), vandq_u32(safe168(c[2]), safe168(c[3])));
+        return vminvq_u32(s) != 0u;
+    }
+    inline __m128 apply168(const __m128 c[4], __m128 v, __m128 &acc)
+    {
+        const float32x4_t x = vreinterpretq_f32_m128(v);
+        const float32x2_t lo = vget_low_f32(x), hi = vget_high_f32(x);
+        float32x4_t p0 = vmulq_lane_f32(vreinterpretq_f32_m128(c[0]), lo, 0);
+        float32x4_t p1 = vmulq_lane_f32(vreinterpretq_f32_m128(c[1]), lo, 1);
+        float32x4_t p2 = vmulq_lane_f32(vreinterpretq_f32_m128(c[2]), hi, 0);
+        float32x4_t p3 = vmulq_lane_f32(vreinterpretq_f32_m128(c[3]), hi, 1);
+        asm("" : "+w"(p0), "+w"(p1), "+w"(p2), "+w"(p3));
+        float32x4_t t = vaddq_f32(p0, p1);
+        t = vaddq_f32(t, p2);
+        asm("" : "+w"(t));
+        acc = vreinterpretq_m128_f32(t);
+        return vreinterpretq_m128_f32(vaddq_f32(t, p3));
+    }
+    // CELOSIA_DIAG_NO_SOLID168=1: apply() throughout. CELOSIA_DIAG_SOLID168_CHECK=1: both made and compared
+    // ([solid168] counts every 200 000 blocks, each mismatch logged; apply()'s result kept).
+    inline int solid168Mode()
+    {
+        static const int mode = std::getenv("CELOSIA_DIAG_NO_SOLID168") ? 0 : (std::getenv("CELOSIA_DIAG_SOLID168_CHECK") ? 2 : 1);
+        return mode;
+    }
+    // c x v[0..3] into out[0..3] (ACC as apply leaves it after the fourth), the fast way when every input is safe.
+    inline void block168(const __m128 c[4], const __m128 v[4], __m128 out[4], __m128 &acc)
+    {
+        const int mode = solid168Mode();
+        const bool safe = mode != 0 && safe168(c) && safe168(v);
+        if (!safe || mode == 2)
+        {
+            for (int k = 0; k < 4; ++k)
+                out[k] = apply(c, v[k], acc);
+            if (!safe)
+                return;
+            static uint64_t checks = 0, bad = 0;
+            __m128 f[4], facc = acc;
+            for (int k = 0; k < 4; ++k)
+                f[k] = apply168(c, v[k], facc);
+            const bool same = std::memcmp(f, out, sizeof f) == 0 && std::memcmp(&facc, &acc, 16) == 0;
+            if (!same && bad++ < 20)
+                std::fprintf(stderr, "[solid168] MISMATCH block %llu\n", (unsigned long long)checks);
+            if (++checks % 200000u == 0u)
+                std::fprintf(stderr, "[solid168] checked %llu blocks, %llu mismatches\n", (unsigned long long)checks, (unsigned long long)bad);
+            return;
+        }
+        for (int k = 0; k < 4; ++k)
+            out[k] = apply168(c, v[k], acc);
+    }
+#else
+    inline void block168(const __m128 c[4], const __m128 v[4], __m128 out[4], __m128 &acc)
+    {
+        for (int k = 0; k < 4; ++k)
+            out[k] = apply(c, v[k], acc);
+    }
+#endif
 
     // The quaternion product block (DispDispObjGroupModel's 0x10f5424..0x10f5448):
     // vf13 = vf11 x vf12 (w: the dot product's complement), ACC / vf14..16 left as the original does.
@@ -900,7 +973,34 @@ namespace decomp_walk
         // picked as if 1.5x as far, so the model goes at 2/3 of its range.
         if (native_renderer::tuning().sacDrawDist && m.s32(a0 + 0x28u) != 0)
             f1 = f1 * 1.5f;
-        float f12 = lodByDistance(m, a0, f1, static_cast<int32_t>(static_cast<int64_t>(m.u64(s2 + 0x250u) << 21) >> 61));
+        // v168/v169: "draw distance" (menu, hot; user: more detail farther, NOT drawn farther): the model's level
+        // picked as if it were 1.25x / 1.5x nearer, but its drop past the last level (+0x28 records) decided at
+        // the PS2's distance: a model the PS2 drops still goes at the same point, and one it draws never gets a
+        // level past the last (v168 kept models farther).
+        const int32_t current169 = static_cast<int32_t>(static_cast<int64_t>(m.u64(s2 + 0x250u) << 21) >> 61);
+        float f12 = lodByDistance(m, a0, f1, current169);
+        if (const int dd = std::clamp(celosia::live::settings().drawDistance.load(std::memory_order_relaxed), 0, 3); dd != 0)
+        {
+            const int32_t countPs2 = m.s32(s1 + 0x1Cu);
+            const int32_t levelPs2 = FPU_CVT_W_S(f12);
+            const bool dropped = static_cast<uint64_t>(static_cast<int64_t>(levelPs2)) >= static_cast<uint64_t>(static_cast<int64_t>(countPs2)) &&
+                                 m.s32(a0 + 0x28u) != 0;
+            if (!dropped)
+            {
+                const float nearer = lodByDistance(m, a0, f1 / (dd == 1 ? 1.5f : dd == 2 ? 2.0f : 3.0f), current169); // v173s: 1.5x / 2x / 3x
+                // v169: how often it changes something ([detail169] in the log: proof it acts).
+                static uint32_t decisions = 0, finer = 0;
+                ++decisions;
+                if (FPU_C_OLT_S(nearer, f12))
+                {
+                    f12 = nearer; // only ever a finer level
+                    ++finer;
+                }
+                if (decisions % 50000u == 0u)
+                    std::fprintf(stderr, "[detail169] %u model levels picked, %u of them finer (%.1f %%)\n", decisions, finer,
+                                 100.0 * double(finer) / double(decisions));
+            }
+        }
         uint64_t v0;
         float f20 = -1.0f;
         bool none = false, past = false;
@@ -1248,7 +1348,31 @@ namespace decomp_walk
                 uint64_t w250;
                 std::memcpy(&w250, gp + 0x250u, 8);
                 const Ram m{rdram};
-                float f12 = lodByDistance(m, hu(hd, 8u), d, static_cast<int32_t>(static_cast<int64_t>(w250 << 21) >> 61));
+                const int32_t current170 = static_cast<int32_t>(static_cast<int64_t>(w250 << 21) >> 61);
+                float f12 = lodByDistance(m, hu(hd, 8u), d, current170);
+                // v170: "Detail distance" here too (v168/v169 had it only in modelClipSolidT, not this fast path:
+                // the models' usual way, so the option did nothing, user). The level picked as if the model were
+                // 1.25x / 1.5x nearer, never coarser; a model the PS2 drops past its last level still goes at the
+                // PS2's distance.
+                if (const int dd = std::clamp(celosia::live::settings().drawDistance.load(std::memory_order_relaxed), 0, 3); dd != 0)
+                {
+                    const int32_t lvPs2 = static_cast<int32_t>(f12);
+                    const bool dropped = static_cast<uint64_t>(static_cast<int64_t>(lvPs2)) >= static_cast<uint64_t>(static_cast<int64_t>(count)) && !keepsLast;
+                    if (!dropped)
+                    {
+                        static uint32_t decisions = 0, finer = 0;
+                        ++decisions;
+                        const float nearer = lodByDistance(m, hu(hd, 8u), d / (dd == 1 ? 1.5f : dd == 2 ? 2.0f : 3.0f), current170); // v173s: 1.5x / 2x / 3x
+                        if (nearer < f12)
+                        {
+                            f12 = nearer;
+                            ++finer;
+                        }
+                        if (decisions % 50000u == 0u)
+                            std::fprintf(stderr, "[detail170 fast] %u model levels picked, %u of them finer (%.1f %%)\n", decisions, finer,
+                                         100.0 * double(finer) / double(decisions));
+                    }
+                }
                 const int32_t lv = static_cast<int32_t>(f12);
                 float f20;
                 if (static_cast<uint64_t>(static_cast<int64_t>(lv)) < static_cast<uint64_t>(static_cast<int64_t>(count)))
@@ -1473,6 +1597,9 @@ namespace decomp_walk
     void solidDisp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const lines67::Scope l67(lines67::kDisp, false, GPR_U32(ctx, 29));
+        // v169: solidDisp's parts as prof129 zones (0x2110 entry / checks, 0x2112 solid103, 0x2111 the parts'
+        // matrices, 0x2113 the end: VU state, modelDisp / shadowDisp calls) to pick what to rewrite next.
+        const ps2_load::GameZone zone169(0x2110u);
         G g(rdram, ctx, runtime);
         const Ram m = g.m;
         const uint32_t sp0 = GPR_U32(ctx, 29), ra0 = GPR_U32(ctx, 31), sp = sp0 - 0x60u;
@@ -1514,6 +1641,7 @@ namespace decomp_walk
         };
         if (s0 == 0u && sotc_decomp::solid103On() && sotc_native::nativeDraws() && m.u32(m.u32(s1 + 0x144u) + 0x280u) == 0u && !lensScaled())
         {
+            const ps2_load::GameZone zone169b(0x2112u);
             const int32_t s2 = m.s16(s1 + 0x1B4u);
             SET_GPR_S32(ctx, 18, s2);
             ctx->f[0] = 1.0f;
@@ -1530,6 +1658,8 @@ namespace decomp_walk
         }
         else if (s0 == 0u)
         {
+            const ps2_load::GameZone zone169p(0x2111u);
+            bool lensDone = false, fused = false; // v167: the lens factor taken before the parts (solid167)
             const int32_t s2 = m.s16(s1 + 0x1B4u);
             SET_GPR_S32(ctx, 18, s2);
             g.call(kGetCameraContext, 0x010F3A2Cu, sp);
@@ -1552,16 +1682,84 @@ namespace decomp_walk
                 if (w67)
                     for (int32_t i = 0; i < 4 && i < s2; ++i)
                         askPart(i, a3 + static_cast<uint32_t>(i) * 0x40u);
+                // v162 (cinematic profile's heaviest own function after the modelDisp wrapper): the camera
+                // matrix and the blocks' base read once when no block written can reach them (the blocks lie in
+                // [base, base + span); the camera's 64 bytes and the three pointer words outside it), the
+                // same values the original reads again each part. CELOSIA_DIAG_NO_SOLID162=1: as before.
+                static const bool solid162Off = std::getenv("CELOSIA_DIAG_NO_SOLID162") != nullptr;
+                const uint32_t geoW = s1 + 0x144u, geoV = m.u32(geoW), geoC = geoV + 0xCu, baseW = m.u32(geoC) + 0x104u;
+                const uint32_t base = m.u32(baseW);
+                const uint64_t span = (static_cast<uint64_t>(s2) * 4u + static_cast<uint64_t>(s2 + 1) / 64u + 4u) * 16u;
+                auto outside = [&](uint32_t a, uint32_t n)
+                { return static_cast<uint64_t>(a) + n <= 0x02000000ull && (static_cast<uint64_t>(a) + n <= base || static_cast<uint64_t>(a) >= base + span); };
+                const bool hoist = !solid162Off && outside(t0, 0x40u) && outside(geoW, 4u) && outside(geoC, 4u) && outside(baseW, 4u) &&
+                                   static_cast<uint64_t>(base) + span <= 0x02000000ull;
+                __m128 ccH[4];
+                if (hoist)
+                    for (int k = 0; k < 4; ++k)
+                        ccH[k] = m.q(t0 + static_cast<uint32_t>(k) * 0x10u);
+                // v167 (CPU rewrite #1, the LSFG cinematic's heaviest own function after the modelDisp wrapper):
+                // a lens-scaled model's blocks in one pass. The original writes each part's block (camera x
+                // part), then reads it back and multiplies it by iosGetScaleMatrix's: here the camera lookup and
+                // the scale matrix come first (guest calls reading neither the blocks nor VU0 state) and each
+                // block is written once, scaled. Bit-identical (the same products; apply's first step overwrites
+                // ACC; stores and loads of floats are exact) and the same VU0 state left. CELOSIA_DIAG_NO_SOLID167=1: as before.
+                static const bool solid167Off = std::getenv("CELOSIA_DIAG_NO_SOLID167") != nullptr;
+                __m128 scH[4];
+                if (!solid167Off)
+                {
+                    const uint32_t lod167 = m.u32(m.u32(m.u32(m.u32(s1 + 0x144u)) + 0x20u) + 8u);
+                    if (lod167 != 0u && m.u32(lod167 + 0x3Cu) != 0u)
+                    {
+                        lensDone = true;
+                        g.call(kGetCameraContext, 0x010F3B10u, sp);
+                        const uint32_t camera = g.v0();
+                        float f12 = 1.0f;
+                        if (camera != 0u)
+                        {
+                            float f0 = m.f32(camera + 0xCu);
+                            f0 = ps2FpuDivide(ctx->fcr31, f0, 500.0f);
+                            ctx->f[0] = f0;
+                            f12 = ps2FpuDivide(ctx->fcr31, 1.0f, f0);
+                        }
+                        ctx->f[0] = 1.0f;
+                        if (!FPU_C_EQ_S(f12, 1.0f))
+                        {
+                            SET_GPR_S32(ctx, 16, m.s16(s1 + 0x1B4u));
+                            g.a(4, sp);
+                            ctx->f[12] = f12;
+                            ctx->f[13] = f12;
+                            ctx->f[14] = f12;
+                            g.callRel(0x010F3B7Cu, sp);
+                            for (int k = 0; k < 4; ++k)
+                                scH[k] = m.q(sp + static_cast<uint32_t>(k) * 0x10u);
+                            fused = true;
+                        }
+                    }
+                }
                 for (int32_t i = 0; i < s2; ++i, a3 += 0x40u)
                 {
                     if (w67 && i + 4 < s2)
                         askPart(i + 4, a3 + 0x100u);
-                    const uint32_t dst = block(i);
-                    // (the camera matrix read again each part, as the original does)
-                    const __m128 cc[4] = {m.q(t0), m.q(t0 + 0x10u), m.q(t0 + 0x20u), m.q(t0 + 0x30u)};
+                    const uint32_t dst = hoist ? static_cast<uint32_t>(((i << 2) + ((i + 1) >> 6)) << 4) + base : block(i);
+                    // (the camera matrix read again each part, as the original does, unless hoisted above)
+                    const __m128 cc[4] = {hoist ? ccH[0] : m.q(t0), hoist ? ccH[1] : m.q(t0 + 0x10u), hoist ? ccH[2] : m.q(t0 + 0x20u),
+                                          hoist ? ccH[3] : m.q(t0 + 0x30u)};
                     const __m128 src[4] = {m.q(a3), m.q(a3 + 0x10u), m.q(a3 + 0x20u), m.q(a3 + 0x30u)};
-                    for (int k = 0; k < 4; ++k)
-                        lastOut[k] = apply(cc, src[k], acc);
+                    if (fused)
+                    {
+                        __m128 block1[4];
+                        block168(cc, src, block1, acc); // v168: the fast way when the inputs allow
+                        block168(block1, scH, lastOut, acc);
+                        for (int k = 0; k < 4; ++k)
+                        {
+                            m.putq(dst + static_cast<uint32_t>(k) * 0x10u, lastOut[k]);
+                            lastC[k] = block1[k];
+                        }
+                        vuTouched = true;
+                        continue;
+                    }
+                    block168(cc, src, lastOut, acc); // v168: the fast way when the inputs allow
                     for (int k = 0; k < 4; ++k)
                     {
                         m.putq(dst + static_cast<uint32_t>(k) * 0x10u, lastOut[k]);
@@ -1574,7 +1772,7 @@ namespace decomp_walk
             const uint32_t header = m.u32(m.u32(m.u32(s1 + 0x144u)) + 0x20u);
             float f12 = 1.0f;
             const uint32_t lodRecord = m.u32(header + 8u);
-            if (lodRecord != 0u && m.u32(lodRecord + 0x3Cu) != 0u)
+            if (!lensDone && lodRecord != 0u && m.u32(lodRecord + 0x3Cu) != 0u)
             {
                 if (vuTouched)
                 {
@@ -1623,8 +1821,7 @@ namespace decomp_walk
                     const uint32_t dst = block(i);
                     const __m128 c[4] = {m.q(dst), m.q(dst + 0x10u), m.q(dst + 0x20u), m.q(dst + 0x30u)};
                     const __m128 sc[4] = {m.q(sp), m.q(sp + 0x10u), m.q(sp + 0x20u), m.q(sp + 0x30u)};
-                    for (int k = 0; k < 4; ++k)
-                        lastOut[k] = apply(c, sc[k], acc);
+                    block168(c, sc, lastOut, acc); // v168
                     for (int k = 0; k < 4; ++k)
                     {
                         m.putq(dst + static_cast<uint32_t>(k) * 0x10u, lastOut[k]);
@@ -1640,6 +1837,7 @@ namespace decomp_walk
             const uint32_t parent = layoutClass(g, s0, 0x010F3C38u, sp);
             m.put32(m.u32(s1 + 0x144u) + 0xCu, m.u32(m.u32(parent + 0x144u) + 0xCu));
         }
+        const ps2_load::GameZone zone169e(0x2113u);
         if (vuTouched)
         {
             for (int k = 0; k < 4; ++k)

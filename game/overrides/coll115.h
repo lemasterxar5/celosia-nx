@@ -457,7 +457,7 @@ namespace coll115
         float ax, ay, az, dx, dy, dz, bx, by, bz, invLen2, eps;
         uint32_t mode;
     };
-#if PS2X_VU_NEON_A32
+#if COLL_FAST170 // v170a: the Switch too (FPCR.FZ, decomp_collision.cpp)
     // ARMv7 NEON (GCC leaves generic float vectors to the VFP, lane by lane,
     // without -funsafe-math-optimizations); flush-to-zero changes nothing at
     // these margins.

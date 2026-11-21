@@ -55,6 +55,8 @@ namespace native_renderer::detail
         virtual void rewriteFramePalette(uint32_t, const float *, uint32_t) {}
         virtual bool hasTexture(uint64_t id) = 0;
         virtual void uploadTexture(uint64_t id, uint32_t width, uint32_t height, const uint8_t *rgba, uint32_t levels) = 0;
+        virtual bool uploadCompressed(uint64_t, const native_renderer::CompressedTexture &) { return false; }
+        virtual void dropTexture(uint64_t) {}
         virtual void beginFrame() = 0;
         virtual void draw(uint64_t mesh, const float clip[16], const DrawState &state) = 0;
         // Meshes drawn one after the other with one matrix and state (by default one draw each).

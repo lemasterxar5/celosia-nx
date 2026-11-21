@@ -41,6 +41,8 @@
 #include "sotc_prof.h"
 #include "sotc_decomp.h"
 #include "sotc_worker.h"
+#include "sotc_texpack.h"
+#include "sotc_cheats.h"
 namespace char104 // round 104 (decomp_char104.cpp)
 {
     void install(PS2Runtime &runtime);
@@ -56,11 +58,15 @@ namespace char104 // round 104 (decomp_char104.cpp)
 #include "ThreadNaming.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <stdexcept>
 #if defined(__SWITCH__)
 #include <pthread.h>
+#include <ctime>
+#include <sys/stat.h>
+#include <switch.h>
 #include "../../PS2Recomp/ps2xRuntime/platform/switch/hybrid/live_settings.hpp"
 extern "C" void celosia_menu_frame();
 #endif
@@ -99,6 +105,11 @@ extern "C" void ps2x_vita_pace_ab(int on);                // raylib_vita.cpp (ro
 extern "C" void ps2x_vita_pace132_ab(int on);             // raylib_vita.cpp (round 132)
 #endif
 #include <vector>
+
+namespace decomp_hot44g
+{
+    void gsReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // v158: called directly by gsRegHook
+}
 
 namespace sotc_native
 {
@@ -823,10 +834,11 @@ namespace sotc_native
 
     // RGBA8 of every level, one after the other; `decoded` the levels made.
     // Pure: runs on the async worker too.
-    bool decodeTexture(const TexSource &src, std::vector<uint8_t> &rgba, uint32_t &decoded)
+    // v167: `paletteOverride` (the identity, for the texture pack's lookup): each texel's index instead.
+    bool decodeTexture(const TexSource &src, std::vector<uint8_t> &rgba, uint32_t &decoded, const uint32_t *paletteOverride = nullptr)
     {
         const uint32_t psm = src.psm, entries = psm == 0x14u ? 16u : 256u;
-        const uint32_t *palette = src.palette;
+        const uint32_t *palette = paletteOverride ? paletteOverride : src.palette;
         size_t total = 0;
         for (uint32_t level = 0, lw = src.width, lh = src.height; level < src.levels && lw >= 1u && lh >= 1u; ++level, lw /= 2u, lh /= 2u)
             total += static_cast<size_t>(lw) * lh * 4u;
@@ -917,6 +929,32 @@ namespace sotc_native
     }
 
     bool decodeTextureReference(uint32_t header, std::vector<uint8_t> &rgba, uint32_t &decodedOut);
+
+    // v167: the texture pack's entry for a palette texture (0 none): its indices (every level), hashed
+    // as PCSX2 names its replacements (sotc_texpack). Pure: runs on the async worker too.
+    uint32_t texturePackFind(const TexSource &src)
+    {
+        if (src.psm != 0x13u && src.psm != 0x14u)
+            return 0;
+        static const auto identity = []
+        {
+            std::array<uint32_t, 256> t{};
+            for (uint32_t i = 0; i < 256u; ++i)
+                t[i] = i;
+            return t;
+        }();
+        std::vector<uint8_t> words;
+        uint32_t levels = 0;
+        if (!decodeTexture(src, words, levels, identity.data()) || !levels)
+            return 0;
+        std::vector<uint8_t> indices(words.size() / 4u);
+        for (size_t i = 0; i < indices.size(); ++i)
+            indices[i] = words[i * 4u];
+        sotc_texpack::Source s;
+        s.psm = src.psm, s.width = src.width, s.height = src.height, s.levels = levels;
+        s.palette = src.palette, s.indices = indices.data();
+        return sotc_texpack::find(s);
+    }
 
     // Texture cost (development measurement; CELOSIA_DIAG_TEX_COST=0 off): the game thread's time in
     // decodedTexture (lookup, hash, synchronous decode), the worker's decode time and the upload
@@ -1088,6 +1126,11 @@ namespace sotc_native
         else
             key = sampleNow();
     haveKey:
+        // v167: while the texture pack is on, the palette textures' keys carry its salt (switching
+        // it on decodes and looks them up anew; off finds the PS2 ones again).
+        const uint64_t packSalt = psm != 0x00u ? sotc_texpack::keySalt() : 0u;
+        if (packSalt)
+            key ^= packSalt & 0x03FFFFFFFFFFFFFFull;
         if (native_renderer::hasTexture(key))
             return key;
         if ((psm != 0x00u && psm != 0x13u && psm != 0x14u) || width > 1024u || height > 1024u)
@@ -1158,17 +1201,24 @@ namespace sotc_native
         // On the worker: decoded there, uploaded at the next frame's start.
         auto out = std::make_shared<std::pair<std::vector<uint8_t>, uint32_t>>();
         auto ok = std::make_shared<bool>(false);
-        if (!changedInPlace && native_renderer::buildAsync({key}, [src, out, ok]
+        auto packHandle = std::make_shared<uint32_t>(0u);
+        if (!changedInPlace && native_renderer::buildAsync({key}, [src, out, ok, packHandle, packSalt]
                                         {
                                             const uint64_t t = texCostOn() ? native_renderer::nowUs() : 0u;
                                             *ok = decodeTexture(*src, out->first, out->second);
                                             if (t)
                                                 g_texCost.decodeUs.fetch_add(native_renderer::nowUs() - t, std::memory_order_relaxed);
+                                            if (*ok && packSalt)
+                                                *packHandle = texturePackFind(*src);
                                         },
-                                        [out, ok, finish]
+                                        [out, ok, finish, packHandle, key, width, height]
                                         {
                                             if (*ok)
+                                            {
                                                 finish(out->first, out->second);
+                                                // v167: the pack's texture loaded on its thread, put in its place later.
+                                                sotc_texpack::request(key, *packHandle, width, height, true);
+                                            }
                                         }))
         {
             if (decodeStart)
@@ -1182,6 +1232,8 @@ namespace sotc_native
         if (decodeStart)
             native_renderer::frameCounters().decodeUs += native_renderer::nowUs() - decodeStart;
         finish(rgba, decoded);
+        if (packSalt)
+            sotc_texpack::request(key, texturePackFind(*src), width, height, true);
         return key;
     }
 
@@ -2632,7 +2684,8 @@ namespace sotc_native
                     if (native_renderer::Vertex *out = native_renderer::frameMesh(std::max<uint32_t>(packet.maxVertices, static_cast<uint32_t>(packet.bind.size()))))
                     {
                         const PosedMesh written = poseSkinned(packet, now.data(), out);
-                        native_renderer::commitFrameMesh(d.mesh, written.vertices, written.indices);
+                        if (written.vertices) // v171g: an empty pose is not sent (the draw's earlier mesh stays)
+                            native_renderer::commitFrameMesh(d.mesh, written.vertices, written.indices);
                         ++st.reposed;
                     }
                 }
@@ -3843,6 +3896,8 @@ namespace sotc_native
     {
         if (g_frame == 0)
             return;
+        // v159: SOTC_NATIVE_LOG read once (it was five environment lookups every frame).
+        static const bool nativeLog = ps2_diag::env("SOTC_NATIVE_LOG") != nullptr;
         if (mdsTraceOn())
             mdsTraceFrame();
         lines67::frame(g_frame);
@@ -3880,25 +3935,25 @@ namespace sotc_native
                              nearD, farD, nearR, farR, k, g_fog.base, g_fog.scale, word(0x118B8DCu), word(0x118B8E0u), word(0x118B8E4u));
             }
         }
-        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+        if (nativeLog && g_frame % 60u == 0u)
             std::fprintf(stderr, "[bossfx] frame %llu flags %08x a0 %d b0 %d b4 %d b8 %d bc %d c0 %d c4 %d 298 %g\n", (unsigned long long)g_frame, word(0x1186290u),
                          static_cast<int32_t>(word(0x11862A0u)), static_cast<int32_t>(word(0x11862B0u)), static_cast<int32_t>(word(0x11862B4u)), static_cast<int32_t>(word(0x11862B8u)),
                          static_cast<int32_t>(word(0x11862BCu)), static_cast<int32_t>(word(0x11862C0u)), static_cast<int32_t>(word(0x11862C4u)), real(0x1186298u));
-        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 120u == 0u)
+        if (nativeLog && g_frame % 120u == 0u)
             std::fprintf(stderr, "[dof] frame %llu on %u rounds %d slices %d focus %g colour %08x %08x %08x %08x\n", (unsigned long long)g_frame, word(0x11862D0u),
                          static_cast<int32_t>(word(0x11862D4u)), static_cast<int32_t>(word(0x11862D8u)), static_cast<float>(static_cast<int32_t>(word(0x11862DCu))),
                          word(0x11862E0u), word(0x11862E4u), word(0x11862E8u), word(0x11862ECu));
-        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+        if (nativeLog && g_frame % 60u == 0u)
         {
             std::fprintf(stderr, "[bloomcol] %llu:", (unsigned long long)g_frame);
             for (uint32_t a = 0x118C0C0u; a < 0x118C150u; a += 4u)
                 std::fprintf(stderr, " %x", word(a));
             std::fprintf(stderr, "\n");
         }
-        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 60u == 0u)
+        if (nativeLog && g_frame % 60u == 0u)
             std::fprintf(stderr, "[native-frame] %llu bloomZ %u ran %d zfog %d start %g width %g vfog %d base %g scale %g col %g %g %g models %u\n", (unsigned long long)g_frame, word(0x118C094u), g_bloomRan ? 1 : 0, g_fog.enabled ? 1 : 0,
                          g_fog.start, g_fog.width, g_fog.vertexFog ? 1 : 0, g_fog.base, g_fog.scale, g_fog.colour[0], g_fog.colour[1], g_fog.colour[2], g_modelDraws);
-        if (ps2_diag::env("SOTC_NATIVE_LOG") && g_frame % 120u == 0u)
+        if (nativeLog && g_frame % 120u == 0u)
         {
             const uint32_t table = word(0x118BFCCu);
             for (uint32_t layer : {1u, 2u, 3u})
@@ -5906,6 +5961,310 @@ namespace sotc_native
 
     // A frame of the game ends when the display list goes to the VIF1.
     void newDrawOrder();
+#if defined(__SWITCH__)
+    // v172 photo mode (the menu's "Modo foto", live photoMode): a few frames with the HUD hidden (flush2D) and every
+    // picture copied back (render.cpp), then the game thread waits here, at the frame change, until B: the picture on
+    // screen stays. A (photoShot) writes the last copied picture as a BMP to sdmc:/switch/celosia_nx/Modo foto/.
+    int savePhoto172(int number)
+    {
+        std::vector<uint8_t> rgba;
+        uint32_t w = 0, h = 0;
+        if (!native_renderer::latestFrame(rgba, w, h) || !w || !h || rgba.size() < size_t(w) * h * 4u)
+            return -1;
+        static const char *dir = "sdmc:/switch/celosia_nx/Modo foto";
+        mkdir(dir, 0777);
+        const std::time_t now = std::time(nullptr);
+        std::tm t{};
+        localtime_r(&now, &t);
+        char path[160];
+        std::snprintf(path, sizeof(path), "%s/foto-%04d%02d%02d-%02d%02d%02d-%d.bmp", dir, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min,
+                      t.tm_sec, number);
+        const uint32_t rowBytes = (w * 3u + 3u) & ~3u, imageBytes = rowBytes * h;
+        uint8_t header[54] = {'B', 'M'};
+        const auto put32 = [&](int at, uint32_t v)
+        {
+            for (int i = 0; i < 4; ++i)
+                header[at + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        put32(2, 54u + imageBytes);
+        put32(10, 54u);
+        put32(14, 40u);
+        put32(18, w);
+        put32(22, h); // bottom-up rows
+        header[26] = 1;
+        header[28] = 24;
+        put32(34, imageBytes);
+        put32(38, 2835u);
+        put32(42, 2835u);
+        std::vector<uint8_t> body(imageBytes, 0);
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const uint8_t *src = rgba.data() + size_t(h - 1u - y) * w * 4u;
+            uint8_t *dst = body.data() + size_t(y) * rowBytes;
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                dst[x * 3u + 0u] = src[x * 4u + 2u];
+                dst[x * 3u + 1u] = src[x * 4u + 1u];
+                dst[x * 3u + 2u] = src[x * 4u + 0u];
+            }
+        }
+        std::FILE *f = std::fopen(path, "wb");
+        if (!f)
+            return -2;
+        bool ok = std::fwrite(header, 1, sizeof(header), f) == sizeof(header);
+        ok = std::fwrite(body.data(), 1, body.size(), f) == body.size() && ok;
+        ok = std::fclose(f) == 0 && ok;
+        std::fprintf(stderr, "[photo172] %s %s (%ux%u)\n", ok ? "saved" : "could not write", path, w, h);
+        return ok ? 1 : -2;
+    }
+    void photoFrame()
+    {
+        auto &live = celosia::live::settings();
+        static int entering = 0;
+        const int mode = live.photoMode.load(std::memory_order_acquire);
+        if (mode == 0)
+        {
+            entering = 0;
+            return;
+        }
+        native_renderer::photoTape(true); // v173: this frame's calls kept (the last whole one is drawn again)
+        if (mode == 1)
+        {
+            // CELOSIA_DIAG_PHOTO_FRAMES (default 3): frames drawn without the HUD before the freeze.
+            static const int frames = []
+            {
+                const char *e = std::getenv("CELOSIA_DIAG_PHOTO_FRAMES");
+                return e ? std::clamp(std::atoi(e), 1, 30) : 3;
+            }();
+            if (++entering <= frames)
+                return;
+            int expected = 1;
+            if (!live.photoMode.compare_exchange_strong(expected, 2)) // B pressed meanwhile
+                return;
+        }
+        std::fprintf(stderr, "[photo172] game frozen (photo mode)\n");
+        int saved = 0, failure = 0;
+        // v173 free camera. The frozen frame's projection P (camera context +0x40, column-major as the draws'
+        // matrices); the camera's axes in its own space from P's rows (right = x row, up = y row, forward = w row,
+        // made orthonormal). A flown camera at p (old camera space) turned by Rot: a point x of the old camera
+        // space is at Rot^T (x - p) in the new one, so every 3D draw's matrix M (P x camera-space) becomes
+        // P D P^-1 M with D = [Rot^T | -Rot^T p]. CELOSIA_DIAG_PHOTO_SPEED (units / s, default 4),
+        // CELOSIA_DIAG_PHOTO_FLIPY=1 (up / down swapped), CELOSIA_DIAG_PHOTO_INVERTY=1 (look up / down swapped).
+        float P[16], Pi[16];
+        for (int i = 0; i < 16; ++i)
+            P[i] = g_cameraContext ? real(g_cameraContext + 0x40u + i * 4u) : (i % 5 == 0 ? 1.0f : 0.0f);
+        const auto invert = [](const float *m, float *inv) -> bool
+        {
+            float t[16];
+            t[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+            t[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+            t[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+            t[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+            t[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+            t[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+            t[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+            t[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+            t[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+            t[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+            t[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+            t[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+            t[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+            t[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+            t[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+            t[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+            const float det = m[0] * t[0] + m[1] * t[4] + m[2] * t[8] + m[3] * t[12];
+            if (!(std::fabs(det) > 1e-20f))
+                return false;
+            for (int i = 0; i < 16; ++i)
+                inv[i] = t[i] / det;
+            return true;
+        };
+        const auto mul4 = [](const float *a, const float *b, float *out) // column-major a x b
+        {
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r)
+                {
+                    float v = 0.0f;
+                    for (int k = 0; k < 4; ++k)
+                        v += a[k * 4 + r] * b[c * 4 + k];
+                    out[c * 4 + r] = v;
+                }
+        };
+        const bool flyable = invert(P, Pi);
+        float axis[3][3] = {}; // right, up, forward (old camera space)
+        {
+            const auto row = [&](int r, float *v) { v[0] = P[r], v[1] = P[4 + r], v[2] = P[8 + r]; };
+            const auto dot = [](const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+            const auto norm = [&](float *v)
+            {
+                const float l = std::sqrt(dot(v, v));
+                if (l > 1e-12f)
+                    v[0] /= l, v[1] /= l, v[2] /= l;
+            };
+            row(3, axis[2]);
+            norm(axis[2]);
+            row(0, axis[0]);
+            float d = dot(axis[0], axis[2]);
+            for (int j = 0; j < 3; ++j)
+                axis[0][j] -= d * axis[2][j];
+            norm(axis[0]);
+            row(1, axis[1]);
+            const float d1 = dot(axis[1], axis[2]), d0 = dot(axis[1], axis[0]);
+            for (int j = 0; j < 3; ++j)
+                axis[1][j] -= d1 * axis[2][j] + d0 * axis[0][j];
+            norm(axis[1]);
+            if (std::getenv("CELOSIA_DIAG_PHOTO_FLIPY"))
+                for (float &v : axis[1])
+                    v = -v;
+            std::fprintf(stderr, "[photo173] free camera %s: right %.2f %.2f %.2f up %.2f %.2f %.2f forward %.2f %.2f %.2f\n", flyable ? "on" : "off (projection not invertible)",
+                         axis[0][0], axis[0][1], axis[0][2], axis[1][0], axis[1][1], axis[1][2], axis[2][0], axis[2][1], axis[2][2]);
+        }
+        // v173e: turns about the world's up (a camera looking down turned about its own up tilted the horizon). The
+        // world's up in camera space: the camera object's up (0x01073660 + 0x200, world) through the context's view
+        // (+0x5A0, world -> camera, column-major); its sign as the projection's up. A level frame (right, up,
+        // forward with no pitch) and the camera's own pitch in it; without a usable view: the projection's axes.
+        float lvl[3][3]; // level right, world up, level forward (old camera space)
+        float pitch0 = 0.0f;
+        {
+            const auto dot = [](const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+            const auto norm = [&](float *v) -> bool
+            {
+                const float l = std::sqrt(dot(v, v));
+                if (!(l > 1e-6f))
+                    return false;
+                v[0] /= l, v[1] /= l, v[2] /= l;
+                return true;
+            };
+            // v173f: the world's Y axis (v173e read the camera object's up: the camera's own, tilted with it).
+            float upW[3] = {0.0f, 1.0f, 0.0f}, u[3];
+            bool ok = g_cameraContext != 0u;
+            if (ok)
+            {
+                const uint32_t m = g_cameraContext + 0x5A0u;
+                for (int r = 0; r < 3; ++r)
+                    u[r] = real(m + 0u * 16u + r * 4u) * upW[0] + real(m + 1u * 16u + r * 4u) * upW[1] + real(m + 2u * 16u + r * 4u) * upW[2];
+                ok = norm(u);
+            }
+            if (ok && dot(u, axis[1]) < 0.0f)
+                u[0] = -u[0], u[1] = -u[1], u[2] = -u[2];
+            ok = ok && std::fabs(dot(u, axis[2])) < 0.995f;
+            if (!ok)
+                std::memcpy(u, axis[1], sizeof(u));
+            std::memcpy(lvl[1], u, sizeof(u));
+            for (int j = 0; j < 3; ++j)
+                lvl[2][j] = axis[2][j] - dot(axis[2], u) * u[j];
+            norm(lvl[2]);
+            for (int j = 0; j < 3; ++j)
+                lvl[0][j] = axis[0][j] - dot(axis[0], u) * u[j] - dot(axis[0], lvl[2]) * lvl[2][j];
+            norm(lvl[0]);
+            pitch0 = std::atan2(dot(axis[2], u), dot(axis[2], lvl[2]));
+            std::fprintf(stderr, "[photo173] world up in camera space %.2f %.2f %.2f (%s), camera pitch %.1f deg\n", u[0], u[1], u[2],
+                         ok ? "world Y through the view" : "projection", pitch0 * 57.2958f);
+        }
+        static const float speed = []
+        {
+            const char *e = std::getenv("CELOSIA_DIAG_PHOTO_SPEED");
+            return e ? std::clamp(static_cast<float>(std::atof(e)), 0.1f, 500.0f) : 4.0f;
+        }();
+        static const float lookSign = std::getenv("CELOSIA_DIAG_PHOTO_INVERTY") ? -1.0f : 1.0f;
+        float pos[3] = {0.0f, 0.0f, 0.0f}, yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+        uint64_t lastTick = armGetSystemTick();
+        live.photoReset = 0;
+        while (live.photoMode.load(std::memory_order_acquire) == 2)
+        {
+            const uint64_t tick = armGetSystemTick();
+            const float dt = std::min(0.1f, static_cast<float>(armTicksToNs(tick - lastTick)) * 1e-9f);
+            lastTick = tick;
+            if (live.photoReset.exchange(0) != 0)
+                pos[0] = pos[1] = pos[2] = 0.0f, yaw = pitch = roll = 0.0f;
+            const uint64_t held = live.photoButtons.load(std::memory_order_relaxed);
+            const auto dead = [](float v) { return std::fabs(v) < 0.12f ? 0.0f : v; };
+            // v173e: the pad's y is negative pushed up here (v173d's check: up looked down and walked back).
+            const float lx = dead(live.photoLX.load(std::memory_order_relaxed)), ly = -dead(live.photoLY.load(std::memory_order_relaxed));
+            const float rx = dead(live.photoRX.load(std::memory_order_relaxed)), ry = -dead(live.photoRY.load(std::memory_order_relaxed));
+            yaw += rx * 1.8f * dt;
+            pitch = std::clamp(pitch + lookSign * ry * 1.4f * dt, -1.5f - pitch0, 1.5f - pitch0);
+            // The new axes: yaw about the world's up in the level frame, then the pitch (the camera's own + the pad's).
+            const float cy = std::cos(yaw), sy = std::sin(yaw), pt = pitch0 + pitch, cp = std::cos(pt), sp = std::sin(pt);
+            float rot[3][3]; // rot[k] = the new axis k (right, up, forward) in old camera space
+            for (int j = 0; j < 3; ++j)
+            {
+                const float fy = cy * lvl[2][j] + sy * lvl[0][j];
+                rot[0][j] = cy * lvl[0][j] - sy * lvl[2][j];
+                rot[2][j] = cp * fy + sp * lvl[1][j];
+                rot[1][j] = -sp * fy + cp * lvl[1][j];
+            }
+            // v173n (user): the tilt chosen with L / R (R rolls clockwise, L back; up to 90 degrees either way, X resets
+            // it): right and up turned about the new forward axis. Moving and rising stay level (lvl, the pad's axes).
+            roll = std::clamp(roll + (((held & HidNpadButton_R) ? 1.0f : 0.0f) - ((held & HidNpadButton_L) ? 1.0f : 0.0f)) * 0.9f * dt,
+                              -1.5708f, 1.5708f);
+            float move[2][3]; // the stick's right and forward before the tilt
+            std::memcpy(move[0], rot[0], sizeof(move[0]));
+            std::memcpy(move[1], rot[2], sizeof(move[1]));
+            if (roll != 0.0f)
+            {
+                const float cr = std::cos(roll), sr = std::sin(roll);
+                for (int j = 0; j < 3; ++j)
+                {
+                    const float r0 = rot[0][j], u0 = rot[1][j];
+                    rot[0][j] = cr * r0 - sr * u0;
+                    rot[1][j] = cr * u0 + sr * r0;
+                }
+            }
+            float v = speed * dt;
+            if (held & HidNpadButton_ZR)
+                v *= 4.0f;
+            if (held & HidNpadButton_ZL)
+                v *= 0.25f;
+            const float rise = ((held & HidNpadButton_A) ? 1.0f : 0.0f) - ((held & HidNpadButton_B) ? 1.0f : 0.0f);
+            for (int j = 0; j < 3; ++j)
+                pos[j] += v * (lx * move[0][j] + ly * move[1][j] + rise * lvl[1][j]);
+            // D = [Rot^T | -Rot^T p]: row k of Rot^T is the new axis k (old space) re-expressed: D x = B (rot^T(x - p)).
+            float D[16] = {};
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                {
+                    // (old axis r) . (sum_k new axis k * component k): component along new axis k goes to old axis k.
+                    float m = 0.0f;
+                    for (int k = 0; k < 3; ++k)
+                        m += axis[k][r] * rot[k][c];
+                    D[c * 4 + r] = m;
+                }
+            for (int r = 0; r < 3; ++r)
+                D[12 + r] = -(D[r] * pos[0] + D[4 + r] * pos[1] + D[8 + r] * pos[2]);
+            D[15] = 1.0f;
+            float C[16], PD[16];
+            if (flyable)
+            {
+                mul4(P, D, PD);
+                mul4(PD, Pi, C);
+            }
+            else
+                for (int i = 0; i < 16; ++i)
+                    C[i] = i % 5 == 0 ? 1.0f : 0.0f;
+            const bool drawn = native_renderer::photoReplay(C);
+            if (live.photoShot.exchange(0) != 0)
+            {
+                if (drawn)
+                    native_renderer::finishFrames(); // the picture just drawn is the one saved
+                const int r = savePhoto172(saved + 1);
+                if (r > 0)
+                    ++saved;
+                else
+                    failure = r;
+            }
+            // About 60 a second (the renderer's own pacing holds it when it is slower).
+            const uint64_t spent = armTicksToNs(armGetSystemTick() - tick);
+            if (spent < 16000000ull)
+                svcSleepThread(static_cast<int64_t>(16000000ull - spent));
+        }
+        native_renderer::photoTape(false);
+        live.photoShot = 0;
+        live.photoResult = saved > 0 ? saved : failure;
+        entering = 0;
+        std::fprintf(stderr, "[photo172] game resumed: %d photos saved%s\n", saved, failure == -1 ? " (no picture: frame generation)" : failure == -2 ? " (SD write failed)" : "");
+    }
+#endif
     void syncFrame(uint8_t *rdram)
     {
         if (g_ram != rdram) // (read by the model jobs: written once)
@@ -6007,6 +6366,11 @@ namespace sotc_native
             sotc_decomp::fastStatsTick(frame);
             ps2_lean::frameTick(frame);
             sotc_decomp::abTick(frame);
+#if defined(__SWITCH__)
+            // v172 photo mode (may wait here while the game is frozen). v173d: before the next frame is opened (the
+            // free camera's replays open and close frames of their own; v173c called it inside the open frame).
+            photoFrame();
+#endif
             native_renderer::beginFrame();
             // SOTC_DRAW_DUMP_FRAMES=f,f,... (debugging): those frames' draws to
             // SOTC_DRAW_DUMP_DIR (default shots)/draws_<frame>.txt.
@@ -6044,6 +6408,9 @@ namespace sotc_native
             if (HookStats &hs = hookStats(); hs.on)
                 hs.headers.clear(), hs.surfaceSet.clear(), hs.textureSet.clear(); // distinct per frame: summed below as sizes
             g_frame = frame;
+            sotc_texpack::frame(); // v167: the texture pack's finished loads, its switch
+            sotc_cheats::frame(rdram); // v170: the cheats turned on (guest data writes, as PCSX2 at vsync)
+            native_renderer::threads::setBoost4(celosia::live::settings().boost4.load(std::memory_order_relaxed)); // v170 (no-op unchanged)
             newDrawOrder();
             {
                 const auto envOn = [](const char *name)
@@ -6159,7 +6526,10 @@ namespace sotc_native
         float s = 0.0f, t = 0.0f;
         uint32_t u = 0, v = 0;
         uint32_t header = 0, layer = 0;
-        std::vector<native_renderer::Vertex> strip; // this primitive's vertices
+        // v158: this primitive's vertices as the kicks read them: its first and its last three
+        // (a fan reads the first and the last two, a strip the last three, the rest at most three).
+        native_renderer::Vertex first{}, last[3]{};
+        uint32_t count = 0;
         std::vector<native_renderer::Vertex> batch; // triangles under one state
         uint64_t batchKey = ~0ull;
         uint64_t batchPrim = 0, batchAlpha = 0;      // that state
@@ -6217,6 +6587,30 @@ namespace sotc_native
         state.screenCopy = a.batchHeader == kScreenCopy && (a.batchPrim & 0x10u);
         state.previousFrame = a.batchHeader == kPreviousFrame && (a.batchPrim & 0x10u);
         const bool textured = (a.batchPrim & 0x10u) && !state.screenCopy && !state.previousFrame;
+#if defined(__SWITCH__)
+        // v172 photo mode: the HUD (the textured 2D draws: gauges, text, icons) left out; the screen copies (heat haze,
+        // blur) and the untextured ones (fades) stay. CELOSIA_DIAG_PHOTO_HUD=1: the HUD kept.
+        static const bool photoHud = std::getenv("CELOSIA_DIAG_PHOTO_HUD") != nullptr;
+        if (!photoHud && !state.screenCopy && !state.previousFrame && celosia::live::settings().photoMode.load(std::memory_order_relaxed) != 0)
+        {
+            // v173j: the untextured ones too unless they cover the screen (fades): the grip gauge's pink disc is
+            // untextured. The 2D vertices are in clip space (x, y in -1..1 across the screen).
+            bool hide = textured;
+            if (!hide)
+            {
+                float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+                for (const native_renderer::Vertex &v : a.batch)
+                    x0 = std::min(x0, v.x), x1 = std::max(x1, v.x), y0 = std::min(y0, v.y), y1 = std::max(y1, v.y);
+                hide = x1 - x0 < 1.8f || y1 - y0 < 1.8f;
+            }
+            if (hide)
+            {
+                a.batch.clear();
+                a.batchKey = ~0ull;
+                return;
+            }
+        }
+#endif
         // Round 28: glEnd's batches (g_2dDefer) with model jobs still on the
         // worker go there as a job of their own, after them, instead of the
         // game thread waiting for them (the fight's heat haze: ~7 ms of
@@ -6330,8 +6724,9 @@ namespace sotc_native
     {
         Assembler &a = g_2d;
         native_renderer::Vertex o{};
-        o.x = ((static_cast<float>(xyz & 0xFFFFu) / 16.0f) - 2048.0f) / 256.0f;
-        o.y = -((static_cast<float>((xyz >> 16) & 0xFFFFu) / 16.0f) - 2048.0f) / 224.0f;
+        // v158: the divisions by powers of two as products by their (exact) reciprocals: the same bits.
+        o.x = ((static_cast<float>(xyz & 0xFFFFu) * 0.0625f) - 2048.0f) * (1.0f / 256.0f);
+        o.y = -((static_cast<float>((xyz >> 16) & 0xFFFFu) * 0.0625f) - 2048.0f) / 224.0f;
         o.nz = 1.0f;
         if (a.header == kScreenCopy)
         {
@@ -6347,17 +6742,18 @@ namespace sotc_native
         o.a = static_cast<uint8_t>(a.rgbaq >> 24);
         if (((a.alpha >> 4) & 3u) == 2u) // C = FIX
             o.a = static_cast<uint8_t>(std::min<uint64_t>((a.alpha >> 32) & 0xFFu, 0x80u));
-        // kScreenCopy: 0x10f37c8's 256 x 256 copy of the screen.
-        const uint32_t format = a.header == kScreenCopy ? 0x00880000u : (a.header ? word(a.header + 0x1Cu) : 0u);
         if ((a.prim & 0x100u) && a.header == kPreviousFrame) // the display buffer, 512 x 448
         {
-            o.u = (static_cast<float>(a.u) / 16.0f) / 512.0f;
-            o.v = (static_cast<float>(a.v) / 16.0f) / 448.0f;
+            o.u = (static_cast<float>(a.u) * 0.0625f) * (1.0f / 512.0f);
+            o.v = (static_cast<float>(a.v) * 0.0625f) / 448.0f;
         }
         else if (a.prim & 0x100u) // FST: UV in texels, 12.4
         {
-            o.u = (static_cast<float>(a.u) / 16.0f) / static_cast<float>(1u << ((format >> 16) & 0xFu));
-            o.v = (static_cast<float>(a.v) / 16.0f) / static_cast<float>(1u << ((format >> 20) & 0xFu));
+            // kScreenCopy: 0x10f37c8's 256 x 256 copy of the screen. v158: the texture's format read
+            // only here (the one branch that uses it), the sizes' divisions as exact products.
+            const uint32_t format = a.header == kScreenCopy ? 0x00880000u : (a.header ? word(a.header + 0x1Cu) : 0u);
+            o.u = (static_cast<float>(a.u) * 0.0625f) * std::ldexp(1.0f, -static_cast<int>((format >> 16) & 0xFu));
+            o.v = (static_cast<float>(a.v) * 0.0625f) * std::ldexp(1.0f, -static_cast<int>((format >> 20) & 0xFu));
         }
         else
         {
@@ -6369,17 +6765,22 @@ namespace sotc_native
             o.u = a.s * k;
             o.v = a.t * k;
         }
-        std::vector<native_renderer::Vertex> &v = a.strip;
-        v.push_back(o);
+        if (a.count == 0u)
+            a.first = o;
+        a.last[0] = a.last[1];
+        a.last[1] = a.last[2];
+        a.last[2] = o;
+        ++a.count;
         if (!kick)
             return;
-        const size_t n = v.size();
+        const uint32_t n = a.count;
+        const native_renderer::Vertex &l3 = a.last[0], &l2 = a.last[1], &l1 = a.last[2]; // v[n-3], v[n-2], v[n-1]
         switch (a.prim & 7u)
         {
         case 1: case 2: // line, line strip: one pixel wide
             if (n >= 2)
             {
-                native_renderer::Vertex p0 = v[n - 2], p1 = v[n - 1];
+                native_renderer::Vertex p0 = l2, p1 = l1;
                 float dx = (p1.x - p0.x) * 256.0f, dy = (p1.y - p0.y) * 224.0f;
                 const float len = std::sqrt(dx * dx + dy * dy);
                 if (len > 0.0f)
@@ -6392,37 +6793,38 @@ namespace sotc_native
                     emit2D(q[1], q[3], q[2]);
                 }
                 if ((a.prim & 7u) == 1u)
-                    v.clear();
+                    a.count = 0;
             }
             break;
         case 3: // triangles
             if (n == 3)
             {
-                emit2D(v[0], v[1], v[2]);
-                v.clear();
+                emit2D(l3, l2, l1);
+                a.count = 0;
             }
             break;
         case 4: // triangle strip
             if (n >= 3)
-                emit2D(v[n - 3], v[n - 2], v[n - 1]);
+                emit2D(l3, l2, l1);
             break;
         case 5: // triangle fan
             if (n >= 3)
-                emit2D(v[0], v[n - 2], v[n - 1]);
+                emit2D(a.first, l2, l1);
             break;
         case 6: // sprite: two opposite corners
             if (n == 2)
             {
-                native_renderer::Vertex q[4] = {v[0], v[1], v[1], v[1]};
-                q[1].y = v[0].y; q[1].v = v[0].v; // (x1, y0)
-                q[2].x = v[0].x; q[2].u = v[0].u; // (x0, y1)
+                const native_renderer::Vertex v0 = l2, v1 = l1;
+                native_renderer::Vertex q[4] = {v0, v1, v1, v1};
+                q[1].y = v0.y; q[1].v = v0.v; // (x1, y0)
+                q[2].x = v0.x; q[2].u = v0.u; // (x0, y1)
                 emit2D(q[0], q[1], q[2]);
                 emit2D(q[1], q[3], q[2]);
-                v.clear();
+                a.count = 0;
             }
             break;
         default:
-            v.clear();
+            a.count = 0;
         }
     }
 
@@ -6460,7 +6862,7 @@ namespace sotc_native
         a.header = g_requested;
         switch (reg)
         {
-        case 0x00u: a.prim = value; a.strip.clear(); break;
+        case 0x00u: a.prim = value; a.count = 0; break;
         case 0x01u: a.rgbaq = value; break;
         case 0x02u:
             std::memcpy(&a.s, &value, 4);
@@ -6779,22 +7181,69 @@ namespace sotc_native
     }
     void immArm128(std::vector<uint64_t> *rec) { g_immRec128 = rec; }
 
+    // v158: gsReg's callers by kind (the ranges below are disjoint), cached by return address: a
+    // direct-mapped table of (ra, kind) words, read and written relaxed (a stale entry only misses:
+    // the kind is made again from the ranges).
+    enum : uint8_t { kGsPlain = 1, kGsBloom, kGsFeedback, kGsRefraction, kGs2D };
+    inline uint8_t gsRegKind(uint32_t ra)
+    {
+        static std::atomic<uint64_t> cache[1024];
+        std::atomic<uint64_t> &slot = cache[(ra >> 2) & 1023u];
+        const uint64_t hit = slot.load(std::memory_order_relaxed);
+        if ((hit & 0xFFu) != 0u && static_cast<uint32_t>(hit >> 8) == ra)
+            return static_cast<uint8_t>(hit & 0xFFu);
+        uint8_t kind = kGsPlain;
+        if (ra >= 0x0109E2A0u && ra < 0x0109FB08u)
+            kind = kGsBloom;
+        else if (ra >= 0x01089BF8u && ra < 0x0108A0E0u)
+            kind = kGsFeedback;
+        else if (ra >= 0x0109C610u && ra < 0x0109CD28u)
+            kind = kGsRefraction;
+        else
+            for (const Range &r : k2D)
+                if (ra >= r.start && ra < r.end)
+                {
+                    kind = kGs2D;
+                    break;
+                }
+        slot.store((static_cast<uint64_t>(ra) << 8) | kind, std::memory_order_relaxed);
+        return kind;
+    }
+    bool g_gsRegNative = false; // g_gsReg is decomp_hot44g::gsReg (install): called directly
+    inline void gsRegCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (__builtin_expect(g_gsRegNative, 1))
+            decomp_hot44g::gsReg(rdram, ctx, runtime);
+        else
+            g_gsReg(rdram, ctx, runtime);
+    }
+
     void gsRegHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t ra = GPR_U32(ctx, 31);
-        gsRegCensus(ra);
+        static const bool census = ps2_diag::env("SOTC_GSREG_CENSUS") != nullptr;
         // SOTC_LOG_GSREG=<reg>: who writes that register, in which layer, with what (debugging).
         static const int logReg = std::getenv("SOTC_LOG_GSREG") ? static_cast<int>(std::strtol(std::getenv("SOTC_LOG_GSREG"), nullptr, 0)) : -1;
-        if (logReg >= 0 && (GPR_U32(ctx, 4) & 0xFFu) == static_cast<uint32_t>(logReg))
+        if (__builtin_expect(census || logReg >= 0, 0))
         {
-            static std::set<std::pair<uint32_t, uint64_t>> seen;
-            if (seen.insert({ra, GPR_U64(ctx, 5)}).second && seen.size() < 300)
-                std::fprintf(stderr, "[gsreg-log] ra %08x layer %u value %016llx\n", ra, g_layers.empty() ? 99u : g_layers.back(),
-                             static_cast<unsigned long long>(GPR_U64(ctx, 5)));
+            gsRegCensus(ra);
+            if (logReg >= 0 && (GPR_U32(ctx, 4) & 0xFFu) == static_cast<uint32_t>(logReg))
+            {
+                static std::set<std::pair<uint32_t, uint64_t>> seen;
+                if (seen.insert({ra, GPR_U64(ctx, 5)}).second && seen.size() < 300)
+                    std::fprintf(stderr, "[gsreg-log] ra %08x layer %u value %016llx\n", ra, g_layers.empty() ? 99u : g_layers.back(),
+                                 static_cast<unsigned long long>(GPR_U64(ctx, 5)));
+            }
         }
-        if (ra >= 0x0109E2A0u && ra < 0x0109FB08u)
+        const uint8_t kind = gsRegKind(ra);
+        if (kind == kGsPlain)
+            return gsRegCall(rdram, ctx, runtime);
+        if (kind == kGsBloom)
+        {
             g_bloomRan = true;
-        if (ra >= 0x01089BF8u && ra < 0x0108A0E0u)
+            return gsRegCall(rdram, ctx, runtime);
+        }
+        if (kind == kGsFeedback)
         {
             // feedbackBlur / feedbackBlur2 (layer 29): the display buffer, the
             // last frame shown, laid over the new one (FIX or vertex alpha).
@@ -6811,18 +7260,14 @@ namespace sotc_native
                 lastLogged = g_frame;
             }
             if (!native_renderer::tuning().feedback)
-            {
-                g_gsReg(rdram, ctx, runtime);
-                return;
-            }
+                return gsRegCall(rdram, ctx, runtime);
             const uint32_t requested = g_requested;
             g_requested = kPreviousFrame;
             feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
             g_requested = requested;
-            g_gsReg(rdram, ctx, runtime);
-            return;
+            return gsRegCall(rdram, ctx, runtime);
         }
-        if (ra >= 0x0109C610u && ra < 0x0109CD28u)
+        if (kind == kGsRefraction)
         {
             // refractionEnd under water (0x109c610): a grid of strips over the
             // screen at layer 19, its ST waving over refractionBegin's 256 x 256
@@ -6833,8 +7278,7 @@ namespace sotc_native
             g_requested = kScreenCopy;
             feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
             g_requested = requested;
-            g_gsReg(rdram, ctx, runtime);
-            return;
+            return gsRegCall(rdram, ctx, runtime);
         }
         // Round 31: the 2D functions' writes as glEnd's (round 28): an
         // untextured batch flushed while model jobs are pending goes to the
@@ -6844,19 +7288,14 @@ namespace sotc_native
         // thread (fadeScreen 51%), nearly all of it this join's wait.
         // SOTC_GSREG_ASYNC=0: the join at every write, as before.
         static const bool async2d = !std::getenv("SOTC_GSREG_ASYNC") || std::atoi(std::getenv("SOTC_GSREG_ASYNC")) != 0;
-        for (const Range &r : k2D)
-        {
-            if (ra < r.start || ra >= r.end)
-                continue;
-            syncFrame(rdram);
-            if (!async2d)
-                hookJoin(hookjobs::k_gsreg_2d);
-            g_2dDefer = async2d;
-            feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
-            g_2dDefer = false;
-            break;
-        }
-        g_gsReg(rdram, ctx, runtime);
+        // kGs2D
+        syncFrame(rdram);
+        if (!async2d)
+            hookJoin(hookjobs::k_gsreg_2d);
+        g_2dDefer = async2d;
+        feed2D(GPR_U32(ctx, 4) & 0xFFu, GPR_U64(ctx, 5));
+        g_2dDefer = false;
+        gsRegCall(rdram, ctx, runtime);
     }
 
     void texTransRequestHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -8512,7 +8951,21 @@ namespace sotc_native
         const float corner = 340.2f; // PS2 pixels from the centre to a corner (256, 224)
         const float moved = std::fabs(b.scale - 1.0f) * corner + (std::fabs(b.angle) >= 0.01570796f ? std::fabs(b.angle) * corner : 0.0f) + std::fabs(b.dx) + std::fabs(b.dy);
         const bool identity = !(moved >= 1.0f / 16.0f); // (NaN: left out too)
-        if (native_renderer::tuning().screenBlur && b.steps > 0 && b.steps < 64 && (!identity || drawIdentity))
+        // v170: "Motion blur" off (menu): cameraBlur's blurs (0x0108B188 - 0x0108B960) not drawn; the guest
+        // still runs (its state, its GS writes) and every other caller's blur (the scenes' effects) is drawn.
+        const uint32_t caller170 = GPR_U32(ctx, 31);
+        const bool camera170 = caller170 >= 0x0108B188u && caller170 < 0x0108B960u;
+        const bool blurOff170 = camera170 && !celosia::live::settings().motionBlur.load(std::memory_order_relaxed);
+        {
+            static uint32_t drawn170 = 0, skipped170 = 0;
+            if (camera170 && b.steps > 0 && (!identity || drawIdentity))
+            {
+                ++(blurOff170 ? skipped170 : drawn170);
+                if ((drawn170 + skipped170) % 300u == 1u)
+                    std::fprintf(stderr, "[mblur170] camera blurs drawn %u, left out %u\n", drawn170, skipped170);
+            }
+        }
+        if (!blurOff170 && native_renderer::tuning().screenBlur && b.steps > 0 && b.steps < 64 && (!identity || drawIdentity))
         {
             if (lazy)
                 hookJoin(hookjobs::k_screenblur);
@@ -11492,6 +11945,8 @@ namespace sotc_native
                     if (native_renderer::Vertex *out = native_renderer::frameMesh(std::max<uint32_t>(packet.maxVertices, static_cast<uint32_t>(packet.bind.size()))))
                     {
                         const PosedMesh written = poseSkinned(packet, palette.data(), out);
+                        if (!written.vertices) // v171g: nothing left to draw (every triangle collapsed): not sent
+                            return;
                         native_renderer::commitFrameMesh(mesh, written.vertices, written.indices);
                         if (g_skinAtKick)
                             g_skinDrawList.push_back({skinRecord(), &packet, mesh, 0u, 0u, 0u});
@@ -12239,6 +12694,7 @@ void installSotcNative(PS2Runtime &runtime)
     if (runtime.hasFunction(kGsReg) && runtime.hasFunction(kTexTransRequest) && runtime.hasFunction(kPushLayer) && runtime.hasFunction(kPopLayer))
     {
         g_gsReg = sotc_decomp::behindHook(runtime, kGsReg); // its native when registered (round 44)
+        g_gsRegNative = g_gsReg == &decomp_hot44g::gsReg; // v158: called directly (no difftest checker, not SKIP)
         runtime.registerFunction(kGsReg, gsRegHook);
         g_texTransRequest = sotc_decomp::behindHook(runtime, kTexTransRequest); // its native when registered (round 48)
         runtime.registerFunction(kTexTransRequest, texTransRequestHook);

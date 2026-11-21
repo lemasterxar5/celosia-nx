@@ -136,7 +136,7 @@ celosia nx is built on these projects. Thank you to all of their authors.
 - **[PS2Recomp](https://github.com/ran-j/PS2Recomp)**: the PS2 static recompiler and runtime.
 - **[devkitPro](https://devkitpro.org/)**: the Switch toolchain, [libnx](https://github.com/switchbrew/libnx),
   [deko3d](https://github.com/devkitPro/deko3d) and [uam](https://github.com/devkitPro/uam), the shader compiler.
-- **lsfg-deko3d** by **NaGaa95**, as used in Cemu-nx: Lossless Scaling frame generation on
+- **lsfg-deko3d** by **[NaGaa95](https://github.com/NaGaa95)**, from [Cemu-nx](https://github.com/NaGaa95/Cemu-nx): Lossless Scaling frame generation on
   deko3d.
 - **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)**: shader translation for the LSFG preparation.
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)**: the frame generation itself.

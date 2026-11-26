@@ -35,6 +35,7 @@ void main() {
         return;
     }
     if(mode==0){outputColour=vec4(texture(image,frag*u.params.zw).rgb,1.0);return;}
+    if(mode==20){outputColour=vec4(texture(image,frag*u.params.zw).rgb,128.0/255.0);return;} // v176: screen copy (alpha 0x80)
     if(mode==17){
         vec2 uv=frag*u.params.zw;
         vec3 cd=floor(texture(image,uv).rgb*255.0+0.001),cs=floor(texture(second,uv).rgb*255.0+0.001);

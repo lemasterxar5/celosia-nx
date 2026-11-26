@@ -71,6 +71,7 @@ void main() {
         rgb=mix(rgb,textureLod(background,gl_FragCoord.xy*u.debug.xy,0.0).rgb,f);
     }
 #endif
+    rgb*=1.0-u.debug.z; // v179: the weak points' glow scaled (render.cpp; 0 elsewhere)
 #if defined(LEAN_ZEROADD) && !defined(LEAN_OPAQUE)
     if(max(rgb.r,max(rgb.g,rgb.b))*a<0.5/255.0)discard;
 #endif

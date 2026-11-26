@@ -3892,6 +3892,7 @@ namespace sotc_native
 #if defined(__SWITCH__)
     void quickPosition();
 #endif
+
     void endFrame()
     {
         if (g_frame == 0)
@@ -8967,7 +8968,16 @@ namespace sotc_native
         }
         if (!blurOff170 && native_renderer::tuning().screenBlur && b.steps > 0 && b.steps < 64 && (!identity || drawIdentity))
         {
-            if (lazy)
+            // v184 (the console's frame log: 'joins screenblur' 3.2 ms in the frames the camera turns): on the Switch
+            // the renderer (deko3d) places a blur by its layer among the frame's draws, sorted at the frame's end,
+            // not by when it comes, and the model jobs' draws all reach the same frame (joined at syncFrame before
+            // endFrame): the join is not needed. CELOSIA_DIAG_SBLUR184=0: the join (v183).
+#if defined(__SWITCH__)
+            static const bool join184 = [] { const char *v = std::getenv("CELOSIA_DIAG_SBLUR184"); return v && std::atoi(v) == 0; }();
+#else
+            constexpr bool join184 = true;
+#endif
+            if (lazy && join184)
                 hookJoin(hookjobs::k_screenblur);
             native_renderer::addScreenBlur(b);
         }

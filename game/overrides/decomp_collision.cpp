@@ -5678,6 +5678,69 @@ namespace decomp_collision
         return _mm_cvtss_f32(vu::addN(acc, vu::mulN(one, vu::lane<2>(m))));
     }
 
+    // v181 (CPU: waterProbe 2.65% + waterSurface 1.88% of the game thread in v179's 4-core run): a
+    // water triangle whose xz box, widened by a wide margin, cannot hold the point (waterProbe) or the
+    // segment's crossing (waterSurface) skips the barycentric (three outer products, two divides): the
+    // original always rejects it there. Exact: such a triangle only writes f0 (rewritten by the next
+    // triangle: the last one always runs in full) and, on a zero divisor, fcr31's flags (a thin or flat
+    // triangle: never skipped). The margin: 1% of the box plus 1e-5 of the coordinates' size; a
+    // triangle thinner than ~3 degrees runs in full. The decision itself in doubles on the same floats.
+    // CELOSIA_DIAG_WATER181=0: off (v180's loops). CELOSIA_DIAG_WATER181_VERIFY=1: skipped triangles
+    // still run (the result is the original's) and the ones that would not have been rejected are
+    // counted ("mismatch" in the [water181] line, every 30000 calls). (v181 checked 1 call in 64: 0 mismatches.)
+    struct Water181
+    {
+        bool on, verify;
+        std::atomic<uint64_t> calls{0}, triangles{0}, skipped{0}, mismatch{0};
+    };
+    Water181 &water181()
+    {
+        static Water181 w{[] { const char *d = std::getenv("CELOSIA_DIAG_WATER181"); return !(d && std::atoi(d) == 0); }(),
+                          [] { const char *v = std::getenv("CELOSIA_DIAG_WATER181_VERIFY"); return v && std::atoi(v) != 0; }()};
+        return w;
+    }
+    void water181Note(Water181 &w, uint64_t triangles, uint64_t skipped, uint64_t mismatch)
+    {
+        if (!w.verify) // v188: the counts and the line only in the verify mode (shipping builds: no tallies)
+            return;
+        w.triangles.fetch_add(triangles, std::memory_order_relaxed);
+        w.skipped.fetch_add(skipped, std::memory_order_relaxed);
+        if (mismatch)
+            w.mismatch.fetch_add(mismatch, std::memory_order_relaxed);
+        const uint64_t n = w.calls.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n % 30000u == 0u)
+            std::fprintf(stderr, "[water181] %s: %llu calls, %llu triangles, %llu skipped, %llu mismatch\n", w.verify ? "verify" : (w.on ? "on" : "off"),
+                         (unsigned long long)n, (unsigned long long)w.triangles.load(), (unsigned long long)w.skipped.load(),
+                         (unsigned long long)w.mismatch.load());
+    }
+    // The query box [qx0, qx1] x [qz0, qz1] (object space) cannot reach the triangle (v, v + a, v + b).
+    inline bool water181Far(double qx0, double qx1, double qz0, double qz1, double vx, double vz, double x1, double z1, double x2, double z2)
+    {
+        constexpr double big = 1.0e7;
+        const double all[] = {qx0, qx1, qz0, qz1, vx, vz, x1, z1, x2, z2};
+        double size = 0.0;
+        for (double x : all)
+        {
+            if (!(std::fabs(x) < big))
+                return false;
+            size = std::max(size, std::fabs(x));
+        }
+        const double ax = x1 - vx, az = z1 - vz, bx = x2 - vx, bz = z2 - vz;
+        const double cr = ax * bz - az * bx, aa = ax * ax + az * az, bb = bx * bx + bz * bz;
+        if (!(aa > 0.0) || !(bb > 0.0) || !(cr * cr >= 0.0025 * aa * bb))
+            return false;
+        const double minx = std::min({vx, x1, x2}), maxx = std::max({vx, x1, x2}), minz = std::min({vz, z1, z2}), maxz = std::max({vz, z1, z2});
+        const double margin = 0.01 * ((maxx - minx) + (maxz - minz)) + 1.0e-5 * size;
+        return qx1 < minx - margin || qx0 > maxx + margin || qz1 < minz - margin || qz0 > maxz + margin;
+    }
+    struct W181Done
+    {
+        Water181 &w;
+        int32_t count;
+        uint64_t &skipped, &mismatch;
+        ~W181Done() { water181Note(w, count > 0 ? uint64_t(count) : 0u, skipped, mismatch); }
+    };
+
     void waterProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (!sotc_decomp::collProbeOn() || sotc_decomp::jalTarget(rdram, 0x01117EE8u) != kGetLayoutClass)
@@ -5697,9 +5760,22 @@ namespace decomp_collision
         const float lowLimit = bitsFloat(0xB7A7C5ACu), highLimit = bitsFloat(0x37A7C5ACu), one = bitsFloat(0x3F800000u);
         float f0 = ctx->f[0];
         uint32_t t = g.u32(rec + 0x3Cu);
+        Water181 &w181 = water181();
+        uint64_t w181Skipped = 0, w181Mismatch = 0;
+        const W181Done w181Done{w181, count, w181Skipped, w181Mismatch};
+        const bool w181Check = w181.verify; // v182: v181's 1-in-64 check found 0 mismatches in 90 000 calls: off by default
         for (int32_t i = 0; i < count; ++i, t += 0x20u)
         {
             const float vx = g.f32(t + 8u), vz = g.f32(t + 0xCu);
+            bool w181Far = false;
+            if (w181.on && i + 1 < count &&
+                water181Far(p1x, p1x, p1z, p1z, vx, vz, g.f32(t + 0x10u), g.f32(t + 0x14u), g.f32(t + 0x18u), g.f32(t + 0x1Cu)))
+            {
+                ++w181Skipped;
+                if (!w181Check)
+                    continue;
+                w181Far = true;
+            }
             const __m128 a = vu::clamp(_mm_setr_ps(FPU_SUB_S(g.f32(t + 0x10u), vx), 0.0f, FPU_SUB_S(g.f32(t + 0x14u), vz), 0.0f));
             const __m128 b = vu::clamp(_mm_setr_ps(FPU_SUB_S(g.f32(t + 0x18u), vx), 0.0f, FPU_SUB_S(g.f32(t + 0x1Cu), vz), 0.0f));
             const __m128 c = vu::clamp(_mm_setr_ps(FPU_SUB_S(p1x, vx), 0.0f, FPU_SUB_S(p1z, vz), 0.0f));
@@ -5717,6 +5793,8 @@ namespace decomp_collision
             f0 = FPU_SUB_S(FPU_ADD_S(u, v), one);
             if (FPU_C_OLT_S(highLimit, f0))
                 continue;
+            if (w181Far)
+                ++w181Mismatch;
             const float h = g.f32(t + 4u);
             if (FPU_C_OLT_S(p1y, h))
             {
@@ -5764,6 +5842,9 @@ namespace decomp_collision
         const vu::Rows rows = vu::clampRows(rowsIn);
         const __m128 p0 = vu::apply(rows, g.q(GPR_U32(ctx, 5))), p1 = vu::apply(rows, g.q(GPR_U32(ctx, 6)));
         const float p0y = _mm_cvtss_f32(vu::lane<1>(p0)), p1y = _mm_cvtss_f32(vu::lane<1>(p1));
+        const double w181x0 = std::min(_mm_cvtss_f32(p0), _mm_cvtss_f32(p1)), w181x1 = std::max(_mm_cvtss_f32(p0), _mm_cvtss_f32(p1)),
+                     w181z0 = std::min(_mm_cvtss_f32(vu::lane<2>(p0)), _mm_cvtss_f32(vu::lane<2>(p1))),
+                     w181z1 = std::max(_mm_cvtss_f32(vu::lane<2>(p0)), _mm_cvtss_f32(vu::lane<2>(p1)));
         // A triangle filter (IsWaterSurfaceExistAround's, the
         // ClipCollisionVariableXZSurfaceCB's) runs as a guest call for every
         // triangle, so a crossing (b under a, which needs the recompiled
@@ -5782,16 +5863,76 @@ namespace decomp_collision
         const __m128 vf0 = ctx->vu0_vf[0];
         float f0 = ctx->f[0];
         uint32_t t = g.u32(rec + 0x3Cu);
+        Water181 &w181 = water181();
+        uint64_t w181Skipped = 0, w181Mismatch = 0;
+        const W181Done w181Done{w181, count, w181Skipped, w181Mismatch};
+        const bool w181Check = w181.verify; // v182: v181's 1-in-64 check found 0 mismatches in 90 000 calls: off by default
+        // v187 (v186's counter: 57% of the triangles cross the height; 52 us a call, 2 of them in the filter): a
+        // crossing triangle far from the segment (water181Far) skips everything after the height test: the work
+        // block (the last triangle writes it anyway), the crossing's division and its two words at `cross`, the
+        // barycentric. Exact: those words are overwritten by the next crossing, so only the last crossing's are
+        // written, at the loop's end, from the same operations; the division cannot set fcr31's flags (its
+        // divisor p1y - p0y is not zero: checked once); f0 as the original leaves it (the last triangle always
+        // runs in full). Off with a filter, in the verify mode and with CELOSIA_DIAG_WATER187=0.
+        static const bool w187 = [] { const char *d = std::getenv("CELOSIA_DIAG_WATER187"); return !(d && std::atoi(d) == 0); }();
+        const bool early187 = w187 && w181.on && !w181Check && filter == 0u && !ps2FloatIsZero(FPU_SUB_S(p1y, p0y));
+        const auto writeCross = [&](float vx, float vz, float h)
+        {
+            const float k = ps2FpuDivide(ctx->fcr31, FPU_SUB_S(h, p0y), FPU_SUB_S(p1y, p0y));
+            const __m128 kx = vu::clamp(_mm_set1_ps(k));
+            const __m128 w = vu::subN(vf0, kx); // vsubx.w vf8, vf0, vf7 (lane w)
+            const __m128 q = vu::addN(vu::mulN(p1, kx), vu::mulN(p0, vu::lane<3>(w)));
+            g.put32(cross, floatBits(FPU_SUB_S(_mm_cvtss_f32(q), vx)));
+            g.put32(cross + 8u, floatBits(FPU_SUB_S(_mm_cvtss_f32(vu::lane<2>(q)), vz)));
+        };
+        bool pending187 = false;
+        float pendingX = 0.0f, pendingZ = 0.0f, pendingH = 0.0f;
         for (int32_t i = 0; i < count; ++i, t += 0x20u)
         {
             const float vx = g.f32(t + 8u), vz = g.f32(t + 0xCu), h = g.f32(t + 4u);
-            g.put32(work + 0x10u, floatBits(FPU_SUB_S(g.f32(t + 0x10u), vx)));
-            g.put32(work + 0x18u, floatBits(FPU_SUB_S(g.f32(t + 0x14u), vz)));
-            g.put32(work + 0x20u, floatBits(FPU_SUB_S(g.f32(t + 0x18u), vx)));
-            g.put32(work, floatBits(vx));
-            g.put32(work + 8u, floatBits(vz));
-            g.put32(work + 0x28u, floatBits(FPU_SUB_S(g.f32(t + 0x1Cu), vz)));
-            g.put32(work + 0x30u, floatBits(h));
+            bool near187 = false;
+            if (early187 && i + 1 < count)
+            {
+                f0 = h;
+                if (!FPU_C_OLT_S(p1y, h))
+                    continue;
+                f0 = p0y;
+                if (!FPU_C_OLT_S(h, p0y))
+                    continue;
+                if (water181Far(w181x0, w181x1, w181z0, w181z1, vx, vz, g.f32(t + 0x10u), g.f32(t + 0x14u), g.f32(t + 0x18u), g.f32(t + 0x1Cu)))
+                {
+                    ++w181Skipped;
+                    pending187 = true;
+                    pendingX = vx;
+                    pendingZ = vz;
+                    pendingH = h;
+                    continue;
+                }
+                near187 = true; // runs on below as before (the same tests again: the same answers)
+            }
+            // v182: the work block's words as registers; written to the guest only where something reads them:
+            // the triangle filter (a guest call each triangle), the barycentric below (it reads the block), and
+            // the last triangle (the words the loop leaves). A way out to the recompiled code writes the block
+            // again from the start. CELOSIA_DIAG_WATER182=0: written every triangle (v181).
+            static const bool w182 = [] { const char *d = std::getenv("CELOSIA_DIAG_WATER182"); return !(d && std::atoi(d) == 0); }();
+            const float e1x = FPU_SUB_S(g.f32(t + 0x10u), vx), e1z = FPU_SUB_S(g.f32(t + 0x14u), vz), e2x = FPU_SUB_S(g.f32(t + 0x18u), vx),
+                        e2z = FPU_SUB_S(g.f32(t + 0x1Cu), vz);
+            const auto writeBlock = [&]
+            {
+                g.put32(work + 0x10u, floatBits(e1x));
+                g.put32(work + 0x18u, floatBits(e1z));
+                g.put32(work + 0x20u, floatBits(e2x));
+                g.put32(work, floatBits(vx));
+                g.put32(work + 8u, floatBits(vz));
+                g.put32(work + 0x28u, floatBits(e2z));
+                g.put32(work + 0x30u, floatBits(h));
+            };
+            bool written = false;
+            if (!w182 || filter != 0u || i + 1 == count)
+            {
+                writeBlock();
+                written = true;
+            }
             f0 = h;
             if (filter != 0u)
             {
@@ -5806,12 +5947,23 @@ namespace decomp_collision
             f0 = p0y;
             if (!FPU_C_OLT_S(h, p0y))
                 continue;
-            const float k = ps2FpuDivide(ctx->fcr31, FPU_SUB_S(h, p0y), FPU_SUB_S(p1y, p0y));
-            const __m128 kx = vu::clamp(_mm_set1_ps(k));
-            const __m128 w = vu::subN(vf0, kx); // vsubx.w vf8, vf0, vf7 (lane w)
-            const __m128 q = vu::addN(vu::mulN(p1, kx), vu::mulN(p0, vu::lane<3>(w)));
-            g.put32(cross, floatBits(FPU_SUB_S(_mm_cvtss_f32(q), vx)));
-            g.put32(cross + 8u, floatBits(FPU_SUB_S(_mm_cvtss_f32(vu::lane<2>(q)), vz)));
+            if (!written)
+            {
+                writeBlock();
+                written = true;
+            }
+            writeCross(vx, vz, h);
+            pending187 = false;
+            // v181: the crossing lies on the segment (0 < k < 1): its box is the segment's.
+            bool w181Far = false;
+            if (!near187 && w181.on && filter == 0u && i + 1 < count &&
+                water181Far(w181x0, w181x1, w181z0, w181z1, vx, vz, g.f32(t + 0x10u), g.f32(t + 0x14u), g.f32(t + 0x18u), g.f32(t + 0x1Cu)))
+            {
+                ++w181Skipped;
+                if (!w181Check)
+                    continue;
+                w181Far = true;
+            }
             const __m128 a = vu::clamp(g.q(work + 0x10u)), b = vu::clamp(g.q(work + 0x20u)), c = vu::clamp(g.q(cross));
             const __m128 n = outer(a, b);
             const __m128 nb = outer(n, b);
@@ -5824,9 +5976,13 @@ namespace decomp_collision
             f0 = FPU_SUB_S(FPU_ADD_S(u, v), one);
             if (FPU_C_OLT_S(highLimit, f0))
                 continue;
+            if (w181Far)
+                ++w181Mismatch;
             COLL_STAT(surfaceSlow);
             return sotc_decomp::recompiled(kWaterSurface)(rdram, ctx, runtime);
         }
+        if (pending187)
+            writeCross(pendingX, pendingZ, pendingH); // the last crossing's words (v187)
         ctx->f[0] = f0;
         SET_GPR_U32(ctx, 31, ra);
         SET_GPR_U32(ctx, 29, spIn);

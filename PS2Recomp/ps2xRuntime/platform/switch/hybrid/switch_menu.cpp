@@ -1,5 +1,5 @@
 // The in-game menu (Minus + Plus together): performance and graphics settings changed while the
-// game runs, save states, and an optional frame-rate overlay. Input comes from pollSwitchInput
+// game runs, and save states. Input comes from pollSwitchInput
 // (main thread); the menu is drawn into the native frame by the game thread at the frame's end
 // (celosia_menu_frame, from sotc_native's frame end) as 2D screen draws over everything else.
 // Settings persist in sdmc:/switch/celosia_nx/menu.cfg as key=value lines.
@@ -89,7 +89,6 @@ std::vector<Tab> tabs;
 std::string status;
 uint64_t statusUntil = 0;
 // Overlay: 0 off, 1 FPS, 2 FPS + GPU + resolution.
-int overlay = 0;
 
 uint64_t nowNs() { return armTicksToNs(armGetSystemTick()); }
 
@@ -202,6 +201,34 @@ void build()
              {"The camera's blur when it turns fast (PS2). The scenes' own effects stay.",
               "El desenfoque de la cámara al girar rápido (PS2). Los efectos de las escenas se mantienen.",
               "O desfoque da câmera ao girar rápido (PS2). Os efeitos das cenas continuam."}},
+            // v176: the screen copies now drawn on the Switch (deko3d makeScreenCopy).
+            {"haze", {"Heat haze and water ripple", "Calima y ondas del agua", "Calor e ondas da água"}, Kind::Choice, {Yes, No}, 0,
+             {"The air's shimmer in the fights and the ripple under water (PS2).",
+              "La vibración del aire en los combates y las ondas bajo el agua (PS2).",
+              "A vibração do ar nas lutas e as ondas debaixo d'água (PS2)."}},
+            // v177: SotC's glow (layer 8 laid over soft) and depth of field, now drawn on the Switch.
+            {"glow", {"Glow", "Resplandor", "Brilho"}, Kind::Choice, {Yes, No}, 0,
+             {"The soft glow of the sigils, the lights and the fallen colossi (PS2).",
+              "El resplandor suave de los sellos, las luces y los colosos caídos (PS2).",
+              "O brilho suave dos selos, das luzes e dos colossos caídos (PS2)."}},
+            {"dof", {"Depth of field", "Profundidad de campo", "Profundidade de campo"}, Kind::Choice, {Yes, No}, 0,
+             {"The blur of what lies far away, in the scenes that use it (PS2).",
+              "El desenfoque de lo lejano, en las escenas que lo usan (PS2).",
+              "O desfoque do que está longe, nas cenas que o usam (PS2)."}},
+            // v179: the weak points' glow at PCSX2's brightness (half the light the port added).
+            {"sigil", {"Weak points as on PCSX2", "Puntos débiles como en PCSX2", "Pontos fracos como no PCSX2"}, Kind::Choice, {Yes, No}, 0,
+             {"The glow of the colossi's weak points at the brightness PCSX2 shows. No: as before (brighter).",
+              "El brillo de los puntos débiles de los colosos como en PCSX2. No: como antes (más brillante).",
+              "O brilho dos pontos fracos dos colossos como no PCSX2. Não: como antes (mais brilhante)."}},
+            // v178: the water's reflection and refraction, now drawn on the Switch.
+            {"reflect", {"Water reflections", "Reflejos del agua", "Reflexos da água"}, Kind::Choice, {Yes, No}, 0,
+             {"The world mirrored on the water, rippling (PS2).",
+              "El mundo reflejado en el agua, con sus ondas (PS2).",
+              "O mundo refletido na água, com suas ondas (PS2)."}},
+            {"refract", {"Water refraction", "Refracción del agua", "Refração da água"}, Kind::Choice, {Yes, No}, 0,
+             {"What lies under the water, seen through it (PS2).",
+              "Lo que hay bajo el agua, visto a través de ella (PS2).",
+              "O que está debaixo d'água, visto através dela (PS2)."}},
             {"shadows", {"Shadows", "Sombras", "Sombras"}, Kind::Choice,
              {{"Soft (PS2)", "Suaves (PS2)", "Suaves (PS2)"}, {"Hard", "Duras", "Duras"}, No}, 0,
              {"Soft: as on PS2 (costs more GPU).", "Suaves: como en PS2 (cuesta más GPU).", "Suaves: como no PS2 (custa mais GPU)."}},
@@ -215,10 +242,6 @@ void build()
              {"A very fine dither: smooth gradients in the sky and the fog.",
               "Un tramado muy fino: degradados suaves en el cielo y la niebla.",
               "Um pontilhado muito fino: degradês suaves no céu e na névoa."}},
-            {"overlay", {"On-screen counter", "Contador en pantalla", "Contador na tela"}, Kind::Choice,
-             {No, same("FPS"), same("FPS + GPU")}, 0,
-             {"Top left, while the menu is closed.", "Arriba a la izquierda, con el menú cerrado.",
-              "No canto superior esquerdo, com o menu fechado."}},
             {"adddiscard", {"Skip empty additive light", "Descartar luz aditiva vacía", "Descartar luz aditiva vazia"}, Kind::Choice,
              {Yes, No}, 0,
              {"Same final colour; saves GPU on glows.", "Mismo color final; ahorra GPU en destellos.",
@@ -329,7 +352,6 @@ void apply()
     static const int caps[3] = {30, 45, 60};
     s.fpsCap = caps[std::clamp(value("fps"), 0, 2)];
     s.swapInterval = s.fpsCap.load() == 30 ? 2 : 1;
-    overlay = value("overlay");
     s.addDiscard = value("adddiscard") == 0;
     s.anisotropy = 1 << std::clamp(value("aniso"), 0, 4);
     static const int handheld[3] = {448, 540, 720}, docked[3] = {720, 900, 1080};
@@ -357,6 +379,12 @@ void apply()
     s.bodyShadows = value("bodyshadows") == 0;
     s.skyImage = value("sky") == 0;
     s.motionBlur = value("mblur") == 0;
+    s.heatHaze = value("haze") == 0; // v176
+    s.glow = value("glow") == 0; // v177
+    s.depthOfField = value("dof") == 0;
+    s.reflections = value("reflect") == 0; // v178
+    s.sigilPs2 = value("sigil") == 0; // v179
+    s.refraction = value("refract") == 0;
     s.boost4 = value("boost4") == 1 && fourCores;
     s.swapFaceButtons = value("swapbuttons") == 1;
     // v173s (the user's request): the GPU at 460.8 MHz while the frame generation, the HD textures (as loaded)
@@ -477,12 +505,21 @@ const PresetValue Presets[] = {
     {"bodyshadows", {0, 0, 0, 0}},
     {"sky",         {0, 0, 0, 0}},
     {"deband",      {0, 1, 1, 1}},
+    // v176 (the user's request): PS3 quality turns the new effects on and the dynamic resolution to Performance;
+    // the other presets leave them as they are (-1).
+    {"haze",        {-1, -1, -1, 0}},
+    {"glow",        {-1, -1, -1, 0}}, // v177
+    {"dof",         {-1, -1, -1, 0}},
+    {"reflect",     {-1, -1, -1, 0}}, // v178
+    {"refract",     {-1, -1, -1, 0}},
+    {"mblur",       {-1, -1, -1, 0}},
+    {"drsmode",     {-1, -1, -1, 3}},
 };
 void applyPreset(int preset)
 {
     if (preset < 1 || preset > 4) return;
     for (const auto &p : Presets)
-        if (Item *i = find(p.key); i && !i->values.empty() && !locked(*i))
+        if (Item *i = find(p.key); i && !i->values.empty() && !locked(*i) && p.v[preset - 1] >= 0)
             i->value = std::clamp(p.v[preset - 1], 0, int(i->values.size()) - 1);
 }
 bool presetKey(const char *key)
@@ -703,6 +740,28 @@ void print(const char *s, float x, float y, float scale, uint8_t r = 240, uint8_
     }
 }
 
+// v176: a text broken into lines no wider than maxW (at this scale), at the spaces.
+std::vector<std::string> wrapLines(const char *text, float scale, float maxW)
+{
+    std::vector<std::string> lines;
+    std::string line, word;
+    auto flushWord = [&] {
+        if (word.empty()) return;
+        const std::string tryLine = line.empty() ? word : line + " " + word;
+        if (!line.empty() && measure(tryLine.c_str(), scale) > maxW) { lines.push_back(line); line = word; }
+        else line = tryLine;
+        word.clear();
+    };
+    for (const char *p = text; *p; ++p) {
+        if (*p == ' ') flushWord();
+        else word += *p;
+    }
+    flushWord();
+    if (!line.empty() || lines.empty()) lines.push_back(line);
+    return lines;
+}
+constexpr float WrapLineH = 16.0f; // 10 px glyphs at 1.5 plus a gap
+
 void submit()
 {
     constexpr float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -729,23 +788,6 @@ void submit()
     rects.clear();
     text.clear();
     title.clear();
-}
-
-void drawOverlay()
-{
-    auto &s = settings();
-    char line[96];
-    const double fps = s.fpsCenti / 100.0, gpu = s.gpuUs / 1000.0;
-    // v155: with frame generation, the images shown per second and the real ones in brackets.
-    static const Text realWord{"real", "reales", "reais"};
-    char rate[48];
-    if (s.frameGen.load(std::memory_order_relaxed) > 0 && s.frameGenShown.load(std::memory_order_relaxed) > 0)
-        std::snprintf(rate, sizeof(rate), "%.1f FPS (%.1f %s)", s.frameGenShown / 100.0, s.frameGenReal / 100.0, tr(realWord));
-    else std::snprintf(rate, sizeof(rate), "%.1f FPS", fps);
-    if (overlay == 1) std::snprintf(line, sizeof(line), "%s", rate);
-    else std::snprintf(line, sizeof(line), "%s  GPU %.1f ms  %ux%u", rate, gpu, unsigned(s.renderWidthNow), unsigned(s.renderHeightNow));
-    rect(8, 8, measure(line, 2.0f) + 16, 30, 0, 0, 0, 160);
-    print(line, 16, 13, 2.0f, 255, 255, 120);
 }
 
 // A slider: a track with a stop per value, the chosen one filled, its name to the right.
@@ -805,7 +847,12 @@ void drawMenu()
     const int count = int(vis.size()), shown = std::min(count, VisibleRows);
     static int first = 0;
     first = std::clamp(first, std::max(0, vrow - shown + 1), std::min(vrow, std::max(0, count - shown)));
-    const float h = 150 + rowH * float(shown) + 70 + (warning ? 24 : 0);
+    // v176: the help and the red note wrapped to the panel; the panel grows by their extra lines.
+    const char *helpText = tr(current.valueHelp.empty() ? current.help : current.valueHelp[std::clamp(current.value, 0, int(current.valueHelp.size()) - 1)]);
+    const char *warnText = warning ? tr(lockedNow ? (current.lock == 1 ? lsfgNote : current.lock == 2 ? packNote : current.warn) : restart ? restartNote : current.warn) : "";
+    const std::vector<std::string> helpLines = wrapLines(helpText, 1.5f, w - 48), warnLines = wrapLines(warnText, 1.5f, w - 48);
+    const float extra = WrapLineH * float(helpLines.size() - 1) + (warning ? WrapLineH * float(warnLines.size() - 1) : 0.0f);
+    const float h = 150 + rowH * float(shown) + 70 + (warning ? 24 : 0) + extra;
     rect(x0, y0, w, h, 8, 8, 8, 235);
     rect(x0, y0, w, 52, 38, 38, 38, 245);
     // v171: the title in Cinzel (title_font.inc, drawn at half its size).
@@ -858,11 +905,14 @@ void drawMenu()
     }
     if (first + shown < count) print("v", x0 + w - 30, y - 10, 1.5f, 200, 200, 200);
     // Help, the red note of the chosen value, status and footer
-    print(tr(current.valueHelp.empty() ? current.help : current.valueHelp[std::clamp(current.value, 0, int(current.valueHelp.size()) - 1)]),
-          x0 + 24, y + 6, 1.5f, 180, 180, 180);
+    for (size_t l = 0; l < helpLines.size(); ++l)
+        print(helpLines[l].c_str(), x0 + 24, y + 6 + WrapLineH * float(l), 1.5f, 180, 180, 180);
+    y += WrapLineH * float(helpLines.size() - 1);
     if (warning) {
         y += 24;
-        print(tr(lockedNow ? (current.lock == 1 ? lsfgNote : current.lock == 2 ? packNote : current.warn) : restart ? restartNote : current.warn), x0 + 24, y + 6, 1.5f, 255, 70, 70);
+        for (size_t l = 0; l < warnLines.size(); ++l)
+            print(warnLines[l].c_str(), x0 + 24, y + 6 + WrapLineH * float(l), 1.5f, 255, 70, 70);
+        y += WrapLineH * float(warnLines.size() - 1);
     }
     if (nowNs() < statusUntil)
         print(status.c_str(), x0 + 24, y + 30, 2.0f, 140, 255, 160);
@@ -927,11 +977,16 @@ extern "C" void celosia_menu_frame()
         if (lastBody < 0 && !body) native_renderer::tuning().bodyShadows = false;
         lastShadows = shadows;
         lastBody = body;
+        native_renderer::tuning().heatHaze = settings().heatHaze.load(std::memory_order_relaxed); // v176 (the filter's switch)
+        native_renderer::tuning().glow = settings().glow.load(std::memory_order_relaxed); // v177
+        native_renderer::tuning().depthOfField = settings().depthOfField.load(std::memory_order_relaxed);
+        native_renderer::tuning().reflections = settings().reflections.load(std::memory_order_relaxed); // v178
+        native_renderer::tuning().refraction = settings().refraction.load(std::memory_order_relaxed);
+        native_renderer::tuning().screenBlur = true; // v177: drawn; the camera's own blur follows "Motion blur"
     }
-    if (!open && (overlay == 0 || settings().photoMode.load(std::memory_order_relaxed) != 0)) // v172: nothing over a photo
+    if (!open) // v181: no on-screen counter (removed at the user's request)
         return;
     prepareFont();
-    if (open) drawMenu();
-    else drawOverlay();
+    drawMenu();
     submit();
 }

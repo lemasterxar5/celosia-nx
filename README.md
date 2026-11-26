@@ -47,11 +47,16 @@ Settings are saved to the SD card when the menu closes and kept across restarts.
     more memory.
   - **Sky bloom**: the glow of the sky and the distance (PS2 effect).
   - **Motion blur**: the camera's blur when it turns fast (PS2 effect). The scenes' own effects stay.
+  - **Heat haze and water ripple**: the air's shimmer in the fights and the ripple under water (PS2 effect).
+  - **Glow**: the soft glow of the sigils, the lights and the fallen colossi (PS2 effect).
+  - **Depth of field**: the blur of what lies far away, in the scenes that use it (PS2 effect).
+  - **Weak points as on PCSX2**: the colossi's weak points glow at the brightness PCSX2 shows.
+  - **Water reflections**: the world mirrored on the water, rippling (PS2 effect).
+  - **Water refraction**: what lies under the water, seen through it (PS2 effect).
   - **Shadows**: soft (as on PS2, costs more GPU) or hard.
   - **Character shadows**: Wander, Agro and the colossi on the ground.
   - **Sky and background fog**: the PS2's background image behind the fog.
   - **Reduce colour banding**: a very fine dither for smooth gradients in the sky and the fog.
-  - **On-screen counter**: FPS counter in the top left, while the menu is closed.
   - **Skip empty additive light**: same final colour, saves GPU on glows.
 
 ### Cheats

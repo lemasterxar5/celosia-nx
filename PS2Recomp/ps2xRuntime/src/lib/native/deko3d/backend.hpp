@@ -244,6 +244,28 @@ class DekoBackend final : public Backend {
     bool bloomAllowed=true,bloomHistory=false;
     std::shared_ptr<Image> bloomMask,bloomChain[7];
     uint32_t bloomMaskSlot=DescriptorSlots::None,bloomChainSlot[7]{};
+    // v176: the screen copies (heat haze, underwater ripple; GL textured 4): the picture so far copied once a
+    // frame, before the first such draw, to 256 x 256 and blurred once through 128 x 128 as the PS2 does
+    // (GL `small`); the draws sample it at their UV (screenCopyTexture: alpha 128 = the vertex alpha as is).
+    std::shared_ptr<Image> screenCopy,screenCopyHalf;uint32_t screenCopySlot=DescriptorSlots::None,screenCopyHalfSlot=DescriptorSlots::None;
+    std::shared_ptr<Texture> screenCopyTexture;bool screenCopyMade=false;uint32_t lastScreenCopies=0,lastScreenCopyDrops=0;
+    // v177: the screen blurs, the depth of field and the glow composite at their layers (GL's events):
+    // effects.frag.glsl; the output images readable (no separate scene); the blur's full-size copy (1x) and
+    // the glow layer (on the scene's depth, the scene's samples), its resolve and its 256/128/64/64 steps,
+    // made on first use (made again after a resize; a failed allocation leaves the effect as before).
+    std::unique_ptr<Shader> effectsShader;
+    std::vector<ScreenBlur> blurs,frameBlurs;GlowComposite glow{};DepthOfField dof{};
+    uint32_t colorReadSlot[Frames]{DescriptorSlots::None,DescriptorSlots::None,DescriptorSlots::None},colorReadGen[Frames]{},swapGeneration=1;
+    std::shared_ptr<Image> fullCopy,glowMs,glowResolved,glowSmall[4];
+    uint32_t fullCopySlot=DescriptorSlots::None,glowSlot=DescriptorSlots::None,
+             glowSmallSlot[4]{DescriptorSlots::None,DescriptorSlots::None,DescriptorSlots::None,DescriptorSlots::None};
+    bool blurFailed=false,glowFailed=false;
+    // v178: the water's mirror (GL `reflection`: 256 x 256 with a depth of its own, cleared to the fog colour;
+    // the reflectionSource draws drawn into it before the first draw that reads it) and the screen copy's
+    // use (1 heat haze, 2 refraction at layer 9: each its own copy, as GL's two events).
+    std::shared_ptr<Image> mirror,mirrorDepth;uint32_t mirrorSlot=DescriptorSlots::None;std::shared_ptr<Texture> mirrorTexture;
+    uint32_t screenCopyUse=0,lastMirrors=0,lastMirrorDraws=0;
+    uint32_t lastBlurs=0,lastDofs=0,lastGlows=0,lastEffectDrops=0;
     // v150: the scene's render size (rw x rh, 16:9; the output stays Width x Height). Below the output
     // the scene is drawn into `scene` and scaled onto the swapchain image at the frame's end, the menu's
     // screen draws (order >= MenuOrder) after it at the output's size.
@@ -346,6 +368,11 @@ class DekoBackend final : public Backend {
     std::unique_ptr<Shader> bloomFragmentShader;
     uint32_t lastBloomRuns=0;
     void runBloom(int slot);
+    bool makeScreenCopy(int slot,uint32_t use=1); // v176 (v178: use 1 haze, 2 refraction)
+    bool drawMirror(int slot,const std::vector<Draw> &all); // v178
+    uint32_t sceneReadSlot(int slot); // v177: the picture so far as a texture (scene, resolved or output)
+    bool ensureFullCopy();bool ensureGlowTargets();
+    void runBlur(const ScreenBlur &b,int slot);void runDof(int slot);bool beginGlow();void endGlow(int slot);
     // blend: 0 none, 1 added (one, one), 2 darkened (zero, 1 - source alpha). stencil: only where the
     // shadow count is not zero, clearing it.
     void bloomQuad(int mode,uint32_t source,uint32_t second,const float params[4],const float colour[4],int blend,float maskDepth,bool stencil=false);

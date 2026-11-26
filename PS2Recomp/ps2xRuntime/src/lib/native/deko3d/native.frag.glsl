@@ -20,6 +20,19 @@ bool alphaPass(float a,int test,float reference) {
 }
 void main() {
     if(nearCull<0.0)discard;
+    // v178: GL textured 2 (the mirror, rippled in 32 bands; rgb x tint x vertex colour, alpha vertex x tint)
+    // and 3 (refraction: the picture's copy x tint, alpha the tint's) at the screen position (debug.xy =
+    // 1 / the target's size, debug.z the ripple's t, alpha.y its H; bgFog the tint). Rows run down here.
+    if(u.fogColour.w>1.5){
+        vec2 s=gl_FragCoord.xy*u.debug.xy;
+        if(u.fogColour.w>2.5){outputColour=vec4(clamp(texture(image,s).rgb*u.bgFog.rgb,0.0,1.0),clamp(u.bgFog.a,0.0,1.0));return;}
+        if(u.alpha.y>0.0){
+            float band=floor(clamp(s.y,0.0,0.999)*32.0);
+            s.x+=(sin(2.0*(12.0*band+u.debug.z)*75.39822/u.alpha.y)+1.0)*(6.4*band/u.alpha.y+0.2)/256.0;
+        }
+        outputColour=vec4(clamp(texture(image,s).rgb*u.bgFog.rgb*shade.rgb,0.0,1.0),clamp(shade.a*u.bgFog.a,0.0,1.0));
+        return;
+    }
     bool textured=u.fogColour.w!=0.0;
     float mip=u.lod.z>0.0?clamp(log2(max(viewDepth,0.001))*u.lod.y+u.lod.x,0.0,u.lod.z):0.0;
     vec4 t=textured?(u.lod.z<0.0?texture(image,uv,u.lod.x):textureLod(image,uv,mip)):vec4(vec3(128.0/255.0),1.0);
@@ -37,6 +50,7 @@ void main() {
     }
     // Additive / subtractive draws without depth writes (params.w = 2): a fragment adding less than
     // half an 8-bit step leaves the picture's colour as it is; nothing reads the picture's alpha.
+    rgb*=1.0-u.debug.z; // v179: the weak points' glow scaled (render.cpp; 0 elsewhere)
     if(u.params.w>1.5 && max(rgb.r,max(rgb.g,rgb.b))*a<0.5/255.0)discard;
     outputColour=u.debug.w>0.0?vec4(u.debug.rgb,1.0):vec4(rgb,a);
 }

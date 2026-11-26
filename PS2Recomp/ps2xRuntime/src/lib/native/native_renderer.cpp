@@ -49,6 +49,14 @@ extern "C" unsigned int _pthread_stack_default_user; // ps2_vita_runtime.cpp
 #define PS2X_NATIVE_GL 1
 #endif
 
+#if defined(__SWITCH__) && defined(PS2X_NATIVE_DEKO3D)
+// v175: the deko3d backend draws no screen copies (heat haze, underwater ripple) nor previous-frame samples; its
+// validateDraw throws on them, so they are left out before it (on Switch they were never visible).
+static constexpr bool kBackendNoScreenCopy = true;
+#else
+static constexpr bool kBackendNoScreenCopy = false;
+#endif
+
 namespace native_renderer::detail
 {
 #if !defined(PS2X_HAVE_METAL)
@@ -3244,6 +3252,7 @@ namespace native_renderer
         const Tuning &t = tuning();
         if (((t.hiddenLayers >> (state.order & 31u)) & 1u) || (state.screen ? !t.draw2D : !t.drawWorld) || (state.overlay && !t.overlays) ||
             (state.screenCopy && state.order != 19u && !t.heatHaze) || // round 124: the heat haze (layer 19: the underwater ripple, kept)
+            (kBackendNoScreenCopy && (state.previousFrame || (state.screenCopy && !t.heatHaze))) || // v176: copies drawn (menu switch); no previous frame
             (state.blend == Blend::Additive && !t.additive) || (state.blend == Blend::Subtract && !t.subtract))
         {
             if (native_recorder::active())
@@ -3332,6 +3341,7 @@ namespace native_renderer
         const Tuning &t = tuning();
         if (((t.hiddenLayers >> (state.order & 31u)) & 1u) || (state.screen ? !t.draw2D : !t.drawWorld) || (state.overlay && !t.overlays) ||
             (state.screenCopy && state.order != 19u && !t.heatHaze) || // round 124: the heat haze (layer 19: the underwater ripple, kept)
+            (kBackendNoScreenCopy && (state.previousFrame || (state.screenCopy && !t.heatHaze))) || // v176: copies drawn (menu switch); no previous frame
             (state.blend == Blend::Additive && !t.additive) || (state.blend == Blend::Subtract && !t.subtract))
         {
             if (native_recorder::active())

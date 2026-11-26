@@ -145,12 +145,13 @@ inline void validateDraw(const DrawState &d, bool depthFogDisabled = false) {
         throw std::invalid_argument("deko3d: depth-fog background composite not implemented");
     if(d.shadowVolume && (!std::isfinite(d.shadow) || d.shadow<0 || d.shadow>1))
         throw std::invalid_argument("deko3d: invalid shadow amount");
-    if(d.reflectionSource || d.reflectionSample)throw std::invalid_argument("deko3d: reflection not implemented");
-    if(d.refractionSample)throw std::invalid_argument("deko3d: refraction not implemented");
-    if(d.screenCopy)throw std::invalid_argument("deko3d: screen copy not implemented");
+    // v178: reflections (render.cpp drawMirror) and refraction (the screen copy at layer 9) are drawn.
+    // v176: screen copies are drawn (render.cpp makeScreenCopy); previous-frame sampling is not.
     if(d.previousFrame)throw std::invalid_argument("deko3d: previous-frame sampling not implemented");
     if(d.skinPalette || d.skinPaletteCount)throw std::invalid_argument("deko3d: GPU skinning not implemented");
-    if(d.mirrorRipple[1] != 0)throw std::invalid_argument("deko3d: mirror ripple not implemented");
+    if(!std::isfinite(d.mirrorRipple[1]) || !std::isfinite(d.reflectionTint[0]) || !std::isfinite(d.reflectionTint[1]) ||
+       !std::isfinite(d.reflectionTint[2]) || !std::isfinite(d.reflectionTint[3]))
+        throw std::invalid_argument("deko3d: non-finite water parameter"); // v178
     if (d.clamp > 3 || static_cast<unsigned>(d.blend) > static_cast<unsigned>(Blend::Subtract))
         throw std::invalid_argument("deko3d: invalid sampler/blend mode");
     if (!std::isfinite(d.opacity) || !std::isfinite(d.lodK) ||

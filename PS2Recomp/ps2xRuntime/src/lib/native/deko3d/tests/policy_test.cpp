@@ -119,10 +119,8 @@ int main() {
         validateDraw(d,true);
         check(true,"world geometry renders directly when depth-fog composite is disabled");
         d={};d.reflectionSample=true;
-        rejects([&]{validateDraw(d,true);},"plain sky path cannot suppress reflection requirements");
-        d={};
-        d.reflectionSample = true;
-        rejects([&] { validateDraw(d); }, "reflection cannot silently disappear");
+        validateDraw(d,true);
+        check(true,"v178: reflections are drawn");
         d = {}; d.skinPaletteCount = 4;
         rejects([&] { validateDraw(d); }, "GPU skinning cannot silently disappear");
         d = {}; d.clamp = 4;
@@ -132,8 +130,7 @@ int main() {
         d = {}; d.light[31] = std::numeric_limits<float>::quiet_NaN();
         rejects([&] { validateDraw(d); }, "non-finite light matrix rejected");
         bool DrawState::*const unsupported[]{&DrawState::background, &DrawState::fogged,
-            &DrawState::reflectionSource, &DrawState::reflectionSample,
-            &DrawState::refractionSample, &DrawState::screenCopy, &DrawState::previousFrame};
+            &DrawState::previousFrame}; // v176: screenCopy drawn; v178: reflections, refraction
         for (auto field : unsupported) {
             d = {}; d.*field = true;
             rejects([&] { validateDraw(d); }, "unsupported path rejected explicitly");

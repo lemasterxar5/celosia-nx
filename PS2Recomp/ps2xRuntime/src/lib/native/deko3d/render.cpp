@@ -112,7 +112,8 @@ void DekoBackend::bindTarget(const DkImage &colour,const DkImage *depthImage,uin
     DkImageView colourView;dkImageViewDefaults(&colourView,&colour);
     DkImageView depthView;if(depthImage)dkImageViewDefaults(&depthView,depthImage);
     dkCmdBufBindRenderTarget(commands,&colourView,depthImage?&depthView:nullptr);
-    bindSamples(msaa>1 && ((scene && &colour==&scene->image) || (bloomMaskMs && &colour==&bloomMaskMs->image)));
+    bindSamples(msaa>1 && ((scene && &colour==&scene->image) || (bloomMaskMs && &colour==&bloomMaskMs->image) ||
+                           (glowMs && &colour==&glowMs->image))); // v177: the glow layer has the scene's samples
     const DkViewport viewport{0,0,float(width),float(height),0,1};
     const DkScissor scissor{0,0,width,height};
     dkCmdBufSetViewports(commands,0,&viewport,1);
@@ -173,6 +174,7 @@ void DekoBackend::bloomQuad(int mode,uint32_t source,uint32_t second,const float
     if(add){
         DkBlendState blend;dkBlendStateDefaults(&blend);
         if(blendMode==2)dkBlendStateSetFactors(&blend,DkBlendFactor_Zero,DkBlendFactor_InvSrcAlpha,DkBlendFactor_Zero,DkBlendFactor_One);
+        else if(blendMode==3)dkBlendStateSetFactors(&blend,DkBlendFactor_SrcAlpha,DkBlendFactor_InvSrcAlpha,DkBlendFactor_Zero,DkBlendFactor_One); // v177: GL QuadBlend::Over
         else dkBlendStateSetFactors(&blend,DkBlendFactor_One,DkBlendFactor_One,DkBlendFactor_Zero,DkBlendFactor_One);
         dkCmdBufBindBlendState(commands,0,&blend);
     }
@@ -237,6 +239,242 @@ void DekoBackend::runBloom(int slot){
     dkCmdBufBindTexture(commands,DkStage_Fragment,1,dkMakeTextureHandle(bgSmallSlot,3));
     ++lastBloomRuns;
 }
+// v176: the screen copy (GL `small`: the picture so far to 256 x 256, through 128 x 128 and back), made once a
+// frame before its first draw; then the picture rebound. False when the picture is the output image itself
+// (no separate scene image to read): those draws are left out, as before v176.
+bool DekoBackend::makeScreenCopy(int slot,uint32_t use){
+    if(screenCopyMade && screenCopyUse==use)return true;
+    screenCopyUse=use;
+    const uint32_t source=sceneReadSlot(slot); // v177: the output image too (no separate scene)
+    if(source==DescriptorSlots::None || !screenCopy)return false;
+    const auto none=DescriptorSlots::None;
+    tcBarrier(DkBarrier_Fragments,0);
+    if(msaa>1){const auto from=scene->view(),to=sceneResolved->view();tcFlush();dkCmdBufResolveImage(commands,&from,&to);}
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    const float full[4]{0,0,1.0f/256.0f,1.0f/256.0f},half[4]{0,0,1.0f/128.0f,1.0f/128.0f};
+    bindTarget(screenCopy->image,nullptr,256,256);
+    bloomQuad(0,source,none,full,nullptr,false,-1.0f);
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    bindTarget(screenCopyHalf->image,nullptr,128,128);
+    bloomQuad(0,screenCopySlot,none,half,nullptr,false,-1.0f);
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    bindTarget(screenCopy->image,nullptr,256,256);
+    bloomQuad(20,screenCopyHalfSlot,none,full,nullptr,false,-1.0f);
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    bindTarget(sceneImage(slot),&depth->image,rw,rh);
+    dkCmdBufBindTexture(commands,DkStage_Fragment,1,dkMakeTextureHandle(bgSmallSlot,3)); // as runBloom leaves it
+    screenCopyMade=true;++lastScreenCopies;
+    return true;
+}
+// v178: GL's mirror pass: the reflectionSource draws (not the sky's under the fog, as GL's pass) into the
+// 256 x 256 mirror on a depth of its own, cleared to the fog colour (reflectionBegin); then the picture rebound.
+bool DekoBackend::drawMirror(int slot,const std::vector<Draw> &all){
+    if(!mirror || !mirrorDepth)return false;
+    tcBarrier(DkBarrier_Fragments,0);
+    bindTarget(mirror->image,&mirrorDepth->image,256,256);
+    dkCmdBufClearColorFloat(commands,0,DkColorMask_RGBA,fog.colour[0],fog.colour[1],fog.colour[2],1);
+    dkCmdBufClearDepthStencil(commands,true,1,0xFF,0);
+    const bool fogOn=fog.enabled && fog.width>0.0f;
+    const bool sky=skyActive;skyActive=false; // (no fade to the background image: it is the picture's size)
+    for(const auto &d:all){
+        if(!d.state.reflectionSource || d.state.shadowVolume || (fogOn && d.state.background))continue;
+        emitDraw(d,false,false);
+        if(needsAlphaFailurePass(d.state,d.mesh->minAlpha,d.texture->minAlpha))emitDraw(d,true,false);
+        ++lastMirrorDraws;
+    }
+    skyActive=sky;
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    bindTarget(sceneImage(slot),&depth->image,rw,rh);
+    ++lastMirrors;
+    return true;
+}
+// v177: the picture so far as a texture: the scene image (resolved by the caller at 4x), or, with no
+// separate scene, the output image itself (its descriptor made once per swapchain).
+uint32_t DekoBackend::sceneReadSlot(int slot){
+    if(scaled())return sceneSlot;
+    if(slot<0 || slot>=int(Frames) || !colors[slot])return DescriptorSlots::None;
+    if(colorReadSlot[slot]==DescriptorSlots::None)colorReadSlot[slot]=imageDescriptors->slots.acquire();
+    if(colorReadSlot[slot]==DescriptorSlots::None)return DescriptorSlots::None;
+    if(colorReadGen[slot]!=swapGeneration){
+        const auto view=colors[slot]->view();
+        dkImageDescriptorInitialize(imageDescriptors->entries()+colorReadSlot[slot],&view,false,false);
+        colorReadGen[slot]=swapGeneration;
+    }
+    return colorReadSlot[slot];
+}
+// v177: the blur's full-size copy (1x: the picture cannot be read while it is drawn into).
+bool DekoBackend::ensureFullCopy(){
+    if(fullCopy)return true;
+    if(blurFailed)return false;
+    try{
+        if(fullCopySlot==DescriptorSlots::None)fullCopySlot=imageDescriptors->slots.acquire();
+        if(fullCopySlot==DescriptorSlots::None)throw std::runtime_error("no descriptor slot");
+        fullCopy=std::make_shared<Image>(device,rw,rh,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+        const auto view=fullCopy->view();
+        dkImageDescriptorInitialize(imageDescriptors->entries()+fullCopySlot,&view,false,false);
+        return true;
+    }catch(const std::exception &e){
+        std::fprintf(stderr,"[fx177] blur copy not made: %s\n",e.what());
+        fullCopy.reset();blurFailed=true;return false;
+    }
+}
+// v177: the glow layer at the scene's size and samples (drawn on the scene's depth), its resolve, its steps.
+bool DekoBackend::ensureGlowTargets(){
+    if(glowMs && glowSmall[3])return true;
+    if(glowFailed)return false;
+    try{
+        if(glowSlot==DescriptorSlots::None)glowSlot=imageDescriptors->slots.acquire();
+        for(auto &s:glowSmallSlot)if(s==DescriptorSlots::None)s=imageDescriptors->slots.acquire();
+        if(glowSlot==DescriptorSlots::None || glowSmallSlot[3]==DescriptorSlots::None)throw std::runtime_error("no descriptor slot");
+        const DkMsMode ms=msaa>=4?DkMsMode_4x:msaa>=2?DkMsMode_2x:DkMsMode_1x;
+        glowMs=std::make_shared<Image>(device,rw,rh,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender|targetFlags,allocationBudget,1,
+            std::shared_ptr<BufferPool>{},ms);
+        if(msaa>1)glowResolved=std::make_shared<Image>(device,rw,rh,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+        const auto view=(msaa>1?glowResolved:glowMs)->view();
+        dkImageDescriptorInitialize(imageDescriptors->entries()+glowSlot,&view,false,false);
+        for(int i=0;i<4;++i){
+            if(glowSmall[i])continue;
+            const uint32_t size=i==0?256u:i==1?128u:64u;
+            glowSmall[i]=std::make_shared<Image>(device,size,size,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+            const auto smallView=glowSmall[i]->view();
+            dkImageDescriptorInitialize(imageDescriptors->entries()+glowSmallSlot[i],&smallView,false,false);
+        }
+        return true;
+    }catch(const std::exception &e){
+        std::fprintf(stderr,"[fx177] glow layer not made: %s (layer 8 drawn plainly)\n",e.what());
+        glowMs.reset();glowResolved.reset();glowFailed=true;return false;
+    }
+}
+// v177: GL doBlur: the picture so far laid over itself `steps` times, turned, scaled and moved by
+// (steps - i) / steps of the blur, at alpha 1 / (i + 1) (QuadBlend::Over), from a copy taken before.
+void DekoBackend::runBlur(const ScreenBlur &b,int slot){
+    if(b.steps<=0 || !effectsShader){++lastEffectDrops;return;}
+    const auto none=DescriptorSlots::None;
+    uint32_t source=none;
+    tcBarrier(DkBarrier_Fragments,0);
+    if(msaa>1){
+        const auto from=scene->view(),to=sceneResolved->view();tcFlush();dkCmdBufResolveImage(commands,&from,&to);
+        tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        source=sceneSlot;
+    }else{
+        const uint32_t picture=sceneReadSlot(slot);
+        if(picture==none || !ensureFullCopy()){++lastEffectDrops;return;}
+        tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        bindTarget(fullCopy->image,nullptr,rw,rh);
+        const float whole[4]{0,0,1.0f/float(rw),1.0f/float(rh)};
+        bloomQuad(0,picture,none,whole,nullptr,0,-1.0f);
+        tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        source=fullCopySlot;
+    }
+    bindTarget(sceneImage(slot),&depth->image,rw,rh);
+    const DkShader *saved=quadShaderOverride;quadShaderOverride=&effectsShader->shader;
+    // v183 (report: the camera blur cost ~25% of the frame rate while turning): the steps in one pass (effects
+    // mode 25: the same turns and the same Over weights, one blend instead of `steps` full-screen ones).
+    // CELOSIA_DIAG_BLUR183=0: one pass a step (v182).
+    static const bool onePass=[]{const char *v=std::getenv("CELOSIA_DIAG_BLUR183");return !(v && std::atoi(v)==0);}();
+    if(onePass && b.steps<=64){
+        const float params[4]{float(b.steps),0,1.0f/float(rw),1.0f/float(rh)};
+        const float turn[4]{b.scale-1.0f,std::fabs(b.angle)>=0.01570796f?b.angle:0.0f,b.dx/256.0f,b.dy/224.0f};
+        bloomQuad(25,source,none,params,turn,3,-1.0f);
+    }else
+    for(int i=0;i<b.steps;++i){
+        const float f=float(b.steps-i)/float(b.steps);
+        // GL's turn (-angle) and move (dx, -dy) are y-up; here rows run down: angle, (dx, dy).
+        const float params[4]{1.0f/float(i+1),0,1.0f/float(rw),1.0f/float(rh)};
+        const float turn[4]{(b.scale-1.0f)*f+1.0f,std::fabs(b.angle)>=0.01570796f?b.angle*f:0.0f,b.dx*f/256.0f,b.dy*f/224.0f};
+        bloomQuad(22,source,none,params,turn,3,-1.0f);
+    }
+    quadShaderOverride=saved;
+    dkCmdBufBindTexture(commands,DkStage_Fragment,1,dkMakeTextureHandle(bgSmallSlot,3)); // as runBloom leaves it
+    ++lastBlurs;
+}
+// v177: GL doDof: the picture to 256 x 256, blurred `rounds` times through 128 x 128, laid over in
+// `slices` passes: pass i where the GS Z is at most focusZ >> i (a quad at that depth, tested), alpha
+// (i + 1) / slices; the passes' product is GL's single-pass keep.
+void DekoBackend::runDof(int slot){
+    const uint32_t source=sceneReadSlot(slot);
+    if(!effectsShader || source==DescriptorSlots::None || !screenCopy || !(dof.zB>0.0f) || dof.slices<=0){++lastEffectDrops;return;}
+    const auto none=DescriptorSlots::None;
+    tcBarrier(DkBarrier_Fragments,0);
+    if(msaa>1){const auto from=scene->view(),to=sceneResolved->view();tcFlush();dkCmdBufResolveImage(commands,&from,&to);}
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    const float full[4]{0,0,1.0f/256.0f,1.0f/256.0f},half[4]{0,0,1.0f/128.0f,1.0f/128.0f};
+    bindTarget(screenCopy->image,nullptr,256,256);
+    bloomQuad(0,source,none,full,nullptr,0,-1.0f);
+    for(int i=0;i<dof.rounds;++i){
+        tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        bindTarget(screenCopyHalf->image,nullptr,128,128);
+        bloomQuad(0,screenCopySlot,none,half,nullptr,0,-1.0f);
+        tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        bindTarget(screenCopy->image,nullptr,256,256);
+        bloomQuad(0,screenCopyHalfSlot,none,full,nullptr,0,-1.0f);
+    }
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    screenCopyMade=false; // (the copy now holds the blurred picture: a later screen copy is made again)
+    bindTarget(sceneImage(slot),&depth->image,rw,rh);
+    const DkShader *saved=quadShaderOverride;quadShaderOverride=&effectsShader->shader;
+    const float whole[4]{0,0,1.0f/float(rw),1.0f/float(rh)};
+    for(int i=0;i<dof.slices;++i){
+        const float z=float(dof.focusZ>>unsigned(i));
+        const float at=std::clamp(1.0f-0.1f*(z-dof.zA)/dof.zB,0.0f,1.0f); // GS Z = zA + zB / w; depth = 1 - 0.1 / w
+        const float alpha[4]{0,0,0,float(i+1)/float(dof.slices)};
+        bloomQuad(21,screenCopySlot,none,whole,alpha,3,at);
+    }
+    quadShaderOverride=saved;
+    dkCmdBufBindTexture(commands,DkStage_Fragment,1,dkMakeTextureHandle(bgSmallSlot,3));
+    ++lastDofs;
+}
+// v177: GL doGlow: layer `glow.order` drawn apart (cleared to nothing, on the scene's depth) ...
+bool DekoBackend::beginGlow(){
+    if(!effectsShader || !ensureGlowTargets())return false;
+    tcBarrier(DkBarrier_Fragments,0);
+    bindTarget(glowMs->image,&depth->image,rw,rh);
+    dkCmdBufClearColorFloat(commands,0,DkColorMask_RGBA,0,0,0,0);
+    ++lastGlows;
+    return true;
+}
+// ... then reduced to 256, 128, 64 and blurred (GL buildGlow's reductions, mode 13 with their half-texel
+// shifts), and laid over the picture sharp (amountA) and blurred (amountB) in the tint (mode 14, Over).
+void DekoBackend::endGlow(int slot){
+    const auto none=DescriptorSlots::None;
+    tcBarrier(DkBarrier_Fragments,0);
+    if(msaa>1){const auto from=glowMs->view(),to=glowResolved->view();tcFlush();dkCmdBufResolveImage(commands,&from,&to);}
+    tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+    const DkShader *saved=quadShaderOverride;quadShaderOverride=&effectsShader->shader;
+    const bool blurred=glow.amountB>0.0f;
+    if(blurred){
+        const uint32_t sizes[4]{256,128,64,64};
+        auto reduce=[&](uint32_t from,uint32_t fromW,uint32_t fromH,int to,float shift){
+            bindTarget(glowSmall[to]->image,nullptr,sizes[to],sizes[to]);
+            const float p[4]{shift/float(fromW),shift/float(fromH),1.0f/float(sizes[to]),1.0f/float(sizes[to])};
+            bloomQuad(23,from,none,p,nullptr,0,-1.0f);
+            tcBarrier(DkBarrier_Fragments,DkInvalidateFlags_Image);
+        };
+        reduce(glowSlot,rw,rh,0,0.0f);
+        if(glow.rounds>0){
+            reduce(glowSmallSlot[0],256,256,1,0.0f);
+            if(glow.rounds>1){
+                reduce(glowSmallSlot[1],128,128,2,0.0f);
+                if(glow.rounds>2)
+                    for(int i=0;i<=glow.rounds;++i){reduce(glowSmallSlot[2],64,64,3,0.5f);reduce(glowSmallSlot[3],64,64,2,-0.5f);}
+                reduce(glowSmallSlot[2],64,64,1,0.0f);
+            }
+            reduce(glowSmallSlot[1],128,128,0,0.0f);
+        }
+    }
+    bindTarget(sceneImage(slot),&depth->image,rw,rh);
+    const float whole[4]{0,0,1.0f/float(rw),1.0f/float(rh)};
+    if(glow.amountA>0.0f){
+        const float tint[4]{glow.tint[0],glow.tint[1],glow.tint[2],glow.amountA};
+        bloomQuad(24,glowSlot,none,whole,tint,3,-1.0f);
+    }
+    if(blurred){
+        const float tint[4]{glow.tint[0],glow.tint[1],glow.tint[2],glow.amountB};
+        bloomQuad(24,glowSmallSlot[0],none,whole,tint,3,-1.0f);
+    }
+    quadShaderOverride=saved;
+    dkCmdBufBindTexture(commands,DkStage_Fragment,1,dkMakeTextureHandle(bgSmallSlot,3));
+}
 // v150: every target of the scene's size made again at width x height (every frame's fence waited: no
 // GPU work reads the old ones), their descriptors rewritten in their slots.
 // v151: the swapchain rebuilt at width x height: the queue idle (no presented image still in use by
@@ -258,6 +496,7 @@ void DekoBackend::resizeScene(uint32_t width,uint32_t height,uint32_t samples,bo
     separate=rw!=ow || rh!=oh || msaa>1 || postOn;
     const DkMsMode ms=msaa>=4?DkMsMode_4x:msaa>=2?DkMsMode_2x:DkMsMode_1x;
     scene.reset();sceneResolved.reset();bloomMaskMs.reset();depth.reset();
+    fullCopy.reset();glowMs.reset();glowResolved.reset();blurFailed=glowFailed=false; // v177 (made again on use)
     depth=std::make_shared<Image>(device,rw,rh,DkImageFormat_ZF32_X24S8,DkImageFlags_UsageRender|targetFlags,allocationBudget,1,
         std::shared_ptr<BufferPool>{},ms);
     if(msaa>1)bloomMaskMs=std::make_shared<Image>(device,rw,rh,maskFormatNow,DkImageFlags_UsageRender,allocationBudget,1,
@@ -1375,12 +1614,27 @@ void DekoBackend::emitDraw(const Draw &draw, bool failurePass, bool farBackdrop)
     }
     if(zeroAddDiscard && celosia::live::settings().addDiscard.load(std::memory_order_relaxed) && !opaque && !failurePass && !(key.depth&2) && key.mask &&
        (s.blend==Blend::Additive || s.blend==Blend::Subtract)){material.params[3]=2;++lastZeroAddDraws;}
+    // v179 (the user's PCSX2 capture: the sigil added twice the light over the colossus's skin, +72/+89/+87 vs
+    // +32/+39/+40): the additive draws of the glow layer (the weak points' sigils) add half their colour.
+    if(s.order==8 && s.blend==Blend::Additive && !s.screen && material.debug[3]==0 &&
+       celosia::live::settings().sigilPs2.load(std::memory_order_relaxed))material.debug[2]=0.5f;
+    // v178: the water's reads (native.frag's textured 2 / 3; the generic shader, never a lean one).
+    const bool waterRead=s.reflectionSample || s.refractionSample;
+    if(waterRead){
+        material.fogColour[3]=s.reflectionSample?2.0f:3.0f;
+        std::copy_n(s.reflectionTint,4,material.bgFog);
+        material.debug[0]=1.0f/float(rw);material.debug[1]=1.0f/float(rh);
+        material.debug[2]=s.mirrorRipple[0];material.debug[3]=0;
+        material.alpha[0]=-1;material.alpha[1]=s.reflectionSample?s.mirrorRipple[1]:0.0f;
+        material.params[3]=0;
+        if(fragment!=2)fragment=0;
+    }
     // v105: a lean variant of the generic shader holding only the paths this draw's uniforms turn on
     // (lean.frag.glsl). Early tests only without depth writes, where they reject what late ones would.
     // v116: also the opaque shader's draws, the background layer's (near cull) and untextured ones.
     // v171c first person (fog.z < 0, the near plane): the generic shader, the one that discards (nearCull).
     if(material.fog[2]<0.0f && fragment<=2)fragment=0;
-    if(leanEnabled && diagGpuMode==0 && fragment<=2 && material.debug[3]==0 && material.fog[2]>=0.0f){
+    if(leanEnabled && diagGpuMode==0 && fragment<=2 && material.debug[3]==0 && material.fog[2]>=0.0f && !waterRead){
         const bool textured=material.fogColour[3]!=0;
         int variant=(material.bgFog[3]>0?2:0)|(textured && material.lod[2]!=0?4:0)|(textured?0:64);
         if(fragment==1)variant|=128;
@@ -1399,7 +1653,7 @@ void DekoBackend::emitDraw(const Draw &draw, bool failurePass, bool farBackdrop)
         boundFragment=fragment;
     }
     pushMaterial(material);
-    bindTexture(diagGpuMode==7 && diagAdditive?*dummyTexture:*draw.texture,s.clamp);
+    bindTexture(diagGpuMode==7 && diagAdditive?*dummyTexture:*draw.texture,(s.screenCopy || waterRead)?uint8_t(3):s.clamp); // v176: the copy clamped (v178: the mirror too)
     submitGeometry(failurePass && draw.failureMesh?*draw.failureMesh:*draw.mesh);
 }
 void DekoBackend::submitGeometry(const Mesh &mesh) {
@@ -1644,6 +1898,8 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
     // every frame regrew them, copying each Draw and its two shared_ptrs). The frame's previous lists
     // (retired: beginFrame waited for this frame's fence) are cleared here as the assignment did.
     frame.draws.swap(draws); draws.clear(); frame.uploads.swap(uploads); uploads.clear();
+    frameBlurs.swap(blurs);blurs.clear(); // v177
+    std::stable_sort(frameBlurs.begin(),frameBlurs.end(),[](const ScreenBlur &a,const ScreenBlur &b){return a.order<b.order;});
     const uint32_t frameMergedAlpha=mergedAlphaDraws;mergedAlphaDraws=0;
     resolvePendingMeshes(frame.draws,meshes);
     if(!held){
@@ -1685,6 +1941,15 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
             static int swapNow=1;static uint32_t cadence=0;
             const int cap=celosia::live::settings().fpsCap.load(std::memory_order_relaxed);
             int wanted=cap<=30?2:(cap<=45?((cadence++%3)==2?2:1):1);
+            // v179 (report: loads took twice as long at 30): the game thread waits on each held image, and the
+            // game loads a step per frame. Frames without a scene (round 107's rule: on at 150 draws or more,
+            // off under 40: loading screens, logos, menus over black) are shown every refresh.
+            {
+                static bool scene=true;
+                const std::size_t n=frame.draws.size();
+                if(n>=150)scene=true;else if(n<40)scene=false;
+                if(!scene)wanted=1;
+            }
             if(celosia::live::settings().frameGen.load(std::memory_order_relaxed)>0)wanted=swapIntervalNow; // v155: set before each of its presents
             if(wanted!=swapIntervalNow){dkSwapchainSetSwapInterval(swapchain,wanted);swapIntervalNow=wanted;}
         }
@@ -1979,7 +2244,7 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
             inBackgroundPass=true;
             for(std::size_t i=0;i<frame.draws.size();++i){
                 const auto &draw=frame.draws[i];
-                if(!draw.state.background || draw.state.shadowVolume)continue;
+                if(!draw.state.background || draw.state.shadowVolume || draw.state.reflectionSource)continue; // (v178: the mirror's)
                 if(!draw.bgMainEmpty)emitDraw(draw,false,false); // v170a: not when it fails everywhere
                 if(needsAlphaFailurePass(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha))emitDraw(draw,true,false);
                 markDrawTime(int(i)*4+2);
@@ -2011,6 +2276,48 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         if(!bloomOn)bloomHistory=false;
         bool bloomDone=!bloomOn;
         menuDraws.clear();resolvedDraws.clear();resolvedFrom=nullptr;compositePending=deferComposite=false;
+        screenCopyMade=false; // v176
+        // v177: the effects at their layers, in GL's event order (each before the first draw at or past its
+        // layer, after the soft shadows and the bloom of lower layers): the blurs, the depth of field, and the
+        // glow layer drawn apart then laid over. The resolved tail starts past them all.
+        const bool fxOn=effectsShader!=nullptr;
+        const bool dofOn=fxOn && dof.enabled && dof.slices>0 && dof.zB>0.0f && screenCopy;
+        const bool glowOn=fxOn && glow.enabled && !glowFailed;
+        if(!fxOn){lastEffectDrops+=uint32_t(frameBlurs.size());frameBlurs.clear();}
+        std::size_t nextBlur=0;bool dofDone=!dofOn;int glowState=glowOn?0:2; // glow: 0 to come, 1 drawing apart, 2 done, 3 layer left out
+        uint32_t effectLast=0;bool anyEffect=false;
+        for(const auto &b:frameBlurs){effectLast=std::max(effectLast,b.order);anyEffect=true;}
+        if(dofOn){effectLast=std::max(effectLast,dof.order);anyEffect=true;}
+        if(glowOn){effectLast=std::max(effectLast,glow.order);anyEffect=true;}
+        bool haveMirrorSource=false,mirrorTried=false,mirrorOk=false; // v178
+        for(const auto &d:frame.draws)if(d.state.reflectionSource){haveMirrorSource=true;break;}
+        auto effectsBefore=[&](uint32_t o){
+            if(glowState>=2 && dofDone && nextBlur>=frameBlurs.size())return;
+            auto prior=[&](uint32_t x){
+                if(shadows.resolveBefore(x)){markSegment(GpuSegment::Shadow);resolveShadows(shadows.amount,slot);shadows.clear();markDrawTime(-4);}
+                if(!bloomDone && bloom.order<x){
+                    if(shadows.pending){markSegment(GpuSegment::Shadow);resolveShadows(shadows.amount,slot);shadows.clear();markDrawTime(-4);}
+                    markSegment(GpuSegment::Screen);runBloom(slot);bloomDone=true;markDrawTime(-5);
+                }
+            };
+            for(;;){
+                const uint32_t bo=nextBlur<frameBlurs.size()?frameBlurs[nextBlur].order:~0u,d=dofDone?~0u:dof.order,x=std::min(bo,d);
+                if(x==~0u || x>o)break;
+                if(glowState==1 && x>glow.order){markSegment(GpuSegment::Screen);endGlow(slot);glowState=2;}
+                prior(x);
+                markSegment(GpuSegment::Screen);
+                if(d<=bo){runDof(slot);dofDone=true;}
+                else runBlur(frameBlurs[nextBlur++],slot);
+                markDrawTime(-5);
+            }
+            if(glowState==1 && o>glow.order){markSegment(GpuSegment::Screen);endGlow(slot);glowState=2;markDrawTime(-5);}
+            if(glowState==0 && o>=glow.order){
+                prior(glow.order);
+                if(o!=glow.order)glowState=2; // no draw in the layer: nothing to lay over
+                else if(!(glow.amountA>0.0f) && !(glow.amountB>0.0f))glowState=3; // laid over at 0: not seen
+                else glowState=beginGlow()?1:2;
+            }
+        };
         // v159: the tail of eligible draws (menu draws aside, drawn after the picture anyway), from where the
         // bloom has already run (its source is the picture before them); diagnostics keep 4x.
         std::size_t tailStart=frame.draws.size();
@@ -2022,11 +2329,20 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
                 tailStart=i;
             }
             while(tailStart<frame.draws.size() && bloomOn && frame.draws[tailStart].state.order<bloom.order)++tailStart;
+            if(anyEffect)while(tailStart<frame.draws.size() && frame.draws[tailStart].state.order<=effectLast)++tailStart; // v177
         }
         bool tailOpen=false;
         for (std::size_t drawIndex=0;drawIndex<frame.draws.size();++drawIndex) {
             const auto &draw=frame.draws[drawIndex];
             if(scaled() && draw.state.order>=MenuOrder && draw.state.screen && !draw.state.shadowVolume){menuDraws.push_back(drawIndex);continue;}
+            effectsBefore(draw.state.order); // v177
+            if(glowState==3 && draw.state.order==glow.order)continue;
+            if(draw.state.reflectionSource)continue; // v178: drawn into the mirror (drawMirror)
+            if(draw.state.reflectionSample){
+                if(!mirrorTried){mirrorTried=true;markSegment(GpuSegment::Screen);mirrorOk=haveMirrorSource && drawMirror(slot,frame.draws);}
+                if(!mirrorOk)continue; // GL: no mirror drawn, its reads left out
+            }
+            if(draw.state.refractionSample){markSegment(GpuSegment::Screen);if(!makeScreenCopy(slot,2)){++lastScreenCopyDrops;continue;}}
             if(drawIndex>=tailStart){
                 // Shadows still pending here are resolved before this draw only if the original order does so
                 // (resolveBefore); otherwise they would darken the tail too: then the tail stays on the 4x picture.
@@ -2076,6 +2392,10 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
                 markDrawTime(int(drawIndex)*4);
                 continue;
             }
+            if(draw.state.screenCopy){ // v176: the picture so far, copied before the first of them
+                markSegment(GpuSegment::Screen);
+                if(!makeScreenCopy(slot)){++lastScreenCopyDrops;continue;}
+            }
             markSegment(draw.state.background?GpuSegment::Backdrop:draw.state.screen?GpuSegment::Screen:
                 canUseOpaqueFragment(draw.state,draw.mesh->minAlpha,draw.texture->minAlpha,false)?GpuSegment::Opaque:GpuSegment::Generic);
             if(!draw.bgMainEmpty)emitDraw(draw,false,prepass.farBackdrop(drawIndex,draw.state)); // v170a
@@ -2087,6 +2407,13 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
                 markSegment(GpuSegment::Screen);
             }
             if (failure && diagGpuMode!=1) {markSegment(GpuSegment::Failure);emitDraw(draw, true);markDrawTime(int(drawIndex)*4+1);}
+        }
+        effectsBefore(~0u); // v177: the effects past the last draw
+        {
+            static uint32_t fxFrames=0;
+            if(++fxFrames%600u==0u)
+                std::fprintf(stderr,"[fx177] blurs %u, depth of field %u, glow %u, left out %u; screen copies %u (%u left out); mirrors %u (%u draws)\n",
+                             lastBlurs,lastDofs,lastGlows,lastEffectDrops,lastScreenCopies,lastScreenCopyDrops,lastMirrors,lastMirrorDraws);
         }
         if(attributeCoverage)lastCoverage=coverage;
         if(shadows.pending){markSegment(GpuSegment::Shadow);resolveShadows(shadows.amount,slot);markDrawTime(-4);}
@@ -2448,6 +2775,18 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
         rt.draws+=double(frame.draws.size());rt.sort+=frameSortNs/1e6;++rt.n;
     }
     lastSubmitEnd=submitEnd;frameTexNs=frameMeshNs=0;frameTexCount=frameMeshCount=0;blocksBefore=BufferBlock::created;frameDrawNs=0;
+    // v180 (report: the on-screen counter changed every 5 s): it counts the images shown over half a second;
+    // the 5 s window below stays for the logs.
+    {
+        static uint64_t counterStart=0;static uint32_t counterFrames=0;
+        if(!held)++counterFrames;
+        if(!counterStart || sampleEndNs<counterStart){counterStart=sampleEndNs;counterFrames=0;}
+        else if(sampleEndNs-counterStart>=500000000ull){
+            const double fps=double(counterFrames)*1e9/double(sampleEndNs-counterStart);
+            celosia::live::settings().fpsCenti.store(uint32_t(fps*100.0+0.5),std::memory_order_relaxed);
+            counterStart=sampleEndNs;counterFrames=0;
+        }
+    }
     if(const auto sample=presentationRate.record(sampleEndNs,!held)){
         if(presentLog&&!presentTenths.empty()){
             static bool fresh=true;
@@ -2477,7 +2816,6 @@ void DekoBackend::endFrame(uint32_t width, uint32_t height) {
             }
             presentTenths.clear();
         }
-        celosia::live::settings().fpsCenti.store(uint32_t(sample->fps*100.0+0.5),std::memory_order_relaxed);
         celosia::live::settings().gpuUs.store(uint32_t(lastGpuNs/1000u),std::memory_order_relaxed);
         char *statusBuf=nullptr;size_t statusLen=0;
         auto *file=open_memstream(&statusBuf,&statusLen);

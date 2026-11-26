@@ -40,6 +40,10 @@ struct Settings {
     std::atomic<bool> softShadows{true};
     std::atomic<bool> bodyShadows{true};  // the characters' shadows (Tuning::bodyShadows)  // soft (mask, reduce, blur) or hard (stencil darken)
     std::atomic<bool> addDiscard{true};   // additive fragments adding nothing are discarded
+    std::atomic<bool> heatHaze{true};
+    std::atomic<bool> sigilPs2{true}; // v179: the weak points' glow at the brightness of PCSX2
+    std::atomic<bool> reflections{true}, refraction{true}; // v178: the water's mirror and refraction
+    std::atomic<bool> glow{true}, depthOfField{true}; // v177: the glow composite, the depth of field     // v176: the screen copies (heat haze, underwater ripple)
     std::atomic<bool> skyImage{true};     // the sky / far scenery as a background image (PS2's zFog)
     // v167: the texture pack (Panda Venom, PCSX2 format, sdmc:/switch/celosia_nx/textures/pandavenom/): on/off
     // (hot); the files found (-1 not looked yet), textures replaced so far and their GPU megabytes (menu).

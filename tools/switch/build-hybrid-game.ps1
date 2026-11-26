@@ -71,6 +71,9 @@ foreach($b in 'bloomchain','bloomcomp','postfx','postplain'){
 }
 & "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_bloom.frag.dksh') (Join-Path $backend 'bloom.frag.glsl')
 if($LASTEXITCODE){throw 'Switch bloom shader compilation failed'}
+# v177: the screen blur, depth of field and glow passes.
+& "$DevkitPro/tools/bin/uam.exe" -s frag -o (Join-Path $shaderDir 'celosia_effects.frag.dksh') (Join-Path $backend 'effects.frag.glsl')
+if($LASTEXITCODE){throw 'Switch effects shader compilation failed'}
 # Early-depth-test variant of the generic shader, generated from the same source.
 $earlySource=Join-Path $shaderDir 'native_early.frag.glsl'
 $generic=Get-Content -LiteralPath (Join-Path $backend 'native.frag.glsl')
@@ -82,7 +85,7 @@ Remove-Item -LiteralPath $earlySource
 $elf=Join-Path $OutputDirectory 'celosia_nx.elf'
 Copy-Item -LiteralPath (Join-Path $BuildDirectory 'celosia_switch_game.elf') -Destination $elf
 $nacp=Join-Path $OutputDirectory 'control.nacp'
-& "$DevkitPro/tools/bin/nacptool.exe" --create 'Shadow of the Colossus' 'Celosia contributors' '0.1.0' $nacp
+& "$DevkitPro/tools/bin/nacptool.exe" --create 'Shadow of the Colossus' 'Celosia contributors' '0.2.0' $nacp
 if($LASTEXITCODE){throw 'Switch NACP generation failed'}
 $nro=Join-Path $OutputDirectory 'celosia_nx.nro'
 & "$DevkitPro/tools/bin/elf2nro.exe" $elf $nro "--nacp=$nacp" "--icon=$(Join-Path $PSScriptRoot 'icon/icon.jpg')" "--romfsdir=$(Join-Path $OutputDirectory 'romfs')"

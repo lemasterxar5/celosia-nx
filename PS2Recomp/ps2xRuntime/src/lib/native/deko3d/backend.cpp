@@ -151,6 +151,8 @@ DekoBackend::DekoBackend() {
     try{bloomChainShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_bloomchain.frag.dksh",DkStage_Fragment,allocationBudget);
         bloomCompShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_bloomcomp.frag.dksh",DkStage_Fragment,allocationBudget);}
     catch(const std::exception &e){bloomChainShader.reset();bloomCompShader.reset();std::fprintf(stderr,"[deko3d] bloom shaders: %s\n",e.what());}
+    try{effectsShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_effects.frag.dksh",DkStage_Fragment,allocationBudget);} // v177
+    catch(const std::exception &e){effectsShader.reset();std::fprintf(stderr,"[deko3d] effects shader: %s\n",e.what());}
     try{shadowSoftShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_shadowsoft.frag.dksh",DkStage_Fragment,allocationBudget);}
     catch(const std::exception &e){std::fprintf(stderr,"[deko3d] soft shadow shader: %s\n",e.what());}
     try{oneFragmentShader=std::make_unique<Shader>(device,"romfs:/shaders/celosia_one.frag.dksh",DkStage_Fragment,allocationBudget);}
@@ -197,6 +199,21 @@ DekoBackend::DekoBackend() {
             bloomChain[i]=std::make_shared<Image>(device,size,size,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
             describe(bloomChain[i],bloomChainSlot[i]);
         }
+        // v176: the screen copy's 256 x 256 image and its 128 x 128 blur step (render targets, sampled).
+        screenCopy=std::make_shared<Image>(device,256,256,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+        describe(screenCopy,screenCopySlot);
+        screenCopyHalf=std::make_shared<Image>(device,128,128,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+        describe(screenCopyHalf,screenCopyHalfSlot);
+        screenCopyTexture=std::make_shared<Texture>();
+        screenCopyTexture->image=screenCopy;screenCopyTexture->slot=screenCopySlot;
+        screenCopyTexture->minAlpha=screenCopyTexture->maxAlpha=128;screenCopyTexture->width=screenCopyTexture->height=256;
+        // v178: the water's mirror and its depth.
+        mirror=std::make_shared<Image>(device,256,256,DkImageFormat_RGBA8_Unorm,DkImageFlags_UsageRender,allocationBudget);
+        describe(mirror,mirrorSlot);
+        mirrorDepth=std::make_shared<Image>(device,256,256,DkImageFormat_ZF32_X24S8,DkImageFlags_UsageRender,allocationBudget);
+        mirrorTexture=std::make_shared<Texture>();
+        mirrorTexture->image=mirror;mirrorTexture->slot=mirrorSlot;
+        mirrorTexture->minAlpha=mirrorTexture->maxAlpha=128;mirrorTexture->width=mirrorTexture->height=256;
         for(int i=0;i<2;++i){
             shadowSmall[i]=std::make_shared<Image>(device,Width/4,Height/4,maskFormat,DkImageFlags_UsageRender,allocationBudget);
             describe(shadowSmall[i],shadowSmallSlot[i]);
@@ -230,6 +247,7 @@ DekoBackend::DekoBackend() {
 // v151: the swapchain and its images at width x height (the window's buffers resized to match).
 void DekoBackend::makeSwapchain(uint32_t width,uint32_t height){
     swapchain.reset();
+    ++swapGeneration; // v177: the output images' read descriptors made again
     const DkImage *images[Frames];
     for (uint32_t i = 0; i < Frames; ++i) {
         colors[i] = std::make_shared<Image>(device, width, height, DkImageFormat_RGBA8_Unorm,
@@ -498,7 +516,7 @@ void DekoBackend::beginFrame() {
     }
     frame.pending=false;frame.vertexCursor.reset();
     markRender(RenderPhase::Uploads);
-    recording = true; held = false; draws.clear(); fog = {};
+    recording = true; held = false; draws.clear(); fog = {}; blurs.clear(); // v177
 }
 void DekoBackend::draw(uint64_t id, const float clip[16], const DrawState &state) {
     const auto drawStart=armGetSystemTick();
@@ -524,7 +542,16 @@ void DekoBackend::draw(uint64_t id, const float clip[16], const DrawState &state
             unsigned(texture->minAlpha),state.lodK,state.lodScale,state.maxLod,unsigned(state.clamp),unsigned(state.alphaTest),
             it->second->count,state.order);
     }
+    if(state.screenCopy || state.refractionSample)texture=screenCopyTexture; // v176: the picture so far (makeScreenCopy)
+    else if(state.reflectionSample)texture=mirrorTexture; // v178: the mirror (drawMirror)
     Draw draw{id, it->second, texture, {}, state};
+    // v178: a screen copy carries no game texture (id 0): the shaders took it as untextured and drew the
+    // vertex colour alone (the white shapes over the moving characters). As GL's textured 4: the copy's rgb x
+    // the vertex colour, one level, no alpha test (GL returns before it); the id only marks it textured.
+    if(state.screenCopy || state.reflectionSample || state.refractionSample){ // (v178: the water's reads too)
+        if(!draw.state.texture)draw.state.texture=~uint64_t(0);
+        draw.state.alphaTest=0;draw.state.maxLod=0;draw.state.lodK=0;draw.state.lodScale=0;
+    }
     if(mergeAlphaNoop && alphaTestWithoutEffect(draw.state)){draw.state.alphaTest=0;++mergedAlphaDraws;}
     std::copy_n(clip, 16, draw.clip.begin()); draws.push_back(std::move(draw));
 }
@@ -538,14 +565,22 @@ void DekoBackend::setBloom(const Bloom &b) {
         throw std::invalid_argument("deko3d: invalid bloom");
     bloom=b; // kept until changed, as the GL renderer keeps it
 }
+// v177: drawn at their layers (render.cpp runBlur / runDof / beginGlow + endGlow); malformed values leave
+// the effect out instead of throwing.
 void DekoBackend::addScreenBlur(const ScreenBlur &b) {
-    if (b.steps) throw std::runtime_error("deko3d: screen blur not implemented");
+    if(b.steps>0 && b.steps<64 && std::isfinite(b.angle) && std::isfinite(b.scale) && std::isfinite(b.dx) && std::isfinite(b.dy) &&
+       blurs.size()<16)blurs.push_back(b);
 }
 void DekoBackend::setGlowComposite(const GlowComposite &g) {
-    if (g.enabled) throw std::runtime_error("deko3d: glow composite not implemented");
+    glow=g;
+    if(!std::isfinite(g.amountA) || !std::isfinite(g.amountB) || !std::isfinite(g.tint[0]) || !std::isfinite(g.tint[1]) || !std::isfinite(g.tint[2]))
+        glow.enabled=false;
+    glow.rounds=std::clamp(glow.rounds,0,8);
 }
 void DekoBackend::setDepthOfField(const DepthOfField &d) {
-    if (d.enabled) throw std::runtime_error("deko3d: depth of field not implemented");
+    dof=d;
+    if(!std::isfinite(d.zA) || !std::isfinite(d.zB))dof.enabled=false;
+    dof.slices=std::clamp(dof.slices,0,8);dof.rounds=std::clamp(dof.rounds,0,4);
 }
 }
 namespace native_renderer::detail {
